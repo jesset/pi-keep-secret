@@ -15,7 +15,7 @@
  * 故事 34：判定模型/端点是配置，不是代码）。
  */
 import type { ClassifierContext, ClassifierResult } from "@earendil-works/pi-ai";
-import { extractCandidates, mergeSpans, type Span } from "../engine/index.ts";
+import { extractCandidates, mergeSpans, type Candidate, type Span } from "../engine/index.ts";
 import { chunkText } from "./chunk.ts";
 import { GATE_QUESTION_NAME, candidateQuestion, gateQuestion } from "./questions.ts";
 
@@ -98,10 +98,11 @@ export function createSystemOneJudge(options: SystemOneJudgeOptions): SystemOneJ
 
 	return {
 		detectorName,
-		async judgeText(text) {
+			async judgeText(text) {
 			let calls = 0;
 			const spans: Span[] = [];
 			let gateHit = false;
+			let truncatedCandidates = 0;
 			for (const chunk of chunkText(text, maxChars)) {
 				calls++;
 				const gateResult = await classify({
@@ -115,14 +116,58 @@ export function createSystemOneJudge(options: SystemOneJudgeOptions): SystemOneJ
 					continue; // gate 低短路：不发起候选问题
 				}
 				gateHit = true;
-				// gate 命中：候选批量判定（下一阶段）
+				const candidates = extractCandidates(chunk.text, minCandidateLength);
+				if (candidates.length === 0) {
+					continue;
+				}
+				// 批数闸门：仅当超过 maxBatches 才截断保最长（成本护栏）
+				const keep = batchSize * maxBatches;
+				if (candidates.length > keep) {
+					truncatedCandidates += candidates.length - keep;
+					candidates.length = keep;
+				}
+				const batches: Candidate[][] = [];
+				for (let i = 0; i < candidates.length; i += batchSize) {
+					batches.push(candidates.slice(i, i + batchSize));
+				}
+				const responses = await Promise.all(
+					batches.map(async (batch) => {
+						calls++;
+						return await classify({
+							state: {
+								text: chunk.text,
+								candidates: Object.fromEntries(batch.map((c, i) => [String(i), c.value])),
+							},
+							questions: Object.fromEntries(
+								batch.map((_, i) => [`cand_${i}`, candidateQuestion(i)]),
+							),
+						});
+					}),
+				);
+				for (const [b, batch] of batches.entries()) {
+					const result = responses[b];
+					for (const [i, candidate] of batch.entries()) {
+						const answer = result.answers[`cand_${i}`];
+						if (answer === undefined || answer.type !== "bool") {
+							continue;
+					}
+						if (answer.probability < candidateThreshold) {
+							continue; // 判定非凭据：丢弃
+						}
+						spans.push({
+							start: chunk.offset + candidate.start,
+							end: chunk.offset + candidate.end,
+							detector: detectorName,
+						});
+					}
+				}
 			}
 			return {
 				spans: mergeSpans(spans),
 				gateHit,
 				clean: spans.length === 0 && !gateHit,
 				failClosed: false,
-				truncatedCandidates: 0,
+				truncatedCandidates,
 				calls,
 			};
 		},

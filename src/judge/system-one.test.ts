@@ -98,4 +98,42 @@ describe("SystemOneJudge 两阶段判定", () => {
 		expect(verdict.failClosed).toBe(false);
 		expect(verdict.calls).toBe(1);
 	});
+
+	test("候选概率达阈值掩码、低于阈值丢弃（真实校准数字锚定）", async () => {
+		// 研究笔记 §1 网关实测：中文句中密码 0.96 掩码 / 同句订单号 0.04 丢弃 / gate 0.98
+		const PASSWORD = "Sup3rS3cretPass";
+		const ORDER = "1029384756";
+		const text = `部署密码是 ${PASSWORD}，订单号 ${ORDER}，请记录。`;
+		const fake = fakeClassify({
+			gate: () => 0.98,
+			candidate: (value) => (value === PASSWORD ? 0.96 : 0.04),
+		});
+		const judge = createSystemOneJudge({ classify: fake.classify });
+
+		const verdict = await judge.judgeText(text);
+
+		expect(verdict.gateHit).toBe(true);
+		expect(verdict.spans).toEqual([
+			{
+				start: text.indexOf(PASSWORD),
+				end: text.indexOf(PASSWORD) + PASSWORD.length,
+				detector: "systemone-judge",
+			},
+		]);
+		expect(verdict.clean).toBe(false);
+		expect(verdict.calls).toBe(2); // gate + 1 个候选批
+		// 候选问题形态：单次调用、逐候选 bool 问（instructions 引用 candidates.{i}）
+		const candidateCall = fake.calls[1];
+		expect(candidateCall).toBeDefined();
+		const values = Object.values(candidateCall.state.candidates as Record<string, string>);
+		expect(values).toContain(PASSWORD);
+		expect(values).toContain(ORDER);
+		for (const [id, question] of candidateCall.questions) {
+			expect(id).toMatch(/^cand_\d+$/);
+			expect(question.type).toBe("bool");
+			expect(question.instructions).toContain(
+				`candidates.${id.slice("cand_".length)} a complete`,
+			);
+		}
+	});
 });
