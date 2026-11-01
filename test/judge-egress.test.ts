@@ -44,15 +44,25 @@ function fakeClassifierModel(): ClassifierModel<ClassifierApi> {
 	} as unknown as ClassifierModel<ClassifierApi>;
 }
 
-/** 概率脚本假 classify：记录调用，gate/candidate 概率由脚本给出。 */
+/** 概率脚本假 classify：记录调用，gate/candidate 概率由脚本给出；可选
+ *  stall 挂起制造并发窗口并统计在途峰值（消息级并发观测）。 */
 function scriptClassify(script: {
 	gate: (text: string) => number;
 	candidate: (value: string) => number;
 	error?: boolean;
+	stall?: () => Promise<void>;
 }) {
 	const calls: ClassifierContext[] = [];
+	let inFlight = 0;
+	let peak = 0;
 	const classify = async (context: ClassifierContext): Promise<ClassifierResult> => {
 		calls.push(structuredClone(context));
+		if (script.stall) {
+			inFlight++;
+			peak = Math.max(peak, inFlight);
+			await script.stall();
+			inFlight--;
+		}
 		const base = {
 			api: "typesafe-system-one" as const,
 			provider: "keep-secret-fake",
@@ -76,7 +86,7 @@ function scriptClassify(script: {
 		}
 		return { ...base, answers, stopReason: "stop" };
 	};
-	return { classify, calls };
+	return { classify, calls, peak: () => peak };
 }
 
 /** 空状态计数（每用例独立实例，断言不静默降级）。 */
@@ -192,6 +202,35 @@ describe("T5 judge 出站扩展（接缝 1）", () => {
 			expect(out).toMatch(/key-[A-Z2-7]{12}/);
 			expect(status.failClosed).toBeGreaterThan(0);
 			expect(status.degradedRequests).toBe(0);
+		} finally {
+			h.dispose();
+		}
+	});
+
+	test("消息级并发：多文本叶的 gate 调用在退道内重叠（信号量限 8）", async () => {
+		const pipeline = createMaskingPipeline();
+		const fake = scriptClassify({
+			gate: () => 0.02, // 干净文本：每叶一次 gate 后短路
+			candidate: () => 0.02,
+			stall: () => new Promise((resolve) => setTimeout(resolve, 10)),
+		});
+		const h = await createHarnessSession({
+			extensionFactories: [
+				createJudgeEgressExtension({
+					modelRef: MODEL_REF,
+					pipeline,
+					resolveModel: () => fakeClassifierModel(),
+					classify: (_model, context) => fake.classify(context),
+				}),
+				createEgressMaskingExtension({ pipeline }),
+			],
+		});
+		try {
+			h.provider.setScript([{ text: "ack" }]);
+			await h.session.prompt("hello world");
+			// system 与 user 两个文本叶的 gate 在退道内重叠（串行则峰值恒为 1）
+			expect(fake.peak()).toBeGreaterThan(1);
+			expect(fake.peak()).toBeLessThanOrEqual(8); // 会话级信号量上限
 		} finally {
 			h.dispose();
 		}
