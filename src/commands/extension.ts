@@ -23,7 +23,7 @@ import type { MaskingPipeline } from "../masking/index.ts";
 import type { ConfigLoader } from "../config/index.ts";
 import { configFingerprint } from "../config/index.ts";
 import type { MaskedCompactionStatus } from "../compaction/index.ts";
-import type { JudgeTextMasker } from "../judge/index.ts";
+import type { JudgeTextMasker, JudgeWire } from "../judge/index.ts";
 
 export interface KeepSecretCommandsOptions {
 	/** 配置 loader（状态面的配置摘要来源；reload 动作消费）。 */
@@ -70,6 +70,18 @@ function hitRate(hits: number, total: number): string {
 	return `${Math.round((hits / total) * 100)}%`;
 }
 
+/** 生效线缆描述（T16：状态面 judge 行尾段；解析前不展示）。 */
+function describeJudgeWire(wire: JudgeWire): string {
+	switch (wire.source) {
+		case "registered":
+			return `跟随注册（${wire.api}）`;
+		case "override":
+			return `覆盖 ${wire.preference}（${wire.api}）`;
+		case "plugin":
+			return `插件自定义 ${wire.api}（judge.api 偏好 ${wire.ineffectivePreference} 未生效）`;
+	}
+}
+
 /** /keep-secret 状态面板文本（数据源：loader/pipeline/compaction/judge）。 */
 function buildStatusReport(options: KeepSecretCommandsOptions): string {
 	const config = options.loader.get();
@@ -93,10 +105,12 @@ function buildStatusReport(options: KeepSecretCommandsOptions): string {
 			: `检测器命中：${[...hits.entries()].map(([name, count]) => `${name}=${count}`).join(", ")}`,
 	);
 	const judgeMode = config.judge?.onMissing ?? "fail_closed";
+	const wirePart =
+		options.judge?.wire === undefined ? "" : `；线缆：${describeJudgeWire(options.judge.wire)}`;
 	lines.push(
 		options.judge === undefined
 			? "judge：未接入（未配置 judge 段，仅 regex 检测层）"
-			: `judge：已判定 ${options.judge.status.judgedTexts} 叶，截断 ${options.judge.status.truncatedCandidates} 次，fail-closed ${options.judge.status.failClosed} 次，降级 ${options.judge.status.degradedTexts} 叶（模型缺失策略：${judgeMode}）`,
+			: `judge：已判定 ${options.judge.status.judgedTexts} 叶，截断 ${options.judge.status.truncatedCandidates} 次，fail-closed ${options.judge.status.failClosed} 次，降级 ${options.judge.status.degradedTexts} 叶（模型缺失策略：${judgeMode}${wirePart}）`,
 	);
 	lines.push(
 		`掩码压缩取消：${options.compaction.cancellations} 次` +
@@ -192,7 +206,7 @@ async function buildSelfTestReport(
 		options.judge.status.degradedTexts > 0 &&
 		!allPassed
 	) {
-		lines.push("注意：judge 已降级（classifier 模型不可用或 judge.api 与模型注册 api 不一致，仅 regex 检测层工作）——假密码项未通过即降级信号");
+		lines.push("注意：judge 已降级（classifier 模型不可用，仅 regex 检测层工作）——假密码项未通过即降级信号");
 	}
 	if (failClosedNoModel) {
 		lines.push(

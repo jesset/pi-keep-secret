@@ -15,13 +15,14 @@ import type {
 } from "@earendil-works/pi-ai";
 import type { JudgeStatus } from "../src/judge/index.ts";
 
-/** 进程内假 classifier 模型（typesafe-system-one 形态，仅测试）。 */
-export function fakeClassifierModel(): ClassifierModel<ClassifierApi> {
+/** 进程内假 classifier 模型（仅测试；api 可指定线缆形态，缺省
+ *  typesafe-system-one；插件自定义名用于 T16 线缆偏好用例）。 */
+export function fakeClassifierModel(api: string = "typesafe-system-one"): ClassifierModel<ClassifierApi> {
 	return {
 		type: "classifier",
 		id: "jev-fake",
 		name: "Fake Jev",
-		api: "typesafe-system-one",
+		api,
 		provider: "keep-secret-fake",
 		baseUrl: "http://127.0.0.1:1/fake",
 		input: ["text"],

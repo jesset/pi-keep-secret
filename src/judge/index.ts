@@ -22,6 +22,7 @@ export {
 	type JudgeEgressOptions,
 	type JudgeStatus,
 	type JudgeTextMasker,
+	type JudgeWire,
 	type ModelResolver,
 } from "./extension.ts";
 export {

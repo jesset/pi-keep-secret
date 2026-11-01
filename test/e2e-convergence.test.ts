@@ -420,15 +420,19 @@ describe("T8 端到端收敛用例（正式组合入口）", () => {
 	});
 });
 
-describe("T14 judge 双协议配置（judge.api，正式组合入口）", () => {
-	test("judge.api 与模型注册 api 匹配：正常装配判定，命令面无降级", async () => {
+describe("T16 judge.api 线缆偏好（正式组合入口）", () => {
+	test("偏好与注册线缆一致：正常装配判定，命令面无降级且展示覆盖线缆", async () => {
 		const fake = passwordJudge();
+		const seenApis: string[] = [];
 		const ext = createKeepSecretExtension({
 			configPath: writeTempConfig(
 				JSON.stringify({ judge: { ...JSON.parse(JUDGE_CONFIG).judge, api: "systemone" } }),
 			),
-			resolveModel: () => fakeClassifierModel(), // typesafe-system-one：与 api: "systemone" 匹配
-			classify: (_model, context) => fake.classify(context),
+			resolveModel: () => fakeClassifierModel(), // typesafe-system-one：与偏好 systemone 一致（覆盖幂等）
+			classify: (m, context) => {
+				seenApis.push(m.api);
+				return fake.classify(context);
+			},
 		});
 		const h = await createHarnessSession({ extensionFactories: [ext] });
 		try {
@@ -437,37 +441,76 @@ describe("T14 judge 双协议配置（judge.api，正式组合入口）", () => 
 			const out = requestText(h.provider.requests()[0]);
 			expect(out).not.toContain(PASSWORD); // judge 照常判定掩码
 			expect(out).not.toContain(OPENAI_KEY);
+			expect(seenApis.length).toBeGreaterThan(0);
 			const status = await runKeepSecretCommand(ext, "");
 			expect(status).toMatch(/judge：已判定 \d+ 叶，截断 0 次，fail-closed 0 次，降级 0 叶/);
+			expect(status).toContain("线缆：覆盖 systemone（typesafe-system-one）");
 		} finally {
 			h.dispose();
 		}
 	});
 
-	test("judge.api 与模型注册 api 不匹配：配置错误——judge 未装配仅 regex 层，命令面降级可见", async () => {
+	test("偏好覆盖另一线缆：内置 api 模型按配置分发——classify 收到覆盖值，密码照常掩码", async () => {
 		const fake = passwordJudge();
+		const seenApis: string[] = [];
 		const ext = createKeepSecretExtension({
 			configPath: writeTempConfig(
 				JSON.stringify({ judge: { ...JSON.parse(JUDGE_CONFIG).judge, api: "decisions" } }),
 			),
-			resolveModel: () => fakeClassifierModel(), // typesafe-system-one：与 api: "decisions" 不匹配
-			classify: (_model, context) => fake.classify(context),
+			resolveModel: () => fakeClassifierModel(), // typesafe-system-one：偏好 decisions → 覆盖分发
+			classify: (m, context) => {
+				seenApis.push(m.api);
+				return fake.classify(context);
+			},
 		});
 		const h = await createHarnessSession({ extensionFactories: [ext] });
 		try {
 			h.provider.setScript([{ text: "ack" }]);
 			await h.session.prompt(`部署密码 ${PASSWORD}，密钥 ${OPENAI_KEY}`);
 			const out = requestText(h.provider.requests()[0]);
-			expect(out).toContain(PASSWORD); // judge 未装配（配置错误语义）：密码原样出站（regex 层不可见）
-			expect(out).not.toContain(OPENAI_KEY); // regex 层照常掩码
-			expect(out).toMatch(/sk-[A-Z2-7]{12}/);
-			// 命令面可见：未判定 + 降级计数（模型缺失策略行仍展示 onMissing 缺省值）
+			expect(out).not.toContain(PASSWORD); // 覆盖线缆照常判定掩码（不再拒绝装配）
+			expect(out).not.toContain(OPENAI_KEY);
+			expect(out).toMatch(/key-[A-Z2-7]{12}/);
+			expect(seenApis.length).toBeGreaterThan(0);
+			expect(new Set(seenApis)).toEqual(new Set(["openai-decisions"])); // classify 收到的 model.api 为覆盖值
 			const status = await runKeepSecretCommand(ext, "");
-			expect(status).toMatch(
-				/judge：已判定 0 叶，截断 0 次，fail-closed 0 次，降级 \d+ 叶（模型缺失策略：fail_closed）/,
-			);
+			expect(status).toMatch(/fail-closed 0 次，降级 0 叶/);
+			expect(status).toContain("线缆：覆盖 decisions（openai-decisions）");
+		} finally {
+			h.dispose();
+		}
+	});
+
+	test("插件自定义 api + 偏好（用户现场场景）：尊重插件实现——正常装配掩码，命令面插件线缆与偏好未生效可见", async () => {
+		const fake = passwordJudge();
+		const seenApis: string[] = [];
+		const ext = createKeepSecretExtension({
+			configPath: writeTempConfig(
+				JSON.stringify({ judge: { ...JSON.parse(JUDGE_CONFIG).judge, api: "systemone" } }),
+			),
+			resolveModel: () => fakeClassifierModel("litellm-decisions"), // 插件注册的自定义 api（#16 现场）
+			classify: (m, context) => {
+				seenApis.push(m.api);
+				return fake.classify(context);
+			},
+		});
+		const h = await createHarnessSession({ extensionFactories: [ext] });
+		try {
+			h.provider.setScript([{ text: "ack" }]);
+			await h.session.prompt(`部署密码 ${PASSWORD}，密钥 ${OPENAI_KEY}`);
+			const out = requestText(h.provider.requests()[0]);
+			// 正常装配：judge 判定掩码照常（不再因名称不一致拒绝装配）
+			expect(out).not.toContain(PASSWORD);
+			expect(out).not.toContain(OPENAI_KEY);
+			expect(out).toMatch(/key-[A-Z2-7]{12}/);
+			expect(seenApis.length).toBeGreaterThan(0);
+			expect(new Set(seenApis)).toEqual(new Set(["litellm-decisions"])); // 插件实现不被改写
+			// 命令面：无降级计数，插件线缆与偏好未生效标记可见
+			const status = await runKeepSecretCommand(ext, "");
+			expect(status).toMatch(/judge：已判定 \d+ 叶，截断 0 次，fail-closed 0 次，降级 0 叶/);
+			expect(status).toContain("线缆：插件自定义 litellm-decisions（judge.api 偏好 systemone 未生效）");
 			const selfTest = await runKeepSecretCommand(ext, "test");
-			expect(selfTest).toMatch(/假密码：未掩码（期望：掩码/); // 自测如实报告降级
+			expect(selfTest).toMatch(/4\/4 通过/); // judge 正常工作：假密码项掩码通过
 		} finally {
 			h.dispose();
 		}

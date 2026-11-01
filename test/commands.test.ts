@@ -22,7 +22,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import { createConfiguredMaskingExtension, CONFIG_PATH_ENV } from "../src/config/index.ts";
 import type { MaskedCompactionStatus } from "../src/compaction/index.ts";
 import { createKeepSecretCommandsExtension } from "../src/commands/index.ts";
-import type { JudgeStatus, JudgeTextMasker } from "../src/judge/index.ts";
+import type { JudgeStatus, JudgeTextMasker, JudgeWire } from "../src/judge/index.ts";
 import { createHarnessSession, requestText } from "../src/harness/fake-session.ts";
 
 const OPENAI_KEY = "sk-live-abcdefghijklmnopqrst";
@@ -150,7 +150,7 @@ function emptyJudgeStatus(): JudgeStatus {
 
 /** 恒等掩码器的 judge 句柄（状态可注入；自测时假密码不被掩码）。 */
 function identityJudge(status: JudgeStatus = emptyJudgeStatus(), onMissing: "fail_closed" | "regex_only" = "fail_closed"): JudgeTextMasker {
-	return { status, onMissing, modelMissing: false, mask: async (text) => text };
+	return { status, onMissing, modelMissing: false, wire: undefined, mask: async (text) => text };
 }
 
 /** 自测假密码样本里的真值（judge 启用时期望被掩码的串）。 */
@@ -162,6 +162,7 @@ function passwordJudgingJudge(status: JudgeStatus = emptyJudgeStatus()): JudgeTe
 		status,
 		onMissing: "fail_closed",
 		modelMissing: false,
+		wire: undefined,
 		mask: async (text) => text.split(SELF_TEST_PASSWORD).join("key-JUDGEDFAKE1"),
 	};
 }
@@ -264,6 +265,36 @@ describe("T7 /keep-secret 状态面板", () => {
 		expect(text).toMatch(/judge：已判定 7 叶，截断 3 次，fail-closed 1 次，降级 0 叶/);
 	});
 
+	test("T16 状态面线缆展示：跟随注册 / 偏好覆盖 / 插件自定义（偏好未生效）；解析前不展示线缆段", async () => {
+		const made = makeCommands();
+		const statusLine = async (wire: JudgeWire | undefined): Promise<string> => {
+			const commands = createKeepSecretCommandsExtension({
+				loader: made.loader,
+				pipeline: made.pipeline,
+				compaction: made.compaction,
+				judge: { ...identityJudge(), wire },
+			});
+			return await runCommand(commands, "");
+		};
+		// 模型未解析前（wire undefined）：不展示线缆段
+		expect(await statusLine(undefined)).not.toContain("线缆：");
+		// 分支 1：缺省偏好——跟随模型注册条目
+		expect(await statusLine({ source: "registered", api: "typesafe-system-one" })).toContain(
+			"线缆：跟随注册（typesafe-system-one）",
+		);
+		// 分支 2：已知 classifier api + 偏好——覆盖分发线缆
+		expect(
+			await statusLine({ source: "override", preference: "systemone", api: "typesafe-system-one" }),
+		).toContain("线缆：覆盖 systemone（typesafe-system-one）");
+		expect(
+			await statusLine({ source: "override", preference: "decisions", api: "openai-decisions" }),
+		).toContain("线缆：覆盖 decisions（openai-decisions）");
+		// 分支 3：插件自定义 api——尊重插件实现 + 偏好未生效标记
+		expect(
+			await statusLine({ source: "plugin", api: "litellm-decisions", ineffectivePreference: "systemone" }),
+		).toContain("线缆：插件自定义 litellm-decisions（judge.api 偏好 systemone 未生效）");
+	});
+
 	test("非法配置：状态面报配置错误与回退标记（无 UI 模式的错误可见出口）", async () => {
 		const { commands } = makeCommands(
 			JSON.stringify({ detectors: [{ name: "bad", pattern: "corp-[{" }] }),
@@ -317,6 +348,7 @@ describe("T7 /keep-secret test 合成样本自测", () => {
 				status: emptyJudgeStatus(),
 				onMissing: "fail_closed",
 				modelMissing: true,
+				wire: undefined,
 				mask: async (text) =>
 					text
 						.replace(/ORD-\d{8}-\d{6}/, "key-FAKEFAKEFAKE")
