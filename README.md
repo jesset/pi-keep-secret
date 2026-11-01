@@ -248,7 +248,7 @@ const compose = (pi: ExtensionAPI): void => {
 
 1. **适配器纯替身**（`src/judge/system-one.test.ts`）：进程内假 classify 按问题 id 应答，概率脚本锚定真实网关实测校准数字（密码 0.96 / 订单号 0.04 / gate 0.98），同时记录全部调用锚定两阶段形态。
 2. **harness 注入点**（`test/judge-egress.test.ts`，接缝 1）：扩展工厂的 `resolveModel`/`classify` 选项挂进程内替身，驱动完整钩子链（judge → regex 串联、降级、fail_closed 全链路）；模型缺失用例走缺省 `findOfType` 路径（harness 注册表无该模型）。
-3. **真实网关验证**（`research/systemone-gateway.test.ts`）：默认跳过，三个环境变量齐备才启用（`PI_KEEP_SECRET_JUDGE_BASE_URL`/`_MODEL`/`_API_KEY`；凭据仅环境变量，严禁入库）；直接 POST 线缆级 noul 问题断言校准锚点区间。
+3. **真实网关验证**（`research/systemone-gateway.test.ts`）：默认跳过，三个环境变量齐备才启用（`PI_KEEP_SECRET_JUDGE_BASE_URL`/`_MODEL`/`_API_KEY`；凭据仅环境变量，严禁入库；可选第四变量 `PI_KEEP_SECRET_JUDGE_API=decisions` 切 OpenAI Decisions 线缆，缺省 systemone——T14）；直接 POST 线缆级问题（noul / predicate）断言校准锚点区间。
 
 ## 安装（用户级扩展目录）
 
@@ -306,6 +306,7 @@ rm -rf ~/.pi/agent/extensions/pi-keep-secret
   "judge": {
     "provider": "litellm",
     "modelId": "typesafe/jev-latest",
+    "api": "systemone",
     "gateThreshold": 0.5,
     "candidateThreshold": 0.7,
     "redactTemplate": "key-{hash}"
@@ -314,7 +315,7 @@ rm -rf ~/.pi/agent/extensions/pi-keep-secret
 ```
 
 - `detectors`：整体替换内置默认集（openai-key/github-pat/aws-access-key-id/google-api-key/slack-bot-token/pem-private-key/jwt）；空列表非法。
-- `judge`（T8）：System One 判定检测器。`provider`/`modelId` 必填——指向一个 **classifier 类型**的模型（models.json 注册或扩展 `pi.registerProvider`；端点须兼容 System One 协议，如 LiteLLM 网关 `/v1/systemone`）。阈值（`gateThreshold` 默认 0.5 / `candidateThreshold` 默认 0.7）、批参（`batchSize` 128 / `maxBatches` 8 / `maxChars` 24000 / `minCandidateLength` 6）、`concurrency`（8）、`redactTemplate`（`key-{hash}`）、`onMissing`（模型缺失策略：`fail_closed` 默认 / `regex_only` 显式知情降级，见 T5/T8 节）可调；未知键报错。未配置该段即不接入 judge（仅 regex 层）。
+- `judge`（T8/T14）：System One 判定检测器。`provider`/`modelId` 必填——指向一个 **classifier 类型**的模型（models.json 注册或扩展 `pi.registerProvider`；端点须兼容 System One 协议，如 LiteLLM 网关 `/v1/systemone` 或 `/v1/decisions`）。`api`（T14 可选线缆协议提示：`systemone` / `decisions`，缺省跟随模型注册条目的 `api` 字段；填写则装配时与模型注册 api 比对，不一致按配置错误处理——不装配 judge、仅 regex 层、错误可见，见 T14 节）。阈值（`gateThreshold` 默认 0.5 / `candidateThreshold` 默认 0.7）、批参（`batchSize` 128 / `maxBatches` 8 / `maxChars` 24000 / `minCandidateLength` 6）、`concurrency`（8）、`redactTemplate`（`key-{hash}`）、`onMissing`（模型缺失策略：`fail_closed` 默认 / `regex_only` 显式知情降级，见 T5/T8 节）可调；未知键报错。未配置该段即不接入 judge（仅 regex 层）。
 - judge 段变更与 `hashLength`/`cleanCache` 同语义：仅新会话生效（会话内装配在工厂创建时定格）；`detectors` 变更可经 `/keep-secret reload` 热应用。
 
 ## 已知限制汇总（0.1.0）
@@ -354,6 +355,66 @@ rm -rf ~/.pi/agent/extensions/pi-keep-secret
 - 非法配置 → 回退默认集加载无错、会话正常；
 - 用户级安装布局（`PI_CODING_AGENT_DIR` 临时 agent 目录 + `extensions/pi-keep-secret/{package.json, extension/, src/}`）→ 自动发现并加载成功（命令分发证明）；「No API key found」属模型不可用，不算扩展加载失败（票面口径）。
 - 真实模型冒烟（可选验收项，已执行）：`pi -p --extension <repo> --extension <出站探针>`（探针注册在后，看到的是掩码后、发供应商前的消息）提交假 key prompt → 出站只见伪值 `sk-<hash>`、真值零出站、模型正常应答。
+
+## T14：judge 双协议（/v1/systemone 与 /v1/decisions，issue #14）
+
+LiteLLM 网关的 `/v1/systemone` 与 `/v1/decisions` 是同一后端路由的两种线缆协议：前者对应 pi-ai `typesafe-system-one` 传输（POST `<baseUrl>/systemone`，bool 问题映射为线缆级 noul），后者对应 `openai-decisions` 传输（POST `<baseUrl>/decisions`，`{model,input,questions}`、bool→predicate、criteria 折进 instructions、state 作 JSON 文本放 input）。两种协议的 baseUrl 都配 `https://<host>/v1`（线缆路径由传输层拼接）。
+
+- **适配器零改动**：judge 适配器走 `modelRegistry.classify()`，传输协议由模型注册条目的 `api` 字段决定——config.json 的 `judge.api` 键只是校验提示（防配错线缆），不改变请求路径。
+- **两处分工**：loader（`src/config/loader.ts`）校验 `judge.api` 合法值（`systemone`|`decisions`，非法 → judge 段整体回退）；装配处（`src/judge/extension.ts` 的 `MODEL_API_BY_JUDGE_API`）在模型解析后比对 `model.api`（`typesafe-system-one`↔`systemone`、`openai-decisions`↔`decisions`），不一致 → 配置错误语义（同 judge 段非法整体回退）：不装配 judge、仅 regex 检测层、错误可见（notify/状态栏 + `/keep-secret` 降级计数；不走 fail_closed 兑底——配置错误非 judge 故障）。
+- **网关验证脚本**（`research/systemone-gateway.test.ts`）：默认跳过；三变量齐备启用，可选 `PI_KEEP_SECRET_JUDGE_API=decisions` 切 OpenAI 线缆（缺省 systemone）跑同一组校准区间断言（decisions 协议概率可能与 systemone 略有差异，断言用区间）。
+
+### models.json 双协议注册样例
+
+同一 LiteLLM 网关两个 classifier 条目（按需其一；`judge.provider`/`modelId` 指向其中一条）：
+
+```json
+{
+  "$schema": "https://pi.dev/schemas/models.schema.json",
+  "providers": {
+    "litellm": {
+      "baseUrl": "https://gateway.example.com/v1",
+      "apiKey": "$LITELLM_API_KEY",
+      "models": [
+        {
+          "type": "classifier",
+          "id": "typesafe/jev-latest",
+          "name": "Jev (System One)",
+          "api": "typesafe-system-one",
+          "input": ["text"],
+          "contextWindow": 128000
+        },
+        {
+          "type": "classifier",
+          "id": "openai/gpt-6-luna",
+          "name": "GPT-6 Luna (Decisions)",
+          "api": "openai-decisions",
+          "input": ["text"],
+          "contextWindow": 128000
+        }
+      ]
+    }
+  }
+}
+```
+
+### config.json 双协议样例
+
+`api` 与注册条目对应（缺省 `api` 则跟随注册条目，不校验）：
+
+```json
+{
+  "judge": {
+    "provider": "litellm",
+    "modelId": "openai/gpt-6-luna",
+    "api": "decisions",
+    "gateThreshold": 0.5,
+    "candidateThreshold": 0.7
+  }
+}
+```
+
+代码：`src/config/loader.ts`（judge.api 合法值）、`src/judge/extension.ts`（MODEL_API_BY_JUDGE_API 比对与降级）、`src/config/extension.ts`（透传）、`research/systemone-gateway.test.ts`（双线缆网关实测）；验收用例：`src/config/loader.test.ts`、`test/judge-egress.test.ts`（T14 describe）、`test/e2e-convergence.test.ts`（T14 describe）。
 
 ## 约定
 

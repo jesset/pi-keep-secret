@@ -19,6 +19,7 @@
 - 正式组合接线（judge 接入 `extension/index.ts`）：config.json 的 `judge` 段（provider/modelId/阈值/批参/并发/伪值模板）驱动装配，judge 先于 regex 出站扩展注册；JudgeStatus 接入命令面，自测假密码项期望随 judge 启用动态化；judge 文本掩码器抽为公共入口（出站链与自测共用同一实例）；降级叶记 clean cache 墓碑防「judge 恢复后被缓存短路」漏判（T8，#10）。
 - 端到端收敛用例（正式组合入口，接缝 1）：多轮掩码-还原-再掩码确定性、judge 故障 fail_closed 全链路、压缩后对话继续且伪值一致、图片内容字节不变（T8，#10）。
 - 目录扩展打包：`package.json` 的 `pi.extensions` 清单（`--extension <repo>` 与用户级目录发现共用）；README 安装/配置/卸载步骤与已知限制汇总（T8，#10）。
+- judge 双协议（T14，#14）：config.json 的 judge 段新增可选键 `api`（`systemone` / `decisions`）——缺省跟随模型注册条目的 `api` 字段（适配器协议无关，走 modelRegistry.classify）；填写则装配时与模型注册 api 比对（typesafe-system-one↔systemone、openai-decisions↔decisions），不一致按配置错误处理：不装配 judge、仅 regex 检测层、错误可见（非法值在 loader 整体回退）。网关验证脚本支持 `PI_KEEP_SECRET_JUDGE_API=decisions` 切 OpenAI Decisions 线缆；README 双协议 models.json/config 样例。
 
 ### Changed
 
