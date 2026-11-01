@@ -25,16 +25,22 @@ import {
 import {
 	fauxAssistantMessage,
 	fauxProvider,
+	fauxText,
+	fauxThinking,
 	fauxToolCall,
+	type FauxContentBlock,
 	type FauxResponseStep,
 	type JsonObject,
 	type Message,
 } from "@earendil-works/pi-ai";
 
-/** 一次脚本化的助手响应：文本，或一次工具调用。 */
+/**
+ * 一次脚本化的助手响应：文本（可带 thinking），或一次工具调用
+ * （可带 thinking/伴随文本；带 toolCall 时 stopReason 为 toolUse，轮次继续）。
+ */
 export type ScriptedResponse =
-	| { text: string }
-	| { toolCall: { name: string; arguments: JsonObject } };
+	| { text: string; thinking?: string }
+	| { toolCall: { name: string; arguments: JsonObject }; thinking?: string; text?: string };
 
 /** 假供应商视角看到的一次模型请求：context 钩子之后、发给「供应商」的全部消息。 */
 export interface ProviderRequest {
@@ -93,13 +99,18 @@ function toRecordedStep(
 			modelId: model.id,
 			messages: structuredClone(context.messages),
 		});
-		if ("text" in scripted) {
-			return fauxAssistantMessage(scripted.text);
+		const blocks: FauxContentBlock[] = [];
+		if (scripted.thinking !== undefined) {
+			blocks.push(fauxThinking(scripted.thinking));
 		}
-		return fauxAssistantMessage(
-			[fauxToolCall(scripted.toolCall.name, scripted.toolCall.arguments)],
-			{ stopReason: "toolUse" },
-		);
+		if ("text" in scripted && scripted.text !== undefined) {
+			blocks.push(fauxText(scripted.text));
+		}
+		if ("toolCall" in scripted) {
+			blocks.push(fauxToolCall(scripted.toolCall.name, scripted.toolCall.arguments));
+			return fauxAssistantMessage(blocks, { stopReason: "toolUse" });
+		}
+		return fauxAssistantMessage(blocks, {});
 	};
 }
 

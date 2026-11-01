@@ -100,4 +100,66 @@ describe("T2 出站掩码：context_with_system 消息树遍历", () => {
 			h.dispose();
 		}
 	});
+
+	test("assistant 历史 text/thinking/toolCall 参数深遍历重掩码，transcript 保留真值", async () => {
+		const runParams = Type.Object({ cmd: Type.String() });
+		const seenCmds: string[] = [];
+		const runCmd: ToolDefinition<typeof runParams> = {
+			name: "run_cmd",
+			label: "Run Cmd",
+			description: "Runs a command.",
+			parameters: runParams,
+			execute: async (_id, params) => {
+				seenCmds.push(params.cmd);
+				return { content: [{ type: "text", text: "ok" }], details: {} };
+			},
+		};
+		const h = await createHarnessSession({
+			extensionPaths: [EXTENSION_ENTRY],
+			customTools: [runCmd],
+		});
+		try {
+			// 供应商脚本化"泄露"响应：thinking 与深嵌套 toolCall 参数里带真值；
+			// 第二次响应带伴随文本（同消息 text+toolCall，轮次继续）以覆盖
+			// assistant 文本历史的重掩码
+			h.provider.setScript([
+				{
+					toolCall: {
+						name: "run_cmd",
+						arguments: {
+							cmd: `export KEY=${OPENAI_KEY}`,
+							env: { auth: `Bearer ${OPENAI_KEY}` },
+						},
+					},
+					thinking: `用户密钥是 ${OPENAI_KEY}，别外传`,
+				},
+				{
+					toolCall: { name: "run_cmd", arguments: { cmd: "noop" } },
+					text: `再确认一次 ${OPENAI_KEY}`,
+				},
+				{ text: "done" },
+			]);
+			await h.session.prompt("run the deploy");
+
+			// 轮次 2（assistant toolCall+thinking）与轮次 3（assistant text）出站都只见伪值
+			const requests = h.provider.requests();
+			expect(requests).toHaveLength(3);
+			for (const request of requests) {
+				expect(requestText(request)).not.toContain(OPENAI_KEY);
+			}
+			const second = requestText(requests[1]);
+			expect(second.match(/sk-[A-Z2-7]{12}/g)).toHaveLength(3); // thinking + cmd + 深嵌套 env.auth
+			expect(requestText(requests[2])).toMatch(/sk-[A-Z2-7]{12}/);
+
+			// 本地 transcript：assistant 消息（thinking/参数/文本）均保留真值
+			const transcript = JSON.stringify(h.session.messages);
+			expect(transcript).toContain(`Bearer ${OPENAI_KEY}`);
+			expect(transcript).toContain(`用户密钥是 ${OPENAI_KEY}`);
+			expect(transcript).toContain(`再确认一次 ${OPENAI_KEY}`);
+			// 工具执行拿到真值（T2 不做回程还原，脚本化参数原样落地）
+			expect(seenCmds).toEqual([`export KEY=${OPENAI_KEY}`, "noop"]);
+		} finally {
+			h.dispose();
+		}
+	});
 });
