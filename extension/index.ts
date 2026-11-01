@@ -5,6 +5,6 @@
  * transcript 的文本叶做检测并替换为确定性伪值（`context_with_system`）。
  * 回程还原（T3）、judge（T5）、掩码压缩（T6）见规格 #1。
  */
-import { createEgressMaskingExtension } from "../src/masking/extension.ts";
+import { createEgressMaskingExtension } from "../src/masking/index.ts";
 
 export default createEgressMaskingExtension();

@@ -11,7 +11,7 @@
  * 会话 transcript 不受影响。
  */
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ImageContent, JsonObject, SystemMessage, TextContent } from "@earendil-works/pi-ai";
+import type { ImageContent, SystemMessage, TextContent } from "@earendil-works/pi-ai";
 /** 单文本叶的掩码函数（由检测管线提供）。 */
 export type TextMasker = (text: string) => string;
 
