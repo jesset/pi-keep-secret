@@ -127,12 +127,14 @@ const compose = (pi: ExtensionAPI): void => {
     { "name": "corp-api-key", "pattern": "corp-[A-Za-z0-9]{20,}",
       "redactTemplate": "corp-{hash}" }
   ],
+  "detectorsMode": "merge",
   "hashLength": 20,
   "cleanCache": { "limit": 20000, "ttlMs": 86400000 }
 }
 ```
 
-- `detectors`：检测器列表（`name`/`pattern`/`redactTemplate`，模板缺省 `{hash}`；`{hash}` 可多次出现保持形状，如 JWT `"eyJ{hash}.{hash}.{hash}"`）。**整体替换**内置默认集（对齐参考实现 secret_detectors 语义）；空列表非法（防止意外关掉全部本地检测）。
+- `detectors`：检测器列表（`name`/`pattern`/`redactTemplate`，模板缺省 `{hash}`；`{hash}` 可多次出现保持形状，如 JWT `"eyJ{hash}.{hash}.{hash}"`）。装配语义由 `detectorsMode` 决定（见下）；空列表非法（防止意外关掉全部本地检测）。
+- `detectorsMode`（T13，#13）：检测器装配策略，`replace`（默认）/`merge`——replace：`detectors` **整体替换**内置默认集（对齐参考实现 secret_detectors 语义，现行为）；merge：内置默认集 + 用户 `detectors` 合并，**同名用户项原位覆盖对应内置项**（可微调 pattern/redactTemplate，如收紧 sk- 的排除规则），非同名项追加在内置之后（内置序保持在前）；`detectors` 未配置时两模式等价纯内置集。非法值 → 整体回退内置默认集 + 错误可见（沿既有全有或全无语义）。模式与生效集均纳入配置指纹：`/keep-secret reload` 热应用（状态面展示模式与生效检测器数）。
 - `hashLength`：伪值哈希段长度，整数 1..52（base32(sha256) 长度），缺省 12。
 - `cleanCache`：`limit`/`ttlMs` 调参，缺省 20000 / 24h。
 - 路径解析优先级：显式参数 > 环境变量 `PI_KEEP_SECRET_CONFIG` > 默认 `~/.pi/agent/extensions/pi-keep-secret/config.json`。
@@ -145,7 +147,7 @@ import { createConfigLoader, createConfiguredMaskingExtension } from "./src/conf
 
 // 纯 loader：load（创建即加载）/ reload（重读磁盘，内容变更才通知订阅者）
 const loader = createConfigLoader({ path?: string });
-loader.get();          // ResolvedConfig { path, exists, detectors, hashLength?, cleanCache?, errors }
+loader.get();          // ResolvedConfig { path, exists, detectors, detectorsMode, hashLength?, cleanCache?, errors }
 loader.reload();       // 重读并返回；指纹变更时同步通知订阅者
 loader.subscribe(fn);  // 订阅变更，返回解绑（订阅不回放当前值）
 
@@ -216,7 +218,7 @@ const compose = (pi: ExtensionAPI): void => {
 
 ### /keep-secret 命令面（三子命令）
 
-- `/keep-secret`（状态）：检测器配置摘要（来源/条数/名列表，含非法配置的错误行与回退标记）、伪值注册表条数、clean cache 条数与命中率（命中 x / 检测 y）、各检测器命中计数（`name=N`）、judge 计数（T8 已接入：配置 judge 段后展示已判定/截断/fail-closed/降级计数与生效的模型缺失策略，未配置显示「未接入」）、掩码压缩取消计数与最近原因。
+- `/keep-secret`（状态）：检测器配置摘要（来源/模式（replace|merge，T13）/条数/名列表，含非法配置的错误行与回退标记）、伪值注册表条数、clean cache 条数与命中率（命中 x / 检测 y）、各检测器命中计数（`name=N`）、judge 计数（T8 已接入：配置 judge 段后展示已判定/截断/fail-closed/降级计数与生效的模型缺失策略，未配置显示「未接入」）、掩码压缩取消计数与最近原因。
 - `/keep-secret test`：合成样本（sk- 假 key、URL 藏 key、假密码、干净订单号）逐项过会话链路（T8 起 judge 启用时经 judge→regex 全链评估，与出站链同序），报告已掩码/未掩码与期望比对；与期望一致为通过，全部通过 info、有未通过 warning。假密码项期望随 judge 是否启用动态化：启用→期望掩码（regex_only 降级时如实报未通过——降级可见信号）；未启用→期望未掩码（regex 层不命中属预期）。当前配置未覆盖某样本时如实报告未通过。模型缺失 + fail_closed（默认）生效时全部样本期望掩码（未验证候选一律兑底掩码，含干净订单号）并附说明行。
 - `/keep-secret reload`：调 `loader.reload()`（变更时同步热应用：applyDetectors + 清空缓存）；变更判定与 loader 同口径（`configFingerprint`），结果经 notify 报告（检测器集变更→已热应用 / 检测器集未变但其他段变更（judge/hashLength/cleanCache）→ 已重读且仅新会话生效 / 无变更 / 配置错误回退）。
 - 未知子命令 → 用法提示。
@@ -301,6 +303,7 @@ rm -rf ~/.pi/agent/extensions/pi-keep-secret
   "detectors": [
     { "name": "corp-api-key", "pattern": "corp-[A-Za-z0-9]{20,}", "redactTemplate": "corp-{hash}" }
   ],
+  "detectorsMode": "merge",
   "hashLength": 12,
   "cleanCache": { "limit": 20000, "ttlMs": 86400000 },
   "judge": {
@@ -313,7 +316,8 @@ rm -rf ~/.pi/agent/extensions/pi-keep-secret
 }
 ```
 
-- `detectors`：整体替换内置默认集（openai-key/github-pat/aws-access-key-id/google-api-key/slack-bot-token/pem-private-key/jwt）；空列表非法。
+- `detectors`：装配语义由 `detectorsMode`（T13）决定——`replace`（默认）整体替换内置默认集（openai-key/github-pat/aws-access-key-id/google-api-key/slack-bot-token/pem-private-key/jwt）；`merge` 内置集与用户项合并（同名用户项原位覆盖内置，非同名追加在内置之后）；空列表非法。
+- `detectorsMode`：`replace` | `merge`（默认 replace，现行为不变）；非法值整体回退默认集 + 错误可见；生效集含模式变更可经 `/keep-secret reload` 热应用（状态面展示模式与生效检测器数）。
 - `judge`（T8）：System One 判定检测器。`provider`/`modelId` 必填——指向一个 **classifier 类型**的模型（models.json 注册或扩展 `pi.registerProvider`；端点须兼容 System One 协议，如 LiteLLM 网关 `/v1/systemone`）。阈值（`gateThreshold` 默认 0.5 / `candidateThreshold` 默认 0.7）、批参（`batchSize` 128 / `maxBatches` 8 / `maxChars` 24000 / `minCandidateLength` 6）、`concurrency`（8）、`redactTemplate`（`key-{hash}`）、`onMissing`（模型缺失策略：`fail_closed` 默认 / `regex_only` 显式知情降级，见 T5/T8 节）可调；未知键报错。未配置该段即不接入 judge（仅 regex 层）。
 - judge 段变更与 `hashLength`/`cleanCache` 同语义：仅新会话生效（会话内装配在工厂创建时定格）；`detectors` 变更可经 `/keep-secret reload` 热应用。
 
