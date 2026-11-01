@@ -387,6 +387,24 @@ describe("T7 /keep-secret reload 配置热重载", () => {
 		expect(made.loader.get().detectors).toHaveLength(1);
 	});
 
+	test("非检测器段变更（judge 配置）reload → 配置已重读、检测器集无变更且仅新会话生效", async () => {
+		const made = makeCommands(ALPHA_CONFIG);
+		// 检测器集不变，仅新增 judge 段（与 loader 的 fingerprint 同口径判定为变更）
+		writeFileSync(
+			made.configPath,
+			JSON.stringify({
+				detectors: JSON.parse(ALPHA_CONFIG).detectors,
+				judge: { provider: "litellm", modelId: "typesafe/jev-latest" },
+			}),
+			"utf8",
+		);
+		const text = await runCommand(made.commands, "reload");
+		expect(text).toContain("检测器集无变更");
+		expect(text).toContain("仅新会话生效");
+		expect(text).not.toContain("已热应用"); // 检测器集未变：不触发热应用
+		expect(made.loader.get().judge?.modelId).toBe("typesafe/jev-latest");
+	});
+
 	test("reload 读到非法新配置 → notify 报错并回退内置默认集", async () => {
 		const made = makeCommands(ALPHA_CONFIG);
 		writeFileSync(made.configPath, JSON.stringify({ detectors: [{ name: "bad", pattern: "((" }] }), "utf8");

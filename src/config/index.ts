@@ -14,11 +14,13 @@ export {
 } from "./extension.ts";
 export {
 	CONFIG_PATH_ENV,
+	configFingerprint,
 	createConfigLoader,
 	defaultConfigPath,
 	type CleanCacheConfig,
 	type ConfigLoader,
 	type ConfigLoaderOptions,
 	type JudgeConfig,
+	type JudgeOnMissing,
 	type ResolvedConfig,
 } from "./loader.ts";

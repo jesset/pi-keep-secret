@@ -29,10 +29,10 @@ import type {
 	ClassifierModel,
 	ClassifierResult,
 } from "@earendil-works/pi-ai";
-import { extractCandidates, redactText, type Span } from "../engine/index.ts";
+import { extractCandidates, type Span } from "../engine/index.ts";
 import type { JudgeOnMissing } from "../config/loader.ts";
 import type { MaskingPipeline } from "../masking/index.ts";
-import { maskMessageTreeAsync } from "../masking/index.ts";
+import { maskMessageTreeAsync, redactSpansWithRegistry } from "../masking/index.ts";
 import {
 	DEFAULT_DETECTOR_NAME,
 	createSystemOneJudge,
@@ -152,22 +152,15 @@ export function createJudgeTextMasker(options: JudgeEgressOptions): JudgeTextMas
 	let modelMissing = false;
 
 	/** 模型缺失的 fail_closed 兜底：与 classify 故障同路径——该文本抽取出的
-	 *  候选未获判定结论，一律掩码（幂等过滤已是伪值的候选，防嵌套）。 */
+	 *  候选未获判定结论，一律掩码（与 regex 管线共享掩码尾段，幂等过滤已是
+	 *  伪值的候选，防嵌套）。 */
 	const maskUnverifiedLocally = (text: string): string => {
 		const spans: Span[] = extractCandidates(text, minCandidateLength).map((candidate) => ({
 			start: candidate.start,
 			end: candidate.end,
 			detector: detectorName,
 		}));
-		const unverified = spans.filter(
-			(span) => !registry.has(text.slice(span.start, span.end)),
-		);
-		if (unverified.length === 0) {
-			return text;
-		}
-		return redactText(text, unverified, templates, {
-			issuePlaceholder: (secret) => registry.issue(secret, templates.get(detectorName)!),
-		}).text;
+		return redactSpansWithRegistry(text, spans, registry, templates).text;
 	};
 
 	const mask = async (text: string, ctx: ExtensionContext): Promise<string> => {
@@ -256,16 +249,9 @@ export function createJudgeTextMasker(options: JudgeEgressOptions): JudgeTextMas
 		if (!verdict.clean) {
 			pipeline.cleanCache.remember(text, { hasSecret: true });
 		}
-		// 幂等：命中串若已是本注册表签发的伪值则跳过（防嵌套伪值，与 regex 管线同语义）
-		const spans = verdict.spans.filter(
-			(span) => !registry.has(text.slice(span.start, span.end)),
-		);
-		if (spans.length === 0) {
-			return text;
-		}
-		return redactText(text, spans, templates, {
-			issuePlaceholder: (secret) => registry.issue(secret, templates.get(detectorName)!),
-		}).text;
+		// 幂等与签发在共享尾段内完成（redactSpansWithRegistry：已是本注册表
+		// 伪值的命中跳过，防嵌套；与 regex 管线同语义）
+		return redactSpansWithRegistry(text, verdict.spans, registry, templates).text;
 	};
 
 	return { status, onMissing, get modelMissing() { return modelMissing; }, mask };

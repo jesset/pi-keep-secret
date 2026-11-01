@@ -206,6 +206,12 @@ async function maskJsonStringsAsync(value: unknown, maskText: AsyncTextMasker): 
  * summary 字段与 bashExecution/custom 自定义消息）；同步遍历保持 T2/T6
  * 路径零开销，不因异步检测器行变。
  * 按消息并发（消息级并发，对齐参考实现：LLM 调用另有会话级信号量限流）。
+ *
+ * 同步/异步孪生是有意保留的重复（去重压制理由）：若合并为接受
+ * `string | Promise<string>` 的单一通用遍历器，同步路径（regex 出站与
+ * 掩码压缩——每请求热路径）的每个文本叶都要跨 await/promise 包装，
+ * 破坏「同步路径零开销」的既有理由；因此逐角色镜像两份，新增角色必须
+ * 两份同步修改（用例分别锚定同步链与 judge 异步链）。
  */
 export async function maskMessageTreeAsync(
 	messages: AgentMessage[],

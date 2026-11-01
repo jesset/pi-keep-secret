@@ -218,7 +218,7 @@ const compose = (pi: ExtensionAPI): void => {
 
 - `/keep-secret`（状态）：检测器配置摘要（来源/条数/名列表，含非法配置的错误行与回退标记）、伪值注册表条数、clean cache 条数与命中率（命中 x / 检测 y）、各检测器命中计数（`name=N`）、judge 计数（T8 已接入：配置 judge 段后展示已判定/截断/fail-closed/降级计数，未配置显示「未接入」）、掩码压缩取消计数与最近原因。
 - `/keep-secret test`：合成样本（sk- 假 key、URL 藏 key、假密码、干净订单号）逐项过会话链路（T8 起 judge 启用时经 judge→regex 全链评估，与出站链同序），报告已掩码/未掩码与期望比对；与期望一致为通过，全部通过 info、有未通过 warning。假密码项期望随 judge 是否启用动态化：启用→期望掩码（regex_only 降级时如实报未通过——降级可见信号）；未启用→期望未掩码（regex 层不命中属预期）。当前配置未覆盖某样本时如实报告未通过。模型缺失 + fail_closed（默认）生效时全部样本期望掩码（未验证候选一律兑底掩码，含干净订单号）并附说明行。
-- `/keep-secret reload`：调 `loader.reload()`（变更时同步热应用：applyDetectors + 清空缓存）；检测结果经 notify 报告（已热应用/无变更/配置错误回退）。
+- `/keep-secret reload`：调 `loader.reload()`（变更时同步热应用：applyDetectors + 清空缓存）；变更判定与 loader 同口径（`configFingerprint`），结果经 notify 报告（检测器集变更→已热应用 / 检测器集未变但其他段变更（judge/hashLength/cleanCache）→ 已重读且仅新会话生效 / 无变更 / 配置错误回退）。
 - 未知子命令 → 用法提示。
 
 ### 三模式安全降级

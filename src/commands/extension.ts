@@ -21,6 +21,7 @@ import { compileRegexDetector, detectRegexSpans, type CompiledRegexDetector } fr
 import { DEFAULT_DETECTOR_SPECS } from "../masking/detectors.ts";
 import type { MaskingPipeline } from "../masking/index.ts";
 import type { ConfigLoader } from "../config/index.ts";
+import { configFingerprint } from "../config/index.ts";
 import type { MaskedCompactionStatus } from "../compaction/index.ts";
 import type { JudgeTextMasker } from "../judge/index.ts";
 
@@ -230,20 +231,30 @@ export function createKeepSecretCommandsExtension(options: KeepSecretCommandsOpt
 				}
 				case "reload": {
 					const before = options.loader.get();
+					const beforeFingerprint = configFingerprint(before);
 					const after = options.loader.reload(); // 变更时同步触发热应用（applyDetectors + 清空缓存）
 					if (after.errors.length > 0) {
 						ctx.ui.notify(
 							`pi-keep-secret reload：配置错误（已回退内置默认集）——\n${after.errors.join("\n")}`,
 							"error",
 						);
-					} else if (JSON.stringify(before.detectors) !== JSON.stringify(after.detectors)) {
-						ctx.ui.notify(
-							`pi-keep-secret reload：检测器集已热应用（${after.detectors.length} 个：${after.detectors.map((d) => d.name).join(", ")}；hashLength/cleanCache 变更仅新会话生效）`,
-							"info",
-						);
+					} else if (configFingerprint(after) !== beforeFingerprint) {
+						// 变更判定与 loader.reload/订阅同口径（configFingerprint）；检测器
+						// 集是否变化仅决定提示语（热应用 vs 仅新会话生效）
+						if (JSON.stringify(before.detectors) !== JSON.stringify(after.detectors)) {
+							ctx.ui.notify(
+								`pi-keep-secret reload：检测器集已热应用（${after.detectors.length} 个：${after.detectors.map((d) => d.name).join(", ")}；hashLength/cleanCache 变更仅新会话生效）`,
+								"info",
+							);
+						} else {
+							ctx.ui.notify(
+								"pi-keep-secret reload：配置已重读，检测器集无变更（judge/hashLength/cleanCache 变更仅新会话生效）",
+								"info",
+							);
+						}
 					} else {
 						ctx.ui.notify(
-							"pi-keep-secret reload：配置已重读，检测器集无变更（hashLength/cleanCache 变更仅新会话生效）",
+							"pi-keep-secret reload：配置无变更",
 							"info",
 						);
 					}

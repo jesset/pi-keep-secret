@@ -15,6 +15,7 @@
 export { createEgressMaskingExtension, type EgressMaskingOptions } from "./extension.ts";
 export {
 	createMaskingPipeline,
+	redactSpansWithRegistry,
 	type MaskingPipeline,
 	type MaskingPipelineOptions,
 } from "./pipeline.ts";

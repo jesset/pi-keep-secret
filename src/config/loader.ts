@@ -393,8 +393,8 @@ function loadFromDisk(path: string): ResolvedConfig {
 	};
 }
 
-/** 配置内容指纹（reload 变更判定与订阅通知依据）。 */
-function fingerprint(config: ResolvedConfig): string {
+/** 配置内容指纹（reload 变更判定与订阅通知的唯一口径；命令面 reload 复用）。 */
+export function configFingerprint(config: ResolvedConfig): string {
 	return JSON.stringify([
 		config.exists,
 		config.detectors,
@@ -431,7 +431,7 @@ export function createConfigLoader(options: ConfigLoaderOptions = {}): ConfigLoa
 		},
 		reload() {
 			const next = loadFromDisk(path);
-			const changed = fingerprint(next) !== fingerprint(current);
+			const changed = configFingerprint(next) !== configFingerprint(current);
 			current = next;
 			if (changed) {
 				for (const listener of [...listeners]) {

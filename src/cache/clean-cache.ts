@@ -15,6 +15,7 @@
  * 同一文本后续的干净结论（如后置 regex 层零命中）不得覆写，每轮重判。
  */
 import { createHash } from "node:crypto";
+import { evictLRU } from "./lru.ts";
 
 /** 默认容量上限（对齐参考实现 CLEAN_CACHE_MAX 20000）。 */
 const DEFAULT_LIMIT = 20000;
@@ -106,12 +107,7 @@ export function createCleanCache(options: CleanCacheOptions = {}): CleanCache {
 			if (outcome.hasSecret) {
 				expiry.delete(key); // 若曾有干净条目一并作废
 				dirty.add(key); // Set 尾部 = 最近插入
-				while (dirty.size > limit) {
-					const oldest = dirty.values().next().value;
-					if (oldest === undefined) break;
-					dirty.delete(oldest);
-					evictions++;
-				}
+				evictions += evictLRU(dirty, limit);
 				return; // 命中 secret/gate 的文本不缓存
 			}
 			if (dirty.has(key)) {
@@ -119,12 +115,7 @@ export function createCleanCache(options: CleanCacheOptions = {}): CleanCache {
 			}
 			expiry.delete(key);
 			expiry.set(key, now() + ttlMs); // 尾部 = 最近写入
-			while (expiry.size > limit) {
-				const oldest = expiry.keys().next().value;
-				if (oldest === undefined) break;
-				expiry.delete(oldest);
-				evictions++;
-			}
+			evictions += evictLRU(expiry, limit);
 		},
 		stats() {
 			return { size: expiry.size, hits, misses, evictions };
