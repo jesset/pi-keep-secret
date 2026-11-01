@@ -354,6 +354,7 @@ rm -rf ~/.pi/agent/extensions/pi-keep-secret
 - config.json 含 judge 段 + 模型不可用 → 降级路径加载无错、会话正常；
 - 非法配置 → 回退默认集加载无错、会话正常；
 - 用户级安装布局（`PI_CODING_AGENT_DIR` 临时 agent 目录 + `extensions/pi-keep-secret/{package.json, extension/, src/}`）→ 自动发现并加载成功（命令分发证明）；「No API key found」属模型不可用，不算扩展加载失败（票面口径）。
+- 真实模型冒烟（可选验收项，已执行）：`pi -p --extension <repo> --extension <出站探针>`（探针注册在后，看到的是掩码后、发供应商前的消息）提交假 key prompt → 出站只见伪值 `sk-<hash>`、真值零出站、模型正常应答。
 
 ## 约定
 
