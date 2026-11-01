@@ -19,5 +19,6 @@ export {
 	type CleanCacheConfig,
 	type ConfigLoader,
 	type ConfigLoaderOptions,
+	type JudgeConfig,
 	type ResolvedConfig,
 } from "./loader.ts";
