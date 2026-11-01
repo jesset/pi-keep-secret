@@ -105,6 +105,62 @@ export function buildStatusReport(options: KeepSecretCommandsOptions): string {
 	return lines.join("\n");
 }
 
+/** 自测合成样本（固定常量；期望针对 regex 掩码层）。 */
+interface SelfTestSample {
+	label: string;
+	text: string;
+	expectMasked: boolean;
+	/** 期望说明（如假密码的 regex 层/judge 职责边界）。 */
+	note?: string;
+}
+
+const SELF_TEST_SAMPLES: SelfTestSample[] = [
+	{
+		label: "sk- 假 key",
+		text: "临时密钥：sk-live-abcdefghijklmnopqrstuvwxyz012345 请尽快轮换",
+		expectMasked: true,
+	},
+	{
+		label: "URL 藏 key",
+		text: "下载：https://cdn.example.com/v1/file?token=sk-live-qrstuvwxyzabcde0123456789&dl=1",
+		expectMasked: true,
+	},
+	{
+		label: "假密码",
+		text: "密码不是 hunter2secret，是 Xk9$mQzT7vLw2Pn4",
+		expectMasked: false,
+		note: "regex 层不命中；低熵密码归 judge（T5 合入后改判）",
+	},
+	{
+		label: "干净订单号",
+		text: "订单号 ORD-20240612-000123 已发货",
+		expectMasked: false,
+	},
+];
+
+/** /keep-secret test：合成样本逐项过会话管线，报告掩码结果与期望是否一致。 */
+export function buildSelfTestReport(pipeline: MaskingPipeline): { text: string; allPassed: boolean } {
+	const lines = ["pi-keep-secret 自测（合成样本，当前生效检测器集）"];
+	let passed = 0;
+	for (const sample of SELF_TEST_SAMPLES) {
+		const masked = pipeline.maskText(sample.text) !== sample.text;
+		const ok = masked === sample.expectMasked;
+		if (ok) {
+			passed += 1;
+		}
+		lines.push(
+			`${sample.label}：${masked ? "已掩码" : "未掩码"}（期望：${sample.expectMasked ? "掩码" : "未掩码"}${
+				sample.note === undefined ? "" : `——${sample.note}`
+			}）${ok ? "✓ 通过" : "✗ 未通过"}`,
+		);
+	}
+	const allPassed = passed === SELF_TEST_SAMPLES.length;
+	lines.push(
+		`${passed}/${SELF_TEST_SAMPLES.length} 通过${allPassed ? "" : "（有未通过项——请检查当前检测器配置）"}`,
+	);
+	return { text: lines.join("\n"), allPassed };
+}
+
 /** 创建 T7 可见性扩展：input 预检通知 + /keep-secret 命令面。 */
 export function createKeepSecretCommandsExtension(options: KeepSecretCommandsOptions) {
 	return (pi: ExtensionAPI): void => {
@@ -122,7 +178,23 @@ export function createKeepSecretCommandsExtension(options: KeepSecretCommandsOpt
 		pi.registerCommand("keep-secret", {
 			description: "掩码扩展状态 / 自测 / 配置热重载（status | test | reload）",
 			handler: async (args, ctx) => {
-				ctx.ui.notify(buildStatusReport(options), "info");
+				switch (args.trim()) {
+					case "": {
+					ctx.ui.notify(buildStatusReport(options), "info");
+					break;
+				}
+				case "test": {
+					const report = buildSelfTestReport(options.pipeline);
+					ctx.ui.notify(report.text, report.allPassed ? "info" : "warning");
+					break;
+				}
+				default: {
+					ctx.ui.notify(
+						`未知子命令 ${JSON.stringify(args.trim())}。用法：/keep-secret（状态）| /keep-secret test（自测）| /keep-secret reload（配置热重载）`,
+						"warning",
+					);
+				}
+				}
 			},
 		});
 	};

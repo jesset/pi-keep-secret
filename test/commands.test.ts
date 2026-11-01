@@ -209,3 +209,42 @@ describe("T7 /keep-secret 状态面板", () => {
 		expect(text).toMatch(/已回退内置默认集/);
 	});
 });
+
+describe("T7 /keep-secret test 合成样本自测", () => {
+	test("逐项报告掩码结果：样本 key 掩码、干净订单号不掩码，全部通过（info）", async () => {
+		const made = makeCommands();
+		const { commandHandler } = registerExtension(made.commands);
+		const { ctx, notifications } = recordingContext();
+		await commandHandler!("test", ctx);
+		const text = notifications.map((n) => n.message).join("\n");
+
+		expect(notifications).toHaveLength(1);
+		expect(notifications[0].type).toBe("info");
+		expect(text).toContain("pi-keep-secret 自测");
+		expect(text).toMatch(/sk- 假 key：已掩码（期望：掩码）✓ 通过/);
+		expect(text).toMatch(/URL 藏 key：已掩码（期望：掩码）✓ 通过/);
+		expect(text).toMatch(/干净订单号：未掩码（期望：未掩码）✓ 通过/);
+		expect(text).toMatch(/假密码：未掩码（期望：未掩码——regex 层不命中）✓ 通过/);
+		expect(text).toMatch(/4\/4 通过/);
+
+		// 自测实际驱动会话管线：两个样本 key 名自册表新增 2 条伪值
+		expect(made.pipeline.registry.size).toBe(2);
+	});
+
+	test("当前检测器集未覆盖 sk- 时如实报告未通过（warning）", async () => {
+		const { commands } = makeCommands(
+			JSON.stringify({
+				detectors: [{ name: "corp-api-key", pattern: "corp-[A-Za-z0-9]{20,}", redactTemplate: "corp-{hash}" }],
+			}),
+		);
+		const { commandHandler } = registerExtension(commands);
+		const { ctx, notifications } = recordingContext();
+		await commandHandler!("test", ctx);
+		const text = notifications.map((n) => n.message).join("\n");
+
+		expect(notifications[0].type).toBe("warning");
+		expect(text).toMatch(/sk- 假 key：未掩码（期望：掩码）✗ 未通过/);
+		expect(text).toMatch(/URL 藏 key：未掩码（期望：掩码）✗ 未通过/);
+		expect(text).toMatch(/2\/4 通过/);
+	});
+});
