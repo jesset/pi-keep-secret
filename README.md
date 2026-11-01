@@ -75,7 +75,7 @@ const factory = createEgressMaskingExtension({
 ```
 
 - 管线：`detectRegexSpans`（T1）→ 注册表层幂等过滤（命中文本已是伪值则跳过，防嵌套 mask）→ `redactText` 注入注册表签发器（确定性伪值 + 碰撞 x 后缀兜底 + LRU 写入）。
-- 遍历（笔记 §2）：user（string/text 块）、toolResult text 块、assistant 的 text/thinking/toolCall.arguments 深遍历、system 的 prose 与 sections 字符串值；豁免 ImageContent.data、*Signature、id/name/role/type、toolsAdded/toolsRemoved、nestedCalls、argumentsError、toolResult.details。
+- 遍历（笔记 §2）：user（string/text 块）、toolResult text 块、assistant 的 text/thinking/toolCall.arguments 深遍历、system 的 prose 与 sections 字符串值、bashExecution 的 command/output 与 custom 消息的 content（两者经 pi convertToLlm 投影为 user 文本进模型上下文；custom 的 details 不进上下文不动）；豁免 ImageContent.data、*Signature、id/name/role/type、toolsAdded/toolsRemoved、nestedCalls、argumentsError、toolResult.details。
 - 内置默认检测器：openai-key（`sk-`，排除 `sk-ant-`）、github-pat（`ghp_`）、aws-access-key-id（`AKIA`+16）、google-api-key（`AIza`+35）、slack-bot-token（`xoxb-`）；PEM/JWT 已由 T4 补入默认集（见 T4 节）。
 - 伪值注册表（`createPlaceholderRegistry`，会话生命周期闭包状态，供 T3/T5 共用）：`issue(secret, template)`（幂等，写入刷新 LRU，碰撞 x 后缀）、`has`/`get`（幂等过滤/还原查值）、`snapshot()`（T3 还原 tokens 副本）、`size`/`clear`。
 
@@ -204,7 +204,7 @@ const compose = (pi: ExtensionAPI): void => {
 - pi 默认压缩自带重试（`retryAssistantCall`）；掩码压缩的摘要调用同样带重试（2 次重试、短退避），瞬时故障被吸收；重试仍失败则取消本次压缩（会话继续不压缩），绝不回退不掩码的默认压缩。
 - 压缩后 `firstKeptEntryId` 之前的历史由 compaction 条目替换，投影生成 `compactionSummary` 角色消息（`summary` 字段携带真值），`convertToLlm` 展开为 user 文本——若遍历器不覆盖该角色，压缩后每一轮出站都会泄漏真值（T6 已补，用例锚定）。
 - `SettingsManager.inMemory(partial)` 可注入 `compaction.keepRecentTokens`/`reserveTokens`，harness 以此驱动手动/阈值压缩；keepRecentTokens 必须小于会话尾部 token 量，否则 `prepareCompaction` 返回 undefined（"Nothing to compact"）。
-- `bashExecution`/`custom` 自定义消息（`!命令` 等）尚未在出站遍历器覆盖（T2 既有缺口，与压缩无关；待后续 ticket 处理）。
+- `bashExecution`/`custom` 自定义消息（`!命令`、sendMessage 注入）经 pi `convertToLlm` 投影为 user 文本进 LLM 上下文（`bashExecutionToText` 含 command+output；custom 的 content 直投影）——已在出站遍历器覆盖（T2 补齐，用例锚定；`!!` 前缀的 excludeFromContext 消息不投影，掩码对其无副作用）。
 
 ## 入站预检通知 + /keep-secret 命令面（T7，issue #9）
 
@@ -326,10 +326,9 @@ rm -rf ~/.pi/agent/extensions/pi-keep-secret
 3. **judge 供应商需可信**：judge 判定会把消息文本发给判定模型（System One 端点）；该供应商必须与主会话供应商同级别的可信边界（规格 #1；T5）。
 4. **transcript 本地保留真值**：会话文件按设计保留真值（本地磁盘保护是独立关注点，规格外）；仅出站请求恒伪值（T2 起，各票锚定）。
 5. **`before_agent_start` 强制 systemPrompt 绕过掩码**：pi 在 context 钩子之后投影强制 systemPrompt，不经 `context_with_system` 掩码；本扩展自身不强制 prompt 不受影响，但其他扩展若把密钥写进强制 prompt 则是泄漏路径（T2 发现，规格外）。
-6. **`bashExecution`/`custom` 自定义消息未覆盖**：出站遍历器覆盖 user/toolResult/assistant/system/compactionSummary/branchSummary 六类；`!命令` 的 bashExecution 与 custom 角色消息尚未进遍历器（T2 既有缺口，待后续处理）。
-7. **input 预检固定内置默认集**：提交提示的非阻塞警告按内置默认 regex 集快扫（与配置无关的固定提示层；掩码执法始终以当前配置为准）（T7）。
-8. **掩码压缩失败时本次不压缩**：摘要调用带重试（2 次重试、短退避）；重试仍失败 → 取消本次压缩并告警（会话继续不压缩、上下文持续增长，用户可稍后重试 `/compact`）。这是零泄漏的取舍——不存在回退 pi 默认压缩的路径（默认路径不掩码，回退即泄漏）（T6，spec 故事 24）。
-9. **judge 截断护栏**：候选超 `batchSize × maxBatches` 截断保最长，丢弃的候选按未验证一律掩码（零未验证出站；截断计数入 `/keep-secret` 状态）——代价是病态大块下掩码偏保守（短低熵串可能被一并掩为伪值）（T5，故事 19）。
+6. **input 预检固定内置默认集**：提交提示的非阻塞警告按内置默认 regex 集快扫（与配置无关的固定提示层；掩码执法始终以当前配置为准）（T7）。
+7. **掩码压缩失败时本次不压缩**：摘要调用带重试（2 次重试、短退避）；重试仍失败 → 取消本次压缩并告警（会话继续不压缩、上下文持续增长，用户可稍后重试 `/compact`）。这是零泄漏的取舍——不存在回退 pi 默认压缩的路径（默认路径不掩码，回退即泄漏）（T6，spec 故事 24）。
+8. **judge 截断护栏**：候选超 `batchSize × maxBatches` 截断保最长，丢弃的候选按未验证一律掩码（零未验证出站；截断计数入 `/keep-secret` 状态）——代价是病态大块下掩码偏保守（短低熵串可能被一并掩为伪值）（T5，故事 19）。
 
 ## T8：端到端加固 + 文档 + 打包（issue #10）
 

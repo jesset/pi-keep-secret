@@ -265,6 +265,65 @@ describe("T2 出站掩码：context_with_system 消息树遍历", () => {
 		}
 	});
 
+	test("bashExecution 消息（!命令）：command/output 掩码后投影出站，transcript 保留真值", async () => {
+		const h = await createHarnessSession({ extensionPaths: [EXTENSION_ENTRY] });
+		try {
+			// !命令 的 bashExecution 自定义消息：pi 经 bashExecutionToText 把
+			// command+output 投影为 user 文本进 LLM 上下文（convertToLlm），
+			// 两字段都必须在出站遍历器被掩码
+			h.session.recordBashResult(`echo ${OPENAI_KEY}`, {
+				output: `deploy key: ${OPENAI_KEY}`,
+				exitCode: 0,
+				cancelled: false,
+				truncated: false,
+			});
+			h.provider.setScript([{ text: "ok" }]);
+			await h.session.prompt("status");
+
+			const [request] = h.provider.requests();
+			expect(requestText(request)).not.toContain(OPENAI_KEY);
+			expect(requestText(request)).toMatch(/sk-[A-Z2-7]{12}/); // 伪值进入投影文本
+			// 本地 session 保留真值（请求本地改写）
+			const bash = h.session.messages.find((m) => m.role === "bashExecution");
+			expect(bash?.command).toContain(OPENAI_KEY);
+			expect(bash?.output).toContain(OPENAI_KEY);
+		} finally {
+			h.dispose();
+		}
+	});
+
+	test("custom 自定义消息（sendMessage 注入）：string 与 text 块 content 掩码出站，transcript 保留真值", async () => {
+		const h = await createHarnessSession({ extensionPaths: [EXTENSION_ENTRY] });
+		try {
+			h.provider.setScript([{ text: "ok" }, { text: "ok" }]);
+			// string content 形态
+			await h.session.sendCustomMessage(
+				{ customType: "deploy-note", content: `rotate key ${OPENAI_KEY}`, display: false },
+				{ triggerTurn: true },
+			);
+			const first = h.provider.requests()[0];
+			expect(requestText(first)).not.toContain(OPENAI_KEY);
+			expect(requestText(first)).toMatch(/sk-[A-Z2-7]{12}/);
+			// text 块数组形态（custom content 的另一合法形态）
+			await h.session.sendCustomMessage(
+				{
+					customType: "deploy-note",
+					content: [{ type: "text", text: `second key ${OPENAI_KEY}` }],
+					display: false,
+				},
+				{ triggerTurn: true },
+			);
+			const second = h.provider.requests()[1];
+			expect(requestText(second)).not.toContain(OPENAI_KEY);
+			expect(requestText(second)).toMatch(/sk-[A-Z2-7]{12}/);
+			// 本地 session 保留真值（请求本地改写）
+			const custom = h.session.messages.find((m) => m.role === "custom");
+			expect(JSON.stringify(custom?.content)).toContain(OPENAI_KEY);
+		} finally {
+			h.dispose();
+		}
+	});
+
 	test("注册表层幂等过滤：助手历史回显的伪值不再嵌套掩码", async () => {
 		// hashLength=30 时伪值本身也命中 sk- 检测器——若无幂等过滤，
 		// 回显伪值会被再掩成「伪值的伪值」，还原链断裂
