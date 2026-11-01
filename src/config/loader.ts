@@ -22,9 +22,10 @@
  *   产物可直接喂 createEgressMaskingExtension。
  * - `judge`（T8 正式接线）：System One 判定检测器配置——provider/modelId
  *   必填 + 阈值/批参/并发/伪值模板/onMissing 策略可调（T14 起另有 api
- *   线缆协议提示：systemone|decisions，缺省跟随模型注册条目的 api 字段，
- *   填写则装配处比对一致性，见 JudgeApi）；未配置即不接入 judge
- *   （仅 regex 检测层）。模型缺失时按 onMissing 处理（默认
+ *   线缆偏好：systemone|decisions，缺省跟随模型注册条目的 api 字段；
+ *   填写后按三分支应用（T16：已知 classifier api 覆盖分发线缆 / 插件
+ *   自定义 api 尊重插件实现 + 偏好未生效提示），见 JudgeApi）；未配置
+ *   即不接入 judge（仅 regex 检测层）。模型缺失时按 onMissing 处理（默认
  *   fail_closed——未验证候选一律掩码；regex_only——降级仅 regex 层，
  *   见 src/judge/extension.ts 与 JudgeOnMissing）。
  *   judge 段变更与 hashLength/cleanCache 同语义：仅新会话生效（会话内
@@ -76,11 +77,13 @@ export interface CleanCacheConfig {
 export type JudgeOnMissing = "fail_closed" | "regex_only";
 
 /**
- * judge 判定线缆协议提示（T14，ticket #14）：systemone——pi-ai
+ * judge 判定线缆偏好（T14 引入，T16 改语义）：systemone——pi-ai
  * `typesafe-system-one`（POST <baseUrl>/systemone，bool→noul）；
  * decisions——pi-ai `openai-decisions`（POST <baseUrl>/decisions，
  * bool→predicate、criteria 折进 instructions、state 为 JSON 文本）。
  * 两种协议同一 LiteLLM 网关后端路由，baseUrl 都配 `https://<host>/v1`。
+ * loader 仅校验合法值（防 typo）；偏好的三分支应用在装配处（见
+ * src/judge/extension.ts 的 JudgeEgressOptions.api）。
  */
 export type JudgeApi = "systemone" | "decisions";
 
@@ -112,12 +115,13 @@ export interface JudgeConfig {
 	redactTemplate?: string;
 	/** classifier 模型缺失策略，默认 fail_closed（见 JudgeOnMissing）。 */
 	onMissing?: JudgeOnMissing;
-	/** 判定线缆协议提示（见 JudgeApi）。缺省 undefined 跟随模型注册条目
-	 *  的 api 字段（不校验）；填写则装配时与模型注册 api 比对一致性
-	 *  （typesafe-system-one↔systemone、openai-decisions↔decisions，见
-	 *  src/judge/extension.ts 的 MODEL_API_BY_JUDGE_API）——不一致按配置
-	 *  错误处理：不装配 judge、仅 regex 层、错误可见。分工：loader 只校验
-	 *  合法值，装配处比对并报错。 */
+	/** 判定线缆偏好（见 JudgeApi）。缺省 undefined 跟随模型注册条目
+	 *  的 api 字段；填写后按三分支应用（T16）：模型注册为 pi-ai 已知
+	 *  classifier api → 覆盖分发线缆（typesafe-system-one↔systemone、
+	 *  openai-decisions↔decisions，见 src/judge/extension.ts 的
+	 *  MODEL_API_BY_JUDGE_API）；插件自定义 api → 尊重插件实现、偏好
+	 *  未生效（info 通知 + 状态面标记）。分工：loader 只校验合法值
+	 *  （非法仍 judge 段整体回退），偏好在装配处应用。 */
 	api?: JudgeApi;
 }
 
