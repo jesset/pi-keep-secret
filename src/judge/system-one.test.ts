@@ -213,7 +213,7 @@ describe("SystemOneJudge 两阶段判定", () => {
 			expect(verdict.spans).toHaveLength(200);
 		});
 
-		test("候选超 8 批（1024）截断保最长并计数丢弃数", async () => {
+		test("候选超 8 批（1024）截断保最长：丢弃的短候选按未验证一并掩码并计数", async () => {
 			const LONG = `LONG${"y".repeat(44)}`; // 48 字符长候选
 			const text = candidateText(1300, [LONG]); // 1301 候选 > 8×128
 			const fake = fakeClassify({ gate: () => 0.98, candidate: () => 0.9 });
@@ -221,16 +221,39 @@ describe("SystemOneJudge 两阶段判定", () => {
 
 			const verdict = await judge.judgeText(text);
 
-			// 8 批 × 128 问，共 1024 候选参判，277 个短候选被丢弃
+			// 8 批 × 128 问，共 1024 候选参判，277 个短候选被截断丢弃
 			const batchCalls = fake.calls.slice(1);
 			expect(batchCalls).toHaveLength(8);
 			expect(batchCalls.every((call) => call.questions.length === 128)).toBe(true);
 			expect(verdict.truncatedCandidates).toBe(277);
-			// 保最长：48 字符候选参判并命中；末尾短候选（最短群体）被截断丢弃
+			// 保最长参判命中（48 字符候选）；末尾短候选（最短群体）被截断丢弃——
+			// 未验证定义上不该出站：丢弃者与命中者一并掩码（故事 19）
 			const masked = verdict.spans.map((span) => text.slice(span.start, span.end));
 			expect(masked).toContain(LONG);
-			expect(masked).not.toContain("t01300");
-			expect(verdict.spans).toHaveLength(1024);
+			expect(masked).toContain("t01300");
+			expect(verdict.spans).toHaveLength(1301); // 1024 参判命中 + 277 丢弃兑底
+			expect(verdict.clean).toBe(false); // 非零 span：永不缓存干净
+		});
+
+		test("截断场景的短低熵密码也被掩（未验证候选不放行）", async () => {
+			const SHORT_PASSWORD = "letmein99"; // 9 字符短低熵密码（regex 不可见形状）
+			const LONG_TOKEN = "AAAABBBBCCCCDDDD1"; // 17 字符长候选
+			const text = `密码 ${SHORT_PASSWORD} 与令牌 ${LONG_TOKEN}`;
+			// batchSize=1、maxBatches=1 → 仅保 1 个最长候选，短密码被截断丢弃
+			const fake = fakeClassify({ gate: () => 0.98, candidate: () => 0.9 });
+			const judge = createSystemOneJudge({
+				classify: fake.classify,
+				batchSize: 1,
+				maxBatches: 1,
+			});
+
+			const verdict = await judge.judgeText(text);
+
+			expect(verdict.truncatedCandidates).toBe(1);
+			const masked = verdict.spans.map((span) => text.slice(span.start, span.end));
+			// 长候选参判命中；短密码虽被丢弃但未验证——一律掩码，零未验证出站
+			expect(masked).toEqual(expect.arrayContaining([SHORT_PASSWORD, LONG_TOKEN]));
+			expect(verdict.spans).toHaveLength(2);
 		});
 	});
 

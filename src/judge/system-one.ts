@@ -24,7 +24,7 @@ export type ClassifyFn = (context: ClassifierContext) => Promise<ClassifierResul
 
 /** 候选批量判定单次调用的问题数上限：对齐 litellm/OpenAI decisions 协议硬上限。 */
 export const DEFAULT_BATCH_SIZE = 128;
-/** 批数闸门：超过则截断保最长（成本护栏，防病态大块失控）。 */
+/** 批数闸门：超过则截断保最长（成本护栏，防病态大块失控；丢弃者按未验证掩码）。 */
 export const DEFAULT_MAX_BATCHES = 8;
 /** gate 阈值默认（低于即短路）。 */
 export const DEFAULT_GATE_THRESHOLD = 0.5;
@@ -72,7 +72,7 @@ export interface JudgeVerdict {
 	failClosed: boolean;
 	/** 首个 classify 错误信息（stopReason!=="stop"；扩展层上报扩展错误）。 */
 	error?: string;
-	/** 被 maxBatches 截断丢弃的候选数（状态显示）。 */
+	/** 被 maxBatches 截断丢弃的候选数（丢弃者已按未验证掩码；状态显示）。 */
 	truncatedCandidates: number;
 	/** classify 调用次数（gate + 候选批；测试锚定与观测）。 */
 	calls: number;
@@ -170,17 +170,19 @@ export function createSystemOneJudge(options: SystemOneJudgeOptions): SystemOneJ
 				if (candidates.length === 0) {
 					continue;
 				}
-				// 批数闸门：仅当超过 maxBatches 才截断保最长（成本护栏；短候选恰是
-				// minCandidateLen 要兜的低熵密码，因此拆批全覆盖优先，不直接截断）
+				// 批数闸门：仅当超过 maxBatches 才截断保最长（成本护栏，防病态大块
+				// 失控）；丢弃的短候选按未验证掩码（见下），计数保留
 				const keep = batchSize * maxBatches;
 				if (candidates.length > keep) {
-					truncatedCandidates += candidates.length - keep;
-					candidates = [
-						...[...candidates]
-							.sort((a, b) => b.end - b.start - (a.end - a.start))
-							.slice(0, keep)
-							.sort((a, b) => a.start - b.start),
-					];
+					const sorted = [...candidates].sort(
+						(a, b) => b.end - b.start - (a.end - a.start),
+					);
+					const dropped = sorted.slice(keep);
+					truncatedCandidates += dropped.length;
+					// 截断丢弃的候选未获判定结论——与 fail_closed 同则一律掩码
+					// （故事 19：未验证定义上不该出站）
+					maskUnverified(dropped, chunk.offset);
+					candidates = [...sorted.slice(0, keep)].sort((a, b) => a.start - b.start);
 				}
 				const batches: Candidate[][] = [];
 				for (let i = 0; i < candidates.length; i += batchSize) {

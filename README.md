@@ -238,7 +238,7 @@ const compose = (pi: ExtensionAPI): void => {
 
 ## System One judge（T5，issue #7）
 
-- 适配器 `createSystemOneJudge`（`src/judge/system-one.ts`）：classify 通道注入（`ClassifyFn`）——扩展层绑 `ctx.modelRegistry.classify`，纯逻辑测试注入进程内假函数。两阶段：gate 单 bool 问（阈值 0.5）低短路 → 候选批量逐个 bool 问（阈值 0.7）；128 问/批拆批全覆盖，仅超 8 批才截断保最长（`truncatedCandidates` 计数，gate 零定位不升级）；超长文本 24000/块、重叠 min(2000, maxChars/4)；全部 classify 调用走会话级共享 FIFO 信号量（默认 8 路，消息级并发安全）。
+- 适配器 `createSystemOneJudge`（`src/judge/system-one.ts`）：classify 通道注入（`ClassifyFn`）——扩展层绑 `ctx.modelRegistry.classify`，纯逻辑测试注入进程内假函数。两阶段：gate 单 bool 问（阈值 0.5）低短路 → 候选批量逐个 bool 问（阈值 0.7）；128 问/批拆批全覆盖，仅超 8 批才截断保最长——丢弃的候选按未验证一律掩码（未验证定义上不该出站）+ `truncatedCandidates` 计数；超长文本 24000/块、重叠 min(2000, maxChars/4)；全部 classify 调用走会话级共享 FIFO 信号量（默认 8 路，消息级并发安全）。
 - fail_closed：`classify` never-rejects，错误在 `stopReason`。gate 故障 → 该块候选全掩且不追加注定失败的候选批；候选批故障 → 该批全掩、其余批判定结论照常采纳；stop 结果缺应答的候选视为未验证一并掩（≠「判定非凭据」丢弃）。真值由共享注册表保留，本地可恢复。
 - 出站扩展 `createJudgeEgressExtension`（`src/judge/extension.ts`）：注册 `context_with_system`，必须先于 regex 出站扩展（判定需要原文；regex 层幂等跳过已签发伪值）。命中 span 掩码为 `key-{hash}` 确定性伪值（与出站/回程/压缩同一注册表）。
 - classifier 模型解析：配置引用 `{provider, modelId}`（T8 起由 config.json 的 judge 段驱动正式组合接线）→ `ctx.modelRegistry.findOfType("classifier", ...)`。模型缺失（含解析通道异常）→ 按 `judge.onMissing` 策略处理（spec 故事 19「down judge never means an unmasked request」）：**fail_closed（默认）**——与 classify 故障同路径，该消息未验证候选（engine 抽取）一律掩码（真值注册表本地保留）+ failClosed 计数 + notify/状态栏；**regex_only（显式知情选择）**——降级放行仅 regex 层 + `degradedTexts` 按文本叶计数（无 UI 模式仅计数）。两策略的降级叶都记 clean cache 墓碑（T8：防 judge 恢复后被缓存短路漏判，见 T8 节）。
@@ -329,7 +329,7 @@ rm -rf ~/.pi/agent/extensions/pi-keep-secret
 6. **`bashExecution`/`custom` 自定义消息未覆盖**：出站遍历器覆盖 user/toolResult/assistant/system/compactionSummary/branchSummary 六类；`!命令` 的 bashExecution 与 custom 角色消息尚未进遍历器（T2 既有缺口，待后续处理）。
 7. **input 预检固定内置默认集**：提交提示的非阻塞警告按内置默认 regex 集快扫（与配置无关的固定提示层；掩码执法始终以当前配置为准）（T7）。
 8. **掩码压缩失败时本次不压缩**：摘要调用带重试（2 次重试、短退避）；重试仍失败 → 取消本次压缩并告警（会话继续不压缩、上下文持续增长，用户可稍后重试 `/compact`）。这是零泄漏的取舍——不存在回退 pi 默认压缩的路径（默认路径不掩码，回退即泄漏）（T6，spec 故事 24）。
-9. **judge 截断护栏**：候选超 `batchSize × maxBatches` 截断保最长（截断计数入 `/keep-secret` 状态），gate 零定位不升级（T5）。
+9. **judge 截断护栏**：候选超 `batchSize × maxBatches` 截断保最长，丢弃的候选按未验证一律掩码（零未验证出站；截断计数入 `/keep-secret` 状态）——代价是病态大块下掩码偏保守（短低熵串可能被一并掩为伪值）（T5，故事 19）。
 
 ## T8：端到端加固 + 文档 + 打包（issue #10）
 
