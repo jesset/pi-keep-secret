@@ -20,7 +20,12 @@ import type {
 	ClassifierResult,
 } from "@earendil-works/pi-ai";
 import { createHarnessSession, requestText } from "../src/harness/fake-session.ts";
-import { createJudgeEgressExtension, type ClassifierModelRef, type JudgeStatus } from "../src/judge/index.ts";
+import {
+	createJudgeEgressExtension,
+	createJudgeTextMasker,
+	type ClassifierModelRef,
+	type JudgeStatus,
+} from "../src/judge/index.ts";
 import { createEgressMaskingExtension, createMaskingPipeline } from "../src/masking/index.ts";
 
 /** judge 命中锚（真实网关实测 0.96 掩码）与非凭据锚（0.04 丢弃）。 */
@@ -92,7 +97,7 @@ function scriptClassify(script: {
 /** 空状态计数（每用例独立实例，断言不静默降级）。 */
 function emptyStatus(): JudgeStatus {
 	return {
-		degradedRequests: 0,
+		degradedTexts: 0,
 		lastResolutionError: undefined,
 		judgedTexts: 0,
 		failClosed: 0,
@@ -138,7 +143,7 @@ describe("T5 judge 出站扩展（接缝 1）", () => {
 			const lastUser = [...h.session.messages].reverse().find((m) => m.role === "user");
 			expect(JSON.stringify(lastUser?.content)).toContain(PASSWORD);
 			expect(status.judgedTexts).toBeGreaterThan(0);
-			expect(status.degradedRequests).toBe(0);
+			expect(status.degradedTexts).toBe(0);
 			expect(status.failClosed).toBe(0);
 		} finally {
 			h.dispose();
@@ -167,7 +172,8 @@ describe("T5 judge 出站扩展（接缝 1）", () => {
 			const out = requestText(h.provider.requests()[0]);
 			expect(out).not.toContain(OPENAI_KEY); // 仅 regex 层工作
 			expect(out).toMatch(/sk-[A-Z2-7]{12}/);
-			expect(status.degradedRequests).toBe(1); // 每次出站计数，不静默
+			// 降级按文本叶计数（system + user 两个叶），不静默
+			expect(status.degradedTexts).toBeGreaterThanOrEqual(2);
 			expect(status.lastResolutionError).toContain("no-such-provider/no-such-model");
 			expect(status.judgedTexts).toBe(0); // 未发起任何判定调用
 		} finally {
@@ -201,7 +207,7 @@ describe("T5 judge 出站扩展（接缝 1）", () => {
 			expect(out).not.toContain(ORDER);
 			expect(out).toMatch(/key-[A-Z2-7]{12}/);
 			expect(status.failClosed).toBeGreaterThan(0);
-			expect(status.degradedRequests).toBe(0);
+			expect(status.degradedTexts).toBe(0);
 		} finally {
 			h.dispose();
 		}
@@ -272,5 +278,76 @@ describe("T5 judge 出站扩展（接缝 1）", () => {
 		} finally {
 			h.dispose();
 		}
+	});
+});
+
+describe("T8 judge 文本掩码器（createJudgeTextMasker）", () => {
+	/** 无 UI 的最小 ctx（降级/故障告警在无 UI 模式仅计数）。 */
+	const noUiCtx = { hasUI: false } as unknown as ExtensionContext;
+
+	test("模型缺失降级：文本原样返回 + 计数 + 墓碑（regex 干净结论不得覆写）", async () => {
+		const pipeline = createMaskingPipeline();
+		const status = emptyStatus();
+		const masker = createJudgeTextMasker({
+			modelRef: MODEL_REF,
+			pipeline,
+			status,
+			resolveModel: () => undefined, // classifier 模型不可用
+		});
+		const text = `部署密码 ${PASSWORD}，订单 ${ORDER}`;
+		const masked = await masker.mask(text, noUiCtx);
+		expect(masked).toBe(text); // 降级：judge 层放行（regex 层照常工作）
+		expect(status.degradedTexts).toBe(1);
+		expect(status.lastResolutionError).toContain("keep-secret-fake/jev-fake");
+		// 墓碑：regex 层零命中也不得把该文本写成干净（防 judge 恢复后被缓存短路）
+		pipeline.maskText(text);
+		expect(pipeline.cleanCache.isClean(text)).toBe(false);
+	});
+
+	test("模型恢复后重判：同一段降级放行过的文本被 judge 掩码（墓碑未被覆写）", async () => {
+		const pipeline = createMaskingPipeline();
+		const fake = scriptClassify({
+			gate: () => 0.98,
+			candidate: (value) => (value === PASSWORD ? 0.96 : 0.04),
+		});
+		let model: ReturnType<typeof fakeClassifierModel> | undefined;
+		const masker = createJudgeTextMasker({
+			modelRef: MODEL_REF,
+			pipeline,
+			resolveModel: () => model,
+			classify: (_m, context) => fake.classify(context),
+		});
+		const text = `部署密码 ${PASSWORD}，订单 ${ORDER}`;
+		// 阶段 1：模型缺失 → 降级放行 + 墓碑；regex 层零命中后也不得标记干净
+		expect(await masker.mask(text, noUiCtx)).toBe(text);
+		pipeline.maskText(text);
+		// 阶段 2：模型注册后恢复 → 墓碑保证重判而非缓存短路
+		model = fakeClassifierModel();
+		const masked = await masker.mask(text, noUiCtx);
+		expect(masked).not.toBe(text);
+		expect(masked).not.toContain(PASSWORD);
+		expect(masked).toMatch(/key-[A-Z2-7]{12}/);
+		expect(masked).toContain(ORDER); // 判非凭据：保留
+	});
+
+	test("自测复用同一掩码器：judge 先行、regex 兑底，与出站链同序", async () => {
+		const pipeline = createMaskingPipeline();
+		const fake = scriptClassify({
+			gate: () => 0.98,
+			candidate: (value) => (value === PASSWORD ? 0.96 : 0.04),
+		});
+		const masker = createJudgeTextMasker({
+			modelRef: MODEL_REF,
+			pipeline,
+			resolveModel: () => fakeClassifierModel(),
+			classify: (_m, context) => fake.classify(context),
+		});
+		const text = `密码 ${PASSWORD}，密钥 ${OPENAI_KEY}`;
+		// 出站链同序：judge 先判原文，regex 后兑底（伪值幂等跳过）
+		const masked = pipeline.maskText(await masker.mask(text, noUiCtx));
+		expect(masked).not.toContain(PASSWORD);
+		expect(masked).not.toContain(OPENAI_KEY);
+		expect(masked).toMatch(/key-[A-Z2-7]{12}/);
+		expect(masked).toMatch(/sk-[A-Z2-7]{12}/);
 	});
 });

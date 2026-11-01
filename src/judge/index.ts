@@ -14,11 +14,13 @@
  */
 export {
 	createJudgeEgressExtension,
+	createJudgeTextMasker,
 	DEFAULT_JUDGE_TEMPLATE,
 	type ClassifyChannel,
 	type ClassifierModelRef,
 	type JudgeEgressOptions,
 	type JudgeStatus,
+	type JudgeTextMasker,
 	type ModelResolver,
 } from "./extension.ts";
 export {
