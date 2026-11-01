@@ -91,10 +91,11 @@ function buildStatusReport(options: KeepSecretCommandsOptions): string {
 			? "检测器命中：（无）"
 			: `检测器命中：${[...hits.entries()].map(([name, count]) => `${name}=${count}`).join(", ")}`,
 	);
+	const judgeMode = config.judge?.onMissing ?? "fail_closed";
 	lines.push(
 		options.judge === undefined
 			? "judge：未接入（未配置 judge 段，仅 regex 检测层）"
-			: `judge：已判定 ${options.judge.status.judgedTexts} 叶，截断 ${options.judge.status.truncatedCandidates} 次，fail-closed ${options.judge.status.failClosed} 次，降级 ${options.judge.status.degradedTexts} 叶`,
+			: `judge：已判定 ${options.judge.status.judgedTexts} 叶，截断 ${options.judge.status.truncatedCandidates} 次，fail-closed ${options.judge.status.failClosed} 次，降级 ${options.judge.status.degradedTexts} 叶（模型缺失策略：${judgeMode}）`,
 	);
 	lines.push(
 		`掩码压缩取消：${options.compaction.cancellations} 次` +
@@ -148,18 +149,28 @@ async function buildSelfTestReport(
 	ctx: ExtensionCommandContext,
 ): Promise<{ text: string; allPassed: boolean }> {
 	const judgeEnabled = options.judge !== undefined;
+	// 模型缺失 + fail_closed（默认）：未验证候选一律掩码——全部样本期望掩码
+	//（含干净订单号：候选被兑底掩码属预期，而非配置问题）
+	const failClosedNoModel =
+		options.judge !== undefined &&
+		options.judge.onMissing === "fail_closed" &&
+		options.judge.modelMissing;
 	const lines = ["pi-keep-secret 自测（合成样本，当前生效检测器集）"];
 	let passed = 0;
 	for (const sample of SELF_TEST_SAMPLES) {
 		// 与出站链同序：judge 先判原文，regex 后兑底（伪值幂等跳过）；
-		// judge 降级时 mask 原样返回，仅 regex 层结果——假密码项如实报未通过
+		// judge 降级（regex_only）时 mask 原样返回，仅 regex 层结果——假密码项如实报未通过
 		let current = sample.text;
 		if (options.judge !== undefined) {
 			current = await options.judge.mask(current, ctx);
 		}
 		current = options.pipeline.maskText(current);
 		const masked = current !== sample.text;
-		const expectMasked = judgeEnabled ? (sample.expectMaskedWithJudge ?? sample.expectMasked) : sample.expectMasked;
+		const expectMasked = failClosedNoModel
+			? true
+			: judgeEnabled
+				? (sample.expectMaskedWithJudge ?? sample.expectMasked)
+				: sample.expectMasked;
 		const ok = masked === expectMasked;
 		if (ok) {
 			passed += 1;
@@ -181,6 +192,11 @@ async function buildSelfTestReport(
 		!allPassed
 	) {
 		lines.push("注意：judge 已降级（classifier 模型不可用，仅 regex 检测层工作）——假密码项未通过即降级信号");
+	}
+	if (failClosedNoModel) {
+		lines.push(
+			"注意：judge classifier 模型缺失，fail_closed 已生效（未验证候选一律掩码）——样本全部掩码属预期兑底；请注册 classifier 模型，或显式配置 judge.onMissing=\"regex_only\"",
+		);
 	}
 	return { text: lines.join("\n"), allPassed };
 }

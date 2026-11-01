@@ -150,17 +150,61 @@ describe("T5 judge 出站扩展（接缝 1）", () => {
 		}
 	});
 
-	test("classifier 模型缺失 → 扩展降级：出站仅 regex 掩码 + 状态计数不静默", async () => {
+	test("classifier 模型缺失（默认 fail_closed）：未验证候选一律掩码，regex 层共存，零真值出站", async () => {
 		const pipeline = createMaskingPipeline();
 		const status = emptyStatus();
 		const h = await createHarnessSession({
 			extensionFactories: [
 				// 缺省 resolveModel → ctx.modelRegistry.findOfType("classifier", ...)
-				// harness 注册表没有该模型 → 降级路径
+			// harness 注册表没有该模型 → 模型缺失路径（spec 故事 19：down
+			// judge never means an unmasked request——与 classify 故障同则）
+			createJudgeEgressExtension({
+				modelRef: { provider: "no-such-provider", modelId: "no-such-model" },
+				pipeline,
+				status,
+			}),
+			createEgressMaskingExtension({ pipeline }),
+			],
+		});
+		try {
+			h.provider.setScript([{ text: "ack" }]);
+			await h.session.prompt(`部署密码 ${PASSWORD}，订单 ${ORDER}，密钥 ${OPENAI_KEY}`);
+
+			const out = requestText(h.provider.requests()[0]);
+			// 未验证候选（密码、订单号与 sk- 密钥——同为候选）一律掩为 judge 伪值；
+		// regex 层对已签发伪值幂等跳过（两层串联安全）
+			expect(out).not.toContain(PASSWORD);
+			expect(out).not.toContain(ORDER);
+			expect(out).not.toContain(OPENAI_KEY);
+			expect(out).toMatch(/key-[A-Z2-7]{12}/);
+			// 真值本地可恢复：注册表里能找到 PASSWORD 的 judge 伪值
+			const placeholder = [...pipeline.registry.snapshot().entries()]
+				.find(([, secret]) => secret === PASSWORD)?.[0];
+			expect(placeholder).toBeDefined();
+			expect(pipeline.registry.get(placeholder!)).toBe(PASSWORD);
+			// 计数语义：fail_closed 生效（非降级放行），解析失败原因可见
+			expect(status.failClosed).toBeGreaterThan(0);
+			expect(status.degradedTexts).toBe(0);
+			expect(status.judgedTexts).toBe(0); // 未发起任何 gate 调用
+			expect(status.lastResolutionError).toContain("no-such-provider/no-such-model");
+			// 本地 transcript 保留真值（请求本地改写）
+			const lastUser = [...h.session.messages].reverse().find((m) => m.role === "user");
+			expect(JSON.stringify(lastUser?.content)).toContain(PASSWORD);
+		} finally {
+			h.dispose();
+		}
+	});
+
+	test("onMissing=regex_only：模型缺失显式降级——出站仅 regex 掩码 + 状态计数不静默", async () => {
+		const pipeline = createMaskingPipeline();
+		const status = emptyStatus();
+		const h = await createHarnessSession({
+			extensionFactories: [
 				createJudgeEgressExtension({
 					modelRef: { provider: "no-such-provider", modelId: "no-such-model" },
 					pipeline,
 					status,
+					onMissing: "regex_only",
 				}),
 				createEgressMaskingExtension({ pipeline }),
 			],
@@ -285,7 +329,28 @@ describe("T8 judge 文本掩码器（createJudgeTextMasker）", () => {
 	/** 无 UI 的最小 ctx（降级/故障告警在无 UI 模式仅计数）。 */
 	const noUiCtx = { hasUI: false } as unknown as ExtensionContext;
 
-	test("模型缺失降级：文本原样返回 + 计数 + 墓碑（regex 干净结论不得覆写）", async () => {
+	test("模型缺失 + onMissing=regex_only：降级放行 + 计数 + 墓碑（regex 干净结论不得覆写）", async () => {
+		const pipeline = createMaskingPipeline();
+		const status = emptyStatus();
+		const masker = createJudgeTextMasker({
+			modelRef: MODEL_REF,
+			pipeline,
+			status,
+			onMissing: "regex_only", // 显式知情选择：保留降级放行行为
+			resolveModel: () => undefined, // classifier 模型不可用
+		});
+		const text = `部署密码 ${PASSWORD}，订单 ${ORDER}`;
+		const masked = await masker.mask(text, noUiCtx);
+		expect(masked).toBe(text); // 降级：judge 层放行（regex 层照常工作）
+		expect(status.degradedTexts).toBe(1);
+		expect(status.failClosed).toBe(0);
+		expect(status.lastResolutionError).toContain("keep-secret-fake/jev-fake");
+		// 墓碑：regex 层零命中也不得把该文本写成干净（防 judge 恢复后被缓存短路）
+		pipeline.maskText(text);
+		expect(pipeline.cleanCache.isClean(text)).toBe(false);
+	});
+
+	test("模型缺失 + 默认 fail_closed：未验证候选一律掩码（真值本地保留）+ 计数 + 墓碑", async () => {
 		const pipeline = createMaskingPipeline();
 		const status = emptyStatus();
 		const masker = createJudgeTextMasker({
@@ -296,10 +361,19 @@ describe("T8 judge 文本掩码器（createJudgeTextMasker）", () => {
 		});
 		const text = `部署密码 ${PASSWORD}，订单 ${ORDER}`;
 		const masked = await masker.mask(text, noUiCtx);
-		expect(masked).toBe(text); // 降级：judge 层放行（regex 层照常工作）
-		expect(status.degradedTexts).toBe(1);
+		// 与 classify 故障同路径：候选（含判非凭据形状的订单号）未验证 → 一律掩码
+		expect(masked).not.toBe(text);
+		expect(masked).not.toContain(PASSWORD);
+		expect(masked).not.toContain(ORDER);
+		const placeholder = masked.match(/key-[A-Z2-7]{12}/)![0];
+		expect(pipeline.registry.get(placeholder)).toBe(PASSWORD); // 真值注册表本地可恢复
+		expect(status.failClosed).toBe(1);
+		expect(status.degradedTexts).toBe(0);
 		expect(status.lastResolutionError).toContain("keep-secret-fake/jev-fake");
-		// 墓碑：regex 层零命中也不得把该文本写成干净（防 judge 恢复后被缓存短路）
+		// 幂等：掩码后的文本再过一次不得嵌套伪值（已是注册表伪值的候选被过滤）
+		const twice = await masker.mask(masked, noUiCtx);
+		expect(twice.split(placeholder).length - 1).toBe(masked.split(placeholder).length - 1);
+		// 墓碑：regex 层零命中也不得把原文写成干净（防 judge 恢复后被缓存短路）
 		pipeline.maskText(text);
 		expect(pipeline.cleanCache.isClean(text)).toBe(false);
 	});
@@ -314,6 +388,7 @@ describe("T8 judge 文本掩码器（createJudgeTextMasker）", () => {
 		const masker = createJudgeTextMasker({
 			modelRef: MODEL_REF,
 			pipeline,
+			onMissing: "regex_only", // 本用例锚定降级墓碑与恢复重判的协同
 			resolveModel: () => model,
 			classify: (_m, context) => fake.classify(context),
 		});

@@ -6,8 +6,9 @@
  * （T6/ticket #8）共用同一会话级掩码管线（同一注册表 + 同一 clean
  * cache）：出站按配置检测器集签发确定性伪值，回程还原与压缩摘要按同一
  * 映射还原。T8（ticket #10）正式接线 judge：config.json 的 judge 段
- * （provider/modelId/阈值）驱动 System One 判定检测器，先于 regex 出站
- * 扩展注册；未配置或模型不可用时降级仅 regex 层并保持可见状态。
+ * （provider/modelId/阈值/onMissing）驱动 System One 判定检测器，先于
+ * regex 出站扩展注册；未配置时不接入；模型不可用时按 onMissing 策略
+ * 处理（默认 fail_closed 掩码未验证候选，regex_only 显式降级）并保持可见。
  *
  * T7（ticket #9）：input 预检通知 + /keep-secret 命令面（状态/自测/热重
  * 载），状态数据与上述模块共享同一实例（loader/pipeline/judge 掩码器/

@@ -7,7 +7,8 @@
  *   校验后的 detectors/hashLength/cleanCache 调参喂会话级掩码管线
  *   createMaskingPipeline（非法配置时 loader 已回退默认集）；
  * - 配置 judge 段时创建 judge 文本掩码器（classifier 模型引用与阈值
- *   全部来自配置；模型不可用由掩码器显式降级——仅 regex 层 + 状态可见），
+ *   全部来自配置；模型不可用由掩码器按 onMissing 策略处理——默认
+ *   fail_closed 掩码，regex_only 降级仅 regex 层，均状态可见），
  *   出站工厂按「judge 先于 regex」顺序注册（judge 判定需要原文；regex
  *   层对已签发伪值幂等跳过），掩码器同一实例返回给组合根接命令面；
  * - 订阅 loader 变更：检测器集热应用（pipeline.applyDetectors：重编译
@@ -69,6 +70,7 @@ function createJudgeTextMaskerFor(
 		minCandidateLength: judgeConfig.minCandidateLength,
 		concurrency: judgeConfig.concurrency,
 		template: judgeConfig.redactTemplate,
+		onMissing: judgeConfig.onMissing,
 		resolveModel: options.resolveModel,
 		classify: options.classify,
 	});
@@ -90,8 +92,9 @@ export function createConfiguredMaskingExtension(
 			cleanCacheLimit: initial.cleanCache?.limit,
 			cleanCacheTtlMs: initial.cleanCache?.ttlMs,
 		});
-	// judge 正式接线（T8）：配置段存在即创建掩码器（模型不可用时由掩码器
-	// 降级：文本原样放行 + 计数 + 墓碑，仅 regex 层工作且状态可见）
+	// judge 正式接线（T8）：配置段存在即创建掩码器（模型不可用时按 onMissing
+	// 策略处理：默认 fail_closed 掩码未验证候选；regex_only 降级仅 regex 层；
+	// 均计数 + 墓碑 + 状态可见）
 	const judgeConfig = initial.judge;
 	const judge =
 		judgeConfig === undefined

@@ -6,7 +6,8 @@
  *   由调用方注入（扩展层绑定 ctx.modelRegistry.classify，纯逻辑测试注入
  *   进程内假函数）。
  * - `createJudgeEgressExtension`：出站扩展工厂（context_with_system 上
- *   的 judge 检测器；模型缺失显式降级仅 regex 层 + 状态计数）。须先于
+ *   的 judge 检测器；模型缺失按 onMissing 策略处理——默认 fail_closed
+ *   掩码未验证候选，regex_only 显式降级仅 regex 层 + 状态计数）。须先于
  *   regex 出站扩展注册。T4 配置层合入前由装配方显式传 modelRef。
  * - `JudgeVerdict.clean`：与 T4 clean cache 的协同依据——judge 层 gate
  *   前查询短路（已判干净不再发起 gate）；非 clean 结论（命中/gate 命中/

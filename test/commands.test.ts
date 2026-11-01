@@ -149,8 +149,8 @@ function emptyJudgeStatus(): JudgeStatus {
 }
 
 /** 恒等掩码器的 judge 句柄（状态可注入；自测时假密码不被掩码）。 */
-function identityJudge(status: JudgeStatus = emptyJudgeStatus()): JudgeTextMasker {
-	return { status, mask: async (text) => text };
+function identityJudge(status: JudgeStatus = emptyJudgeStatus(), onMissing: "fail_closed" | "regex_only" = "fail_closed"): JudgeTextMasker {
+	return { status, onMissing, modelMissing: false, mask: async (text) => text };
 }
 
 /** 自测假密码样本里的真值（judge 启用时期望被掩码的串）。 */
@@ -160,6 +160,8 @@ const SELF_TEST_PASSWORD = "Xk9$mQzT7vLw2Pn4";
 function passwordJudgingJudge(status: JudgeStatus = emptyJudgeStatus()): JudgeTextMasker {
 	return {
 		status,
+		onMissing: "fail_closed",
+		modelMissing: false,
 		mask: async (text) => text.split(SELF_TEST_PASSWORD).join("key-JUDGEDFAKE1"),
 	};
 }
@@ -275,6 +277,32 @@ describe("T7 /keep-secret test 合成样本自测", () => {
 			expect(text).toMatch(/假密码：已掩码（期望：掩码/);
 			expect(text).toMatch(/4\/4 通过/);
 			expect(text).not.toMatch(/✗/);
+		});
+
+		test("judge 模型缺失 + fail_closed（默认）：全部样本期望掩码（含干净订单号）+ 兑底说明行", async () => {
+			const made = makeCommands();
+			// 模拟模型缺失的 fail_closed 掩码器：全部 ASCII 候选一律掩码（与真实实现同则）
+			const failClosedJudge: JudgeTextMasker = {
+				status: emptyJudgeStatus(),
+				onMissing: "fail_closed",
+				modelMissing: true,
+				mask: async (text) =>
+					text
+						.replace(/ORD-\d{8}-\d{6}/, "key-FAKEFAKEFAKE")
+						.split(SELF_TEST_PASSWORD)
+						.join("key-FAKEFAILCLS"),
+			};
+			const commands = createKeepSecretCommandsExtension({
+				loader: made.loader,
+				pipeline: made.pipeline,
+				compaction: made.compaction,
+				judge: failClosedJudge,
+			});
+			const text = await runCommand(commands, "test");
+			expect(text).toMatch(/干净订单号：已掩码（期望：掩码）✓ 通过/); // 兑底掩码属预期
+			expect(text).toMatch(/4\/4 通过/);
+			expect(text).toContain("fail_closed 已生效");
+			expect(text).toContain("judge.onMissing=\"regex_only\"");
 		});
 
 		test("judge 启用但降级（模型不可用）：假密码未被掩码，如实报未通过（warning，降级可见）", async () => {
