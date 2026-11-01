@@ -11,10 +11,35 @@
  * 会话 transcript 不受影响。
  */
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-
-
+import type { ImageContent, JsonObject, SystemMessage, TextContent } from "@earendil-works/pi-ai";
 /** 单文本叶的掩码函数（由检测管线提供）。 */
 export type TextMasker = (text: string) => string;
+
+/** SystemMessage 的 prose：content（string/text 块）与 sections 字符串值；toolsAdded/toolsRemoved 豁免。 */
+function maskSystemProse(message: SystemMessage, maskText: TextMasker): void {
+	if (typeof message.content === "string") {
+		message.content = maskText(message.content);
+	} else {
+		maskTextParts(message.content, maskText);
+	}
+	if (message.sections !== undefined) {
+		for (const key of Object.keys(message.sections)) {
+			const section = message.sections[key];
+			if (typeof section === "string") {
+				message.sections[key] = maskText(section);
+			}
+		}
+	}
+}
+
+/** 内容数组的 text 块（ImageContent 等非文本叶不动）。 */
+function maskTextParts(parts: (TextContent | ImageContent)[], maskText: TextMasker): void {
+	for (const part of parts) {
+		if (part.type === "text") {
+			part.text = maskText(part.text);
+		}
+	}
+}
 
 /** 深遍历 JSON 值的字符串叶并原位回写（toolCall.arguments 用；数组/嵌套对象全下钻）。 */
 function maskJsonStrings(value: unknown, maskText: TextMasker): void {
@@ -42,9 +67,10 @@ function maskJsonStrings(value: unknown, maskText: TextMasker): void {
 }
 
 /**
- * 对消息树的文本叶原位掩码。当前覆盖：UserMessage（string/text 块）、
+ * 对消息树的文本叶原位掩码。覆盖：UserMessage（string/text 块）、
  * ToolResultMessage 的 text 块（ImageContent.data 豁免）、AssistantMessage
- * 的 text/thinking 块与 toolCall.arguments 深遍历字符串值。
+ * 的 text/thinking 块与 toolCall.arguments 深遍历字符串值、SystemMessage
+ * 的 prose 与 sections 字符串值（toolsAdded/toolsRemoved 豁免）。
  */
 export function maskMessageTree(messages: AgentMessage[], maskText: TextMasker): void {
 	for (const message of messages) {
@@ -53,20 +79,16 @@ export function maskMessageTree(messages: AgentMessage[], maskText: TextMasker):
 				if (typeof message.content === "string") {
 					message.content = maskText(message.content);
 				} else {
-					for (const part of message.content) {
-						if (part.type === "text") {
-							part.text = maskText(part.text);
-						}
-					}
+					maskTextParts(message.content, maskText);
 				}
 				break;
 			}
+			case "system": {
+				maskSystemProse(message, maskText);
+				break;
+			}
 			case "toolResult": {
-				for (const part of message.content) {
-					if (part.type === "text") {
-						part.text = maskText(part.text);
-					}
-				}
+				maskTextParts(message.content, maskText);
 				break;
 			}
 			case "assistant": {

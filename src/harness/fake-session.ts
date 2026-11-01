@@ -9,7 +9,7 @@
  *
  * 会话运行在临时目录、内存 settings 与内存 session 里，不触网、不落盘。
  */
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -71,6 +71,9 @@ export interface HarnessOptions {
 	customTools?: ToolDefinition[];
 	/** 扩展文件/目录路径（如本仓库扩展目录里的正式扩展）。 */
 	extensionPaths?: string[];
+	/** 会话 cwd 临时目录里预置的文件（相对路径 → 内容），如 AGENTS.md
+	 *  项目指令（其内容会进入 system 消息的 sections）。 */
+	cwdFiles?: Record<string, string>;
 }
 
 /** 把一次供应商请求的全部文本叶（含 toolCall 参数深字符串值）拼成可检索文本。 */
@@ -120,6 +123,9 @@ export async function createHarnessSession(
 ): Promise<HarnessSession> {
 	const agentDir = mkdtempSync(join(tmpdir(), "pi-keep-secret-harness-"));
 	const cwd = mkdtempSync(join(tmpdir(), "pi-keep-secret-cwd-"));
+	for (const [relativePath, content] of Object.entries(options.cwdFiles ?? {})) {
+		writeFileSync(join(cwd, relativePath), content);
+	}
 	const requests: ProviderRequest[] = [];
 
 	const faux = fauxProvider({

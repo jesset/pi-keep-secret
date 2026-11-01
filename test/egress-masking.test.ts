@@ -7,7 +7,7 @@
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Type } from "@earendil-works/pi-ai";
+import { Type, type ImageContent, type TextContent } from "@earendil-works/pi-ai";
 import { createHarnessSession, requestText } from "../src/harness/fake-session.ts";
 
 /** 正式扩展入口（目录扩展 index.ts 工厂，内置默认检测器）。 */
@@ -158,6 +158,98 @@ describe("T2 出站掩码：context_with_system 消息树遍历", () => {
 			expect(transcript).toContain(`再确认一次 ${OPENAI_KEY}`);
 			// 工具执行拿到真值（T2 不做回程还原，脚本化参数原样落地）
 			expect(seenCmds).toEqual([`export KEY=${OPENAI_KEY}`, "noop"]);
+		} finally {
+			h.dispose();
+		}
+	});
+
+	test("system 消息 prose 掩码（AGENTS.md 项目指令），toolsAdded 工具 schema 不被触碰", async () => {
+		// 工具描述里带同形 key：若遍历器误掩 toolsAdded 会破坏工具接线
+		const SCHEMA_EXAMPLE = "sk-examplekey1234567890abcd";
+		const params = Type.Object({ payload: Type.String() });
+		const recordSecret: ToolDefinition<typeof params> = {
+			name: "record_secret",
+			label: "Record",
+			description: `Records its payload. Shaped example: ${SCHEMA_EXAMPLE}`,
+			parameters: params,
+			execute: async () => ({ content: [{ type: "text", text: "recorded" }], details: {} }),
+		};
+		// AGENTS.md 项目指令进 system 消息 sections（project_context）：
+		// 模拟项目指令里粘了 key 的真实场景
+		const h = await createHarnessSession({
+			extensionPaths: [EXTENSION_ENTRY],
+			customTools: [recordSecret],
+			cwdFiles: {
+				"AGENTS.md": `# Project rules\n\nDeploy key: ${OPENAI_KEY}\n`,
+			},
+		});
+		try {
+			h.provider.setScript([{ text: "ok" }]);
+			await h.session.prompt("hello");
+
+			const [request] = h.provider.requests();
+			const system = request.messages.find((m) => m.role === "system");
+			expect(system).toBeDefined();
+			// prose/sections：供应商只见伪值
+			const systemText = JSON.stringify(system);
+			expect(systemText).not.toContain(OPENAI_KEY);
+			expect(systemText).toMatch(/sk-[A-Z2-7]{12}/);
+			// toolsAdded：工具 schema（含同形示例 key）原样保留
+			const added = system?.toolsAdded?.find((t) => t.name === "record_secret");
+			expect(added?.description).toContain(SCHEMA_EXAMPLE);
+			// 本地 cwd 文件仍写真值
+		} finally {
+			h.dispose();
+		}
+	});
+
+	test("toolResult 图片 data 字节不变（内嵌同形 key 也不动），同消息文本块照常掩码", async () => {
+		// 假 base64 图片数据：内嵌命中 AWS 检测器的同形串——若遍历器误掩
+		// ImageContent.data，此串会被改写（参考实现曾因 base64 内嵌 AIza/
+		// AKIA 模式误命中损坏图片）
+		const IMAGE_DATA = "iVBORw0KGgoAAAANSUhEUgAKIAIOSFODNN7EXAMPLE==";
+		const AWS_KEY = "AKIAIOSFODNN7EXAMPLE"; // 纯文本对照组：同形 key 在文本里必须被掩
+		const params = Type.Object({});
+		const readScreenshot: ToolDefinition<typeof params> = {
+			name: "read_screenshot",
+			label: "Read Screenshot",
+			description: "Returns a text part and an image part.",
+			parameters: params,
+			execute: async () => ({
+				content: [
+					{ type: "text", text: `env aws key: ${AWS_KEY}` },
+					{ type: "image", data: IMAGE_DATA, mimeType: "image/png" },
+				],
+				details: {},
+			}),
+		};
+		const h = await createHarnessSession({
+			extensionPaths: [EXTENSION_ENTRY],
+			customTools: [readScreenshot],
+		});
+		try {
+			h.provider.setScript([
+				{ toolCall: { name: "read_screenshot", arguments: {} } },
+				{ text: "done" },
+			]);
+			await h.session.prompt("show me the screenshot and env");
+
+			expect(h.provider.requests()).toHaveLength(2);
+			const second = h.provider.requests()[1];
+			// 图片 data 字节不变（结构豁免）
+			const toolResult = second.messages.find((m) => m.role === "toolResult");
+			const image = toolResult?.content.find(
+				(part): part is ImageContent => part.type === "image",
+			);
+			expect(image?.data).toBe(IMAGE_DATA);
+			expect(image?.mimeType).toBe("image/png");
+			// 同消息文本块照常掩码：同形 key 只见伪值
+			const textParts = toolResult?.content
+				.filter((part): part is TextContent => part.type === "text")
+				.map((part) => part.text)
+				.join("\n") ?? "";
+			expect(textParts).not.toContain(AWS_KEY);
+			expect(textParts).toMatch(/AKIA[A-Z2-7]{12}/);
 		} finally {
 			h.dispose();
 		}
