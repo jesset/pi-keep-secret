@@ -54,8 +54,8 @@ export interface ConfiguredMasking {
 }
 
 /** judge 配置段 → 掩码器选项映射（阈值/批参/并发/模板全部来自配置；注入点透传）。
- *  api 为线缆协议提示（T14）：两处分工——loader 校验合法值，此处透传给
- *  掩码器在模型解析后比对 model.api 并报错（见 src/judge/extension.ts）。 */
+ *  api 为线缆偏好（T16）：loader 校验合法值，此处透传给掩码器在模型
+ *  解析后按三分支应用（见 src/judge/extension.ts）。 */
 function createJudgeTextMaskerFor(
 	judgeConfig: JudgeConfig,
 	pipeline: MaskingPipeline,

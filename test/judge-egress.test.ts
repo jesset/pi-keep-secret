@@ -427,37 +427,25 @@ describe("T8 judge 文本掩码器（createJudgeTextMasker）", () => {
 	});
 });
 
-describe("T14 judge 双协议（judge.api 与模型注册 api 一致性）", () => {
-	/** 无 UI 的最小 ctx（降级/故障告警在无 UI 模式仅计数与 lastResolutionError）。 */
+describe("T16 judge.api 线缆偏好（三分支装配，无名称硬校验）", () => {
+	/** 无 UI 的最小 ctx（告警在无 UI 模式仅计数与 lastResolutionError）。 */
 	const noUiCtx = { hasUI: false } as unknown as ExtensionContext;
 
-	test("api 匹配即装配判定：systemone/typesafe-system-one 与 decisions/openai-decisions 两协议各走通", async () => {
-		const pairs = [
-			["systemone", "typesafe-system-one"],
-			["decisions", "openai-decisions"],
-		] as const;
-		for (const [api, modelApi] of pairs) {
-			const pipeline = createMaskingPipeline();
-			const fake = scriptClassify({
-				gate: () => 0.98,
-				candidate: (value) => (value === PASSWORD ? 0.96 : 0.04),
-			});
-			const masker = createJudgeTextMasker({
-				modelRef: MODEL_REF,
-				pipeline,
-				api, // 配置提示与模型注册 api 一致 → 正常装配
-				resolveModel: () => fakeClassifierModel(modelApi),
-				classify: (_m, context) => fake.classify(context),
-			});
-			const masked = await masker.mask(`部署密码 ${PASSWORD}，订单 ${ORDER}`, noUiCtx);
-			expect(masked).not.toContain(PASSWORD); // judge 命中 → 伪值
-			expect(masked).toContain(ORDER); // 判非凭据：保留
-			expect(masker.status.judgedTexts).toBeGreaterThan(0);
-			expect(masker.status.degradedTexts).toBe(0);
-		}
-	});
+	/** 有 UI 的最小 ctx：记录 notify/setStatus 调用（偏好未生效 info 通知断言用）。 */
+	function uiCtx() {
+		const notifications: { message: string; type?: string }[] = [];
+		const statusKeys: string[] = [];
+		const ctx = {
+			hasUI: true,
+			ui: {
+				notify: (message: string, type?: string) => notifications.push({ message, type }),
+				setStatus: (key: string) => statusKeys.push(key),
+			},
+		} as unknown as ExtensionContext;
+		return { ctx, notifications, statusKeys };
+	}
 
-	test("缺省 api：跟随模型注册条目——两种协议假模型均装配并走通两阶段判定", async () => {
+	test("分支 1（缺省 api）：跟随模型注册条目——两种协议假模型均装配并走通两阶段判定", async () => {
 		for (const modelApi of ["typesafe-system-one", "openai-decisions"] as const) {
 			const pipeline = createMaskingPipeline();
 			const fake = scriptClassify({
@@ -466,7 +454,7 @@ describe("T14 judge 双协议（judge.api 与模型注册 api 一致性）", () 
 			});
 			const masker = createJudgeTextMasker({
 				modelRef: MODEL_REF,
-				pipeline, // 不传 api：不校验，协议由模型注册条目的 api 字段决定
+				pipeline, // 不传 api：跟随模型注册条目的 api 字段（线缆由注册决定）
 				resolveModel: () => fakeClassifierModel(modelApi),
 				classify: (_m, context) => fake.classify(context),
 			});
@@ -477,32 +465,88 @@ describe("T14 judge 双协议（judge.api 与模型注册 api 一致性）", () 
 			// 两阶段形态：首轮仅 gate 问，命中后第二批才是候选问
 			expect(Object.keys(fake.calls[0]!.questions)).toEqual(["gate"]);
 			expect(Object.keys(fake.calls[1]!.questions).every((id) => id.startsWith("cand_"))).toBe(true);
+			expect(masker.wire).toEqual({ source: "registered", api: modelApi });
 		}
 	});
 
-	test("api 不匹配：配置错误语义——不装配 judge（文本原样交 regex 层，不 fail_closed 兑底）、错误可见、墓碑", async () => {
+	test("分支 2（已知 classifier api + 偏好）：分发覆盖——classify 收到的 model.api 恒为偏好映射值", async () => {
+		// 三个子形态：偏好与注册一致（覆盖为幂等）× 1、偏好覆盖另一线缆 × 2
+		const cases = [
+			{ api: "systemone", modelApi: "typesafe-system-one", classifyApi: "typesafe-system-one" },
+			{ api: "systemone", modelApi: "openai-decisions", classifyApi: "typesafe-system-one" },
+			{ api: "decisions", modelApi: "typesafe-system-one", classifyApi: "openai-decisions" },
+		] as const;
+		for (const { api, modelApi, classifyApi } of cases) {
+			const pipeline = createMaskingPipeline();
+			const fake = scriptClassify({
+				gate: () => 0.98,
+				candidate: (value) => (value === PASSWORD ? 0.96 : 0.04),
+			});
+			const seenApis: string[] = [];
+			const masker = createJudgeTextMasker({
+				modelRef: MODEL_REF,
+				pipeline,
+				api, // 配置选择线缆：classify 分发走偏好映射的 pi-ai 传输
+				resolveModel: () => fakeClassifierModel(modelApi),
+				classify: (m, context) => {
+					seenApis.push(m.api);
+					return fake.classify(context);
+				},
+			});
+			const masked = await masker.mask(`部署密码 ${PASSWORD}，订单 ${ORDER}`, noUiCtx);
+			expect(masked).not.toContain(PASSWORD); // 覆盖线缆照常判定掩码
+			expect(masked).toContain(ORDER);
+			expect(masker.status.judgedTexts).toBeGreaterThan(0);
+			expect(masker.status.degradedTexts).toBe(0); // 覆盖非降级、非错误
+			expect(seenApis.length).toBeGreaterThan(0);
+			expect(new Set(seenApis)).toEqual(new Set([classifyApi])); // 断言 classify 收到的 model.api 为覆盖值
+			expect(masker.wire).toEqual({ source: "override", preference: api, api: classifyApi });
+		}
+	});
+
+	test("分支 3（插件自定义 api + 偏好）：尊重插件实现——正常装配掩码 + 一次性 info 通知 + 偏好未生效标记", async () => {
 		const pipeline = createMaskingPipeline();
-		const status = emptyStatus();
-		const fake = scriptClassify({ gate: () => 0.98, candidate: () => 0.96 });
+		const fake = scriptClassify({
+			gate: () => 0.98,
+			candidate: (value) => (value === PASSWORD ? 0.96 : 0.04),
+		});
+		const seenApis: string[] = [];
+		const { ctx, notifications, statusKeys } = uiCtx();
 		const masker = createJudgeTextMasker({
 			modelRef: MODEL_REF,
 			pipeline,
-			status,
-			api: "decisions", // 与模型注册的 typesafe-system-one 不一致
-			resolveModel: () => fakeClassifierModel("typesafe-system-one"),
-			classify: (_m, context) => fake.classify(context),
+			api: "systemone", // 用户现场场景（#16）：插件注册的自定义 api，偏好不生效但正常装配
+			resolveModel: () => fakeClassifierModel("litellm-decisions"),
+			classify: (m, context) => {
+				seenApis.push(m.api);
+				return fake.classify(context);
+			},
 		});
 		const text = `部署密码 ${PASSWORD}，订单 ${ORDER}`;
-		const masked = await masker.mask(text, noUiCtx);
-		expect(masked).toBe(text); // 配置错误 ≠ judge 故障：不走 fail_closed 兑底，文本原样交 regex 层
-		expect(status.judgedTexts).toBe(0);
-		expect(fake.calls.length).toBe(0); // 未发起任何判定调用
-		expect(status.degradedTexts).toBe(1); // 降级按文本叶计数，不静默
-		expect(status.lastResolutionError).toContain("decisions");
-		expect(status.lastResolutionError).toContain("typesafe-system-one");
-		expect(status.lastResolutionError).toContain("keep-secret-fake/jev-fake");
-		// 墓碑：regex 层零命中也不得把该文本写成干净（防配置修正后 judge 恢复被缓存短路）
-		pipeline.maskText(text);
-		expect(pipeline.cleanCache.isClean(text)).toBe(false);
+		const masked = await masker.mask(text, ctx);
+		expect(masked).not.toContain(PASSWORD); // 正常装配：judge 判定掩码照常
+		expect(masked).toContain(ORDER);
+		expect(masked).toMatch(/key-[A-Z2-7]{12}/);
+		expect(masker.status.judgedTexts).toBeGreaterThan(0);
+		expect(masker.status.degradedTexts).toBe(0); // 非错误、非降级
+		expect(masker.status.failClosed).toBe(0);
+		expect(seenApis.length).toBeGreaterThan(0);
+		expect(new Set(seenApis)).toEqual(new Set(["litellm-decisions"])); // 模型原样（插件实现不被改写）
+		// 一次性 info 通知：偏好未生效，线缆由插件实现决定
+		expect(notifications).toHaveLength(1);
+		expect(notifications[0]!.type).toBe("info");
+		expect(notifications[0]!.message).toContain("systemone");
+		expect(notifications[0]!.message).toContain("litellm-decisions");
+		expect(notifications[0]!.message).toContain("未生效");
+		expect(statusKeys).toEqual([]); // 非降级不占状态栏
+		// 状态面标记：生效线缆为插件自定义名 + 偏好未生效
+		expect(masker.wire).toEqual({
+			source: "plugin",
+			api: "litellm-decisions",
+			ineffectivePreference: "systemone",
+		});
+		// 同一掩码器的后续文本不重复通知（一次性）
+		await masker.mask(`再说一次 ${PASSWORD}`, ctx);
+		expect(notifications).toHaveLength(1);
 	});
 });

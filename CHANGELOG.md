@@ -20,10 +20,11 @@
 - 端到端收敛用例（正式组合入口，接缝 1）：多轮掩码-还原-再掩码确定性、judge 故障 fail_closed 全链路、压缩后对话继续且伪值一致、图片内容字节不变（T8，#10）。
 - 目录扩展打包：`package.json` 的 `pi.extensions` 清单（`--extension <repo>` 与用户级目录发现共用）；README 安装/配置/卸载步骤与已知限制汇总（T8，#10）。
 - `detectorsMode` 策略开关（`replace` 默认 / `merge`）：merge 下内置默认集与用户 `detectors` 合并——同名用户项原位覆盖内置（可微调 pattern/redactTemplate，如收紧 sk- 排除规则），非同名项追加在内置之后；`detectors` 未配置时两模式等价纯内置集；非法值整体回退默认集 + 错误可见；模式与生效集纳入配置指纹（reload 热应用），`/keep-secret` 状态面展示模式与生效检测器数（T13，#13）。
-- judge 双协议（T14，#14）：config.json 的 judge 段新增可选键 `api`（`systemone` / `decisions`）——缺省跟随模型注册条目的 `api` 字段（适配器协议无关，走 modelRegistry.classify）；填写则装配时与模型注册 api 比对（typesafe-system-one↔systemone、openai-decisions↔decisions），不一致按配置错误处理：不装配 judge、仅 regex 检测层、错误可见（非法值在 loader 整体回退）。网关验证脚本支持 `PI_KEEP_SECRET_JUDGE_API=decisions` 切 OpenAI Decisions 线缆；README 双协议 models.json/config 样例。
+- judge 双协议（T14，#14）：config.json 的 judge 段新增可选键 `api`（`systemone` / `decisions`，非法值在 loader 整体回退）——缺省跟随模型注册条目的 `api` 字段（适配器协议无关，走 modelRegistry.classify）；`MODEL_API_BY_JUDGE_API` 映射 typesafe-system-one↔systemone、openai-decisions↔decisions（T16 起用作偏好覆盖映射，见 Changed）。网关验证脚本支持 `PI_KEEP_SECRET_JUDGE_API=decisions` 切 OpenAI Decisions 线缆；README 双协议 models.json/config 样例。
 
 ### Changed
 
+- judge.api 语义从名称硬校验改为线缆偏好（T16，#16，修复插件注册 classifier 模型被误杀）：设置后按三分支应用——模型注册为 pi-ai 内置 classifier api 时覆盖分发线缆（classify 调用传浅拷贝仅改 api 字段的模型）；插件自定义 api（如 `litellm-decisions`）时尊重插件实现、正常装配，偏好未生效（一次性 info 通知 + `/keep-secret` 状态面线缆段与未生效标记）；彻底移除「不一致 → 不装配 judge」硬校验路径与错误文案。loader 合法值校验保留；运行期 classify 异常 fail_closed 语义不变。
 - 掩码压缩故障语义（spec 故事 24，零泄漏）：摘要调用带重试（2 次重试、短退避，中止感知）；重试仍失败 → 返回 `{ cancel: true }` 取消本次压缩（会话继续不压缩）+ notify 说明与重试建议 + 取消计数；**彻底移除「回退 pi 默认压缩」路径**（默认压缩不掩码，回退即泄漏）。用户中止语义不变（不计失败）。
 - judge 模型缺失默认 fail_closed（spec 故事 19「down judge never means an unmasked request」）：新增配置项 `judge.onMissing`（`fail_closed` 默认 / `regex_only` 显式知情降级）；fail_closed 下模型缺失与 classify 故障同路径——该消息未验证候选一律掩码（真值注册表本地保留）/ 命令面状态行展示生效策略 / 自测在模型缺失时全部样本期望掩码并附说明。
 - judge 截断护栏（故事 19 精神）：候选超 `batchSize × maxBatches` 截断丢弃的短候选按未验证一律掩码（不再放行；计数保留）。

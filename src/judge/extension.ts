@@ -19,10 +19,14 @@
  *   ctx.ui.notify（有 UI 时）+ 状态栏标记 + JudgeStatus 每请求计数
  *   （无 UI 模式仅计数）。
  *
- * T14（ticket #14）：`api` 选项（config.json 的 judge.api）是线缆协议
- * 提示——缺省不校验（跟随模型注册条目的 api 字段，适配器协议无关）；
- * 填写则模型解析后比对 MODEL_API_BY_JUDGE_API，不一致 → 配置错误语义
- * （同 judge 段非法整体回退）：不装配 judge、仅 regex 层、错误可见。
+ * T14（ticket #14）→ T16（ticket #16）：`api` 选项（config.json 的
+ * judge.api）是**线缆偏好**而非名称校验——三分支：缺省跟随模型注册
+ * 条目的 api 字段；模型注册为 pi-ai 已知 classifier api 时按偏好覆盖
+ * 分发线缆（classify 收到浅拷贝仅改 api 的模型）；模型注册为插件
+ * 自定义 api（如 litellm-decisions）时尊重插件实现、正常装配，偏好
+ * 记为未生效（一次性 info 通知 + 状态面标记）。不再有「不一致 →
+ * 不装配」的硬校验（modelRegistry.classify 本身按 model.api 正确分发，
+ * 名称检查只带来插件模型误杀）。
  *
  * fail_closed：judge verdict 中未验证候选已并入 spans 掩码（真值由注册表
  * 本地保留，可恢复）；classify 错误计入状态并（有 UI 时）告警。
@@ -52,17 +56,20 @@ export const DEFAULT_JUDGE_TEMPLATE = "key-{hash}";
 const STATUS_KEY = "keep-secret-judge";
 
 /**
- * judge.api 配置值 ↔ pi-ai classifier 模型注册 api（T14）：两处分工——
- * loader（config/loader.ts）只校验 judge.api 合法值
- * （systemone|decisions），一致性比对在装配处（本掩码器模型解析后）：
- * model.api 与映射不一致 → 配置错误（同 judge 段非法整体回退语义）。
- * 适配器本身协议无关（走 modelRegistry.classify，传输协议由模型注册
- * 条目的 api 字段决定），仅此提示键做防 typo 校验。
+ * judge.api 偏好值 ↔ pi-ai classifier 模型注册 api（T14 引入，T16 改用途）：
+ * 两处分工——loader（config/loader.ts）只校验 judge.api 合法值
+ * （systemone|decisions）；装配处（本掩码器模型解析后）按三分支应用
+ * 偏好（见 options.api 文档）：模型注册为已知 classifier api 时本映射
+ * 给出覆盖分发的目标 api；插件自定义 api 时尊重插件实现、偏好不生效。
  */
 export const MODEL_API_BY_JUDGE_API: Record<JudgeApi, string> = {
 	systemone: "typesafe-system-one",
 	decisions: "openai-decisions",
 };
+
+/** pi-ai 已知 classifier 线缆（内置传输）——judge.api 偏好可覆盖的分发目标。
+ *  值域即 MODEL_API_BY_JUDGE_API 的映射值（同一拼写单一来源）。 */
+const KNOWN_MODEL_APIS = new Set(Object.values(MODEL_API_BY_JUDGE_API));
 
 /** classifier 模型配置引用（provider/modelId；判定模型/端点是配置，规格 #1 故事 34）。 */
 export interface ClassifierModelRef {
@@ -85,8 +92,7 @@ export type ClassifyChannel = (
 /** judge 故障与降级状态（/keep-secret 状态面与测试断言用；不静默降级）。 */
 export interface JudgeStatus {
 	/** classifier 模型解析失败而降级放行的文本叶数（onMissing=regex_only 时
-	 *  递增；judge.api 与模型注册 api 不一致的配置错误降级同样递增——
-	 *  两者都是 judge 层不工作、文本交后置 regex 层）。 */
+	 *  递增；judge 层不工作、文本交后置 regex 层）。 */
 	degradedTexts: number;
 	/** 最近一次模型解析/协议一致性失败原因（降级与 fail_closed 两路径都记录）。 */
 	lastResolutionError: string | undefined;
@@ -119,12 +125,25 @@ export interface JudgeEgressOptions extends Omit<SystemOneJudgeOptions, "classif
 	masker?: JudgeTextMasker;
 	/** classifier 模型缺失策略，默认 fail_closed（见 config/loader.ts JudgeOnMissing）。 */
 	onMissing?: JudgeOnMissing;
-	/** 期望线缆协议（config.json 的 judge.api；缺省 undefined 不校验——
-	 *  跟随模型注册条目的 api 字段。填写则模型解析后与
-	 *  MODEL_API_BY_JUDGE_API 比对，不一致按配置错误处理：不装配
-	 *  judge、仅 regex 层、错误可见）。 */
+	/** 线缆偏好（config.json 的 judge.api；缺省 undefined 跟随模型注册条目
+	 *  的 api 字段。填写时按三分支应用（T16）：模型注册为 pi-ai 已知
+	 *  classifier api（typesafe-system-one/openai-decisions）→ 覆盖分发
+	 *  线缆（classify 收到 {...model, api: 映射值} 浅拷贝，仅改 api 字段，
+	 *  baseUrl/provider/headers 不变，认证按 provider 解析不受影响）；
+	 *  模型注册为插件自定义 api → 尊重插件实现（插件作者已选定线缆），
+	 *  正常装配 + 偏好未生效一次性 info 通知 + 状态面标记。 */
 	api?: JudgeApi;
 }
+
+/** 生效线缆信息（T16：模型解析后定格；/keep-secret 状态面展示用）。
+ *  source=registered——缺省偏好，跟随模型注册条目；override——偏好
+ *  覆盖分发线缆（已知 classifier api 模型）；plugin——模型注册为插件
+ *  自定义 api，线缆由该实现决定（偏好未生效，ineffectivePreference 记录
+ *  未生效的偏好值）。 */
+export type JudgeWire =
+	| { source: "registered"; api: string }
+	| { source: "override"; preference: JudgeApi; api: string }
+	| { source: "plugin"; api: string; ineffectivePreference: JudgeApi };
 
 const defaultResolveModel: ModelResolver = (ctx, ref) =>
 	ctx.modelRegistry.findOfType("classifier", ref.provider, ref.modelId);
@@ -148,6 +167,9 @@ export interface JudgeTextMasker {
 	/** 最近一次 mask 时 classifier 模型是否缺失（自测期望动态化：fail_closed 下
 	 *  未验证候选一律掩码，全部样本期望掩码）。 */
 	readonly modelMissing: boolean;
+	/** 生效线缆（T16：模型解析后定格；解析前 undefined。状态面展示生效
+	 *  线缆与偏好未生效标记）。 */
+	readonly wire: JudgeWire | undefined;
 	/** 对一段文本判定并掩码；模型缺失按 onMissing 策略（默认 fail_closed 掩码，
 	 *  regex_only 原样返回交 regex 层）。 */
 	mask(text: string, ctx: ExtensionContext): Promise<string>;
@@ -172,9 +194,10 @@ export function createJudgeTextMasker(options: JudgeEgressOptions): JudgeTextMas
 
 	let judge: SystemOneJudge | undefined;
 	let notifiedModelMissing = false;
-	let notifiedApiMismatch = false;
+	let notifiedApiPreference = false;
 	let notifiedError: string | undefined;
 	let modelMissing = false;
+	let wire: JudgeWire | undefined;
 
 	/** 模型缺失的 fail_closed 兜底：与 classify 故障同路径——该文本抽取出的
 	 *  候选未获判定结论，一律掩码（与 regex 管线共享掩码尾段，幂等过滤已是
@@ -237,27 +260,35 @@ export function createJudgeTextMasker(options: JudgeEgressOptions): JudgeTextMas
 				pipeline.cleanCache.remember(text, { hasSecret: true }); // 墓碑同记
 				return maskUnverifiedLocally(text);
 			}
-			// judge.api 一致性比对（T14，装配处分工）：模型在位但注册 api 与
-			// 配置提示不一致 → 配置错误（同 judge 段非法整体回退语义）：不装配
-			// judge、文本原样交后置 regex 层（不走 fail_closed 兑底——配置错误非
-			// judge 故障）、错误可见（notify/状态栏 + lastResolutionError +
-			// degradedTexts）+ 墓碑（防配置修正后 judge 恢复被 clean cache 短路）
-			if (options.api !== undefined && model.api !== MODEL_API_BY_JUDGE_API[options.api]) {
-				status.lastResolutionError =
-					`judge.api "${options.api}" 与模型注册 api "${model.api}"（${modelRef.provider}/${modelRef.modelId}）不一致——配置错误，judge 未接入（仅 regex 检测层）`;
-				if (!notifiedApiMismatch) {
-					notifiedApiMismatch = true;
+			// T16 三分支线缆偏好（彻底移除「不一致 → 不装配」硬校验——
+			// modelRegistry.classify 本身按 model.api 正确分发，名称检查只会
+			// 误杀插件注册的 classifier 模型）：
+			// 1) 缺省偏好 → 跟随模型注册条目的 api 字段；
+			// 2) 偏好 + 模型注册为 pi-ai 已知 classifier api → 覆盖分发线缆
+			//    （浅拷贝仅改 api 字段，baseUrl/provider/headers 不变）；
+			// 3) 偏好 + 模型注册为插件自定义 api → 尊重插件实现（插件作者已
+			//    选定线缆），正常装配 + 偏好未生效一次性 info 通知（非错误、
+			//    非降级：不减分、不占状态栏）+ 状态面 wire 标记。
+			let effectiveModel = model;
+			if (options.api === undefined) {
+				wire = { source: "registered", api: model.api };
+			} else if (KNOWN_MODEL_APIS.has(model.api)) {
+				const preferredApi = MODEL_API_BY_JUDGE_API[options.api];
+				if (model.api !== preferredApi) {
+					effectiveModel = { ...model, api: preferredApi };
+				}
+				wire = { source: "override", preference: options.api, api: preferredApi };
+			} else {
+				wire = { source: "plugin", api: model.api, ineffectivePreference: options.api };
+				if (!notifiedApiPreference) {
+					notifiedApiPreference = true;
 					if (ctx.hasUI) {
 						ctx.ui.notify(
-							`pi-keep-secret: judge 配置错误——judge.api "${options.api}" 与模型 ${modelRef.provider}/${modelRef.modelId} 注册的 api "${model.api}" 不一致，judge 未接入（仅 regex 检测层）；请修正 config.json 的 judge.api 或模型注册条目`,
-							"error",
+							`pi-keep-secret: judge.api 偏好 "${options.api}" 未生效——模型 ${modelRef.provider}/${modelRef.modelId} 注册为自定义 api "${model.api}"，线缆由该实现决定（judge 正常装配）`,
+							"info",
 						);
-						ctx.ui.setStatus(STATUS_KEY, "pi-keep-secret judge 未接入（judge.api 与模型注册 api 不一致）");
 					}
 				}
-				status.degradedTexts += 1;
-				pipeline.cleanCache.remember(text, { hasSecret: true });
-				return text;
 			}
 			// classify 通道绑定首次解析到的 modelRegistry 与模型（会话生命周期稳定）
 			modelMissing = false;
@@ -266,7 +297,7 @@ export function createJudgeTextMasker(options: JudgeEgressOptions): JudgeTextMas
 			judge = createSystemOneJudge({
 				...options,
 				detectorName,
-				classify: (context) => channel(model, context),
+				classify: (context) => channel(effectiveModel, context),
 			});
 		}
 		const activeJudge = judge;
@@ -301,7 +332,13 @@ export function createJudgeTextMasker(options: JudgeEgressOptions): JudgeTextMas
 		return redactSpansWithRegistry(text, verdict.spans, registry, templates).text;
 	};
 
-	return { status, onMissing, get modelMissing() { return modelMissing; }, mask };
+	return {
+		status,
+		onMissing,
+		get modelMissing() { return modelMissing; },
+		get wire() { return wire; },
+		mask,
+	};
 }
 
 /** 创建 judge 出站扩展（ExtensionFactory）。模型缺失不抛错——按 onMissing 策略
