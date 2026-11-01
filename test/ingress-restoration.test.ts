@@ -8,6 +8,8 @@
  */
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Type } from "@earendil-works/pi-ai";
 import { makePlaceholder } from "../src/engine/index.ts";
 import { createHarnessSession, requestText } from "../src/harness/fake-session.ts";
 
@@ -18,6 +20,25 @@ const EXTENSION_ENTRY = join(import.meta.dir, "..", "extension", "index.ts");
 const OPENAI_KEY = "sk-live-abcdefghijklmnopqrst";
 /** 出站确定性伪值（默认 hashLength=12；脚本化回显只能用供应商见过的伪值）。 */
 const OPENAI_PH = makePlaceholder(OPENAI_KEY, "sk-{hash}", 12);
+
+/** 记录 cmd 参数的探针工具（bash 透明性验收的进程内等价物：fauxToolCall
+ * 路径 + 记录工具；真 bash 对真模型的验证见 research/probe.ts 探针实验 2）。 */
+function runCmdTool(seenCmds: string[]): ToolDefinition {
+	const params = Type.Object({
+		cmd: Type.String(),
+		env: Type.Optional(Type.Record(Type.String(), Type.String())),
+	});
+	return {
+		name: "run_cmd",
+		label: "Run Cmd",
+		description: "Runs a command.",
+		parameters: params,
+		execute: async (_id, input) => {
+			seenCmds.push(input.cmd);
+			return { content: [{ type: "text", text: "ok" }], details: {} };
+		},
+	};
+}
 
 describe("T3 回程还原：message_end + tool_call", () => {
 	test("脚本化文本响应回显伪值：transcript 落真值，供应商全程只见伪值", async () => {
@@ -41,6 +62,61 @@ describe("T3 回程还原：message_end + tool_call", () => {
 			const last = requests[requests.length - 1];
 			expect(requestText(last)).not.toContain(OPENAI_KEY);
 			expect(requestText(last)).toContain(OPENAI_PH);
+		} finally {
+			h.dispose();
+		}
+	});
+
+	test("脚本化 toolCall 参数回显伪值：工具实际执行参数与 transcript 均为真值", async () => {
+		const seenCmds: string[] = [];
+		const h = await createHarnessSession({
+			extensionPaths: [EXTENSION_ENTRY],
+			customTools: [runCmdTool(seenCmds)],
+		});
+		try {
+			// 供应商回 toolCall：参数里只有它见过的伪值（含深嵌套 env 值）
+			h.provider.setScript([
+				{
+					toolCall: {
+						name: "run_cmd",
+						arguments: {
+							cmd: `export KEY=${OPENAI_PH}`,
+							env: { auth: `Bearer ${OPENAI_PH}` },
+						},
+					},
+				},
+				{ text: "done" },
+			]);
+			await h.session.prompt(`rotate the key ${OPENAI_KEY}`);
+
+			// 工具实际执行参数为真值（message_end 还原在工具执行之前生效）
+			expect(seenCmds).toEqual([`export KEY=${OPENAI_KEY}`]);
+			// 本地 transcript：toolCall 参数（含深嵌套 env.auth）保留真值
+			const transcript = JSON.stringify(h.session.messages);
+			expect(transcript).toContain(`export KEY=${OPENAI_KEY}`);
+			expect(transcript).toContain(`Bearer ${OPENAI_KEY}`);
+			// 供应商视角：全部请求只见伪值
+			expect(h.provider.requests()).toHaveLength(2);
+			for (const request of h.provider.requests()) {
+				expect(requestText(request)).not.toContain(OPENAI_KEY);
+			}
+		} finally {
+			h.dispose();
+		}
+	});
+
+	test("脚本化 thinking 回显伪值：transcript 的 thinking 块落真值", async () => {
+		const h = await createHarnessSession({ extensionPaths: [EXTENSION_ENTRY] });
+		try {
+			h.provider.setScript([
+				{ text: "ack", thinking: `用户密钥是 ${OPENAI_PH}，我用它部署` },
+			]);
+			await h.session.prompt(`use my key ${OPENAI_KEY}`);
+
+			// 本地 transcript：thinking 块已还原为真值
+			const transcript = JSON.stringify(h.session.messages);
+			expect(transcript).toContain(`用户密钥是 ${OPENAI_KEY}，我用它部署`);
+			expect(transcript).not.toContain(OPENAI_PH);
 		} finally {
 			h.dispose();
 		}
