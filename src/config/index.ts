@@ -21,6 +21,7 @@ export {
 	type ConfigLoader,
 	type ConfigLoaderOptions,
 	type DetectorsMode,
+	type JudgeApi,
 	type JudgeConfig,
 	type JudgeOnMissing,
 	type ResolvedConfig,

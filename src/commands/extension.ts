@@ -192,7 +192,7 @@ async function buildSelfTestReport(
 		options.judge.status.degradedTexts > 0 &&
 		!allPassed
 	) {
-		lines.push("注意：judge 已降级（classifier 模型不可用，仅 regex 检测层工作）——假密码项未通过即降级信号");
+		lines.push("注意：judge 已降级（classifier 模型不可用或 judge.api 与模型注册 api 不一致，仅 regex 检测层工作）——假密码项未通过即降级信号");
 	}
 	if (failClosedNoModel) {
 		lines.push(

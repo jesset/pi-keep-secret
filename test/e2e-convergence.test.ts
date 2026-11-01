@@ -419,3 +419,57 @@ describe("T8 端到端收敛用例（正式组合入口）", () => {
 		}
 	});
 });
+
+describe("T14 judge 双协议配置（judge.api，正式组合入口）", () => {
+	test("judge.api 与模型注册 api 匹配：正常装配判定，命令面无降级", async () => {
+		const fake = passwordJudge();
+		const ext = createKeepSecretExtension({
+			configPath: writeTempConfig(
+				JSON.stringify({ judge: { ...JSON.parse(JUDGE_CONFIG).judge, api: "systemone" } }),
+			),
+			resolveModel: () => fakeClassifierModel(), // typesafe-system-one：与 api: "systemone" 匹配
+			classify: (_model, context) => fake.classify(context),
+		});
+		const h = await createHarnessSession({ extensionFactories: [ext] });
+		try {
+			h.provider.setScript([{ text: "ack" }]);
+			await h.session.prompt(`部署密码 ${PASSWORD}，密钥 ${OPENAI_KEY}`);
+			const out = requestText(h.provider.requests()[0]);
+			expect(out).not.toContain(PASSWORD); // judge 照常判定掩码
+			expect(out).not.toContain(OPENAI_KEY);
+			const status = await runKeepSecretCommand(ext, "");
+			expect(status).toMatch(/judge：已判定 \d+ 叶，截断 0 次，fail-closed 0 次，降级 0 叶/);
+		} finally {
+			h.dispose();
+		}
+	});
+
+	test("judge.api 与模型注册 api 不匹配：配置错误——judge 未装配仅 regex 层，命令面降级可见", async () => {
+		const fake = passwordJudge();
+		const ext = createKeepSecretExtension({
+			configPath: writeTempConfig(
+				JSON.stringify({ judge: { ...JSON.parse(JUDGE_CONFIG).judge, api: "decisions" } }),
+			),
+			resolveModel: () => fakeClassifierModel(), // typesafe-system-one：与 api: "decisions" 不匹配
+			classify: (_model, context) => fake.classify(context),
+		});
+		const h = await createHarnessSession({ extensionFactories: [ext] });
+		try {
+			h.provider.setScript([{ text: "ack" }]);
+			await h.session.prompt(`部署密码 ${PASSWORD}，密钥 ${OPENAI_KEY}`);
+			const out = requestText(h.provider.requests()[0]);
+			expect(out).toContain(PASSWORD); // judge 未装配（配置错误语义）：密码原样出站（regex 层不可见）
+			expect(out).not.toContain(OPENAI_KEY); // regex 层照常掩码
+			expect(out).toMatch(/sk-[A-Z2-7]{12}/);
+			// 命令面可见：未判定 + 降级计数（模型缺失策略行仍展示 onMissing 缺省值）
+			const status = await runKeepSecretCommand(ext, "");
+			expect(status).toMatch(
+				/judge：已判定 0 叶，截断 0 次，fail-closed 0 次，降级 \d+ 叶（模型缺失策略：fail_closed）/,
+			);
+			const selfTest = await runKeepSecretCommand(ext, "test");
+			expect(selfTest).toMatch(/假密码：未掩码（期望：掩码/); // 自测如实报告降级
+		} finally {
+			h.dispose();
+		}
+	});
+});
