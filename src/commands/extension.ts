@@ -44,7 +44,7 @@ export interface KeepSecretCommandsOptions {
 const precheckDetectors: CompiledRegexDetector[] = DEFAULT_DETECTOR_SPECS.map(compileRegexDetector);
 
 /** 提交内容疑似凭据快扫：命中的检测器名集合（空 = 未命中）。 */
-export function precheckSuspects(text: string): string[] {
+function precheckSuspects(text: string): string[] {
 	const names = new Set(detectRegexSpans(precheckDetectors, text).map((span) => span.detector));
 	return [...names];
 }
@@ -70,7 +70,7 @@ function hitRate(hits: number, total: number): string {
 }
 
 /** /keep-secret 状态面板文本（数据源：loader/pipeline/compaction/judge）。 */
-export function buildStatusReport(options: KeepSecretCommandsOptions): string {
+function buildStatusReport(options: KeepSecretCommandsOptions): string {
 	const config = options.loader.get();
 	const lines: string[] = [
 		"pi-keep-secret 状态",
@@ -139,7 +139,7 @@ const SELF_TEST_SAMPLES: SelfTestSample[] = [
 ];
 
 /** /keep-secret test：合成样本逐项过会话管线，报告掩码结果与期望是否一致。 */
-export function buildSelfTestReport(pipeline: MaskingPipeline): { text: string; allPassed: boolean } {
+function buildSelfTestReport(pipeline: MaskingPipeline): { text: string; allPassed: boolean } {
 	const lines = ["pi-keep-secret 自测（合成样本，当前生效检测器集）"];
 	let passed = 0;
 	for (const sample of SELF_TEST_SAMPLES) {
