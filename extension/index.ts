@@ -1,10 +1,19 @@
 /**
  * pi-keep-secret 扩展入口（目录扩展 index.ts 工厂）。
  *
- * 当前能力（ticket #4 / T2）：出站掩码——每次模型请求前对完整
- * transcript 的文本叶做检测并替换为确定性伪值（`context_with_system`）。
- * 回程还原（T3）、judge（T5）、掩码压缩（T6）见规格 #1。
+ * 组合接线：出站掩码（ticket #4 / T2）与回程还原（ticket #5 / T3）
+ * 共用同一伪值注册表实例（会话生命周期闭包状态：出站签发、回程还原）。
+ * judge（T5）、掩码压缩（T6）见规格 #1。
  */
-import { createEgressMaskingExtension } from "../src/masking/index.ts";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createIngressRestorationExtension } from "../src/ingress/index.ts";
+import { createEgressMaskingExtension, createPlaceholderRegistry } from "../src/masking/index.ts";
 
-export default createEgressMaskingExtension();
+/** 出站签发与回程还原共用的注册表（每次扩展加载一份，随会话存续）。 */
+const registry = createPlaceholderRegistry();
+
+/** pi-keep-secret 组合扩展工厂。 */
+export default function keepSecretExtension(pi: ExtensionAPI): void {
+	createEgressMaskingExtension({ registry })(pi);
+	createIngressRestorationExtension({ registry })(pi);
+}
