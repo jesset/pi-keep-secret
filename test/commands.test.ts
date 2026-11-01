@@ -14,7 +14,7 @@
  *
  * 全部配置走临时文件，不触真实 ~/.pi 路径。
  */
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -34,13 +34,15 @@ afterEach(() => {
 	}
 });
 
-/** 组装命令面依赖：不存在的配置路径（内置默认集）+ 会话级管线 + 压缩状态。 */
-function makeCommands() {
+/** 组装命令面依赖：configContent 给定时写入临时配置文件（缺省不存在 → 内置默认集）。 */
+function makeCommands(configContent?: string) {
 	const dir = mkdtempSync(join(tmpdir(), "pi-keep-secret-t7-"));
 	tempDirs.push(dir);
-	const { factory, loader, pipeline } = createConfiguredMaskingExtension({
-		configPath: join(dir, "config.json"),
-	});
+	const configPath = join(dir, "config.json");
+	if (configContent !== undefined) {
+		writeFileSync(configPath, configContent, "utf8");
+	}
+	const { factory, loader, pipeline } = createConfiguredMaskingExtension({ configPath });
 	const compaction: MaskedCompactionStatus = { fallbacks: 0, lastFallbackError: undefined };
 	const commands = createKeepSecretCommandsExtension({ loader, pipeline, compaction });
 	return { factory, commands, loader, pipeline, compaction };
@@ -122,5 +124,88 @@ describe("T7 input 预检通知（默认 regex 集快扫，非阻塞）", () => 
 		} finally {
 			h.dispose();
 		}
+	});
+});
+
+describe("T7 /keep-secret 状态面板", () => {
+	const OTHER_KEY = "sk-live-zyxwvutsrqponmlkjih";
+
+	/** 直调命令 handler 并取全部 notify 文本。 */
+	async function runCommand(
+		commands: (pi: ExtensionAPI) => void,
+		args: string,
+	): Promise<string> {
+		const { commandHandler } = registerExtension(commands);
+		expect(commandHandler).toBeDefined();
+		const { ctx, notifications } = recordingContext();
+		await commandHandler!(args, ctx);
+		return notifications.map((n) => n.message).join("\n");
+	}
+
+	test("含各计数器且随会话事件递增（harness 会话驱动）", async () => {
+		const { factory, commands } = makeCommands();
+		const h = await createHarnessSession({ extensionFactories: [factory, commands] });
+		try {
+			h.provider.setScript([{ text: "ok" }, { text: "done" }]);
+			await h.session.prompt(`deploy with ${OPENAI_KEY}`);
+			const status1 = await runCommand(commands, "");
+
+			// 检测器配置摘要：来源（默认集）、条数（内置默认集 7 个）、名列表
+			expect(status1).toContain("pi-keep-secret");
+			expect(status1).toContain("来源：内置默认集");
+			expect(status1).toMatch(/检测器：7 个/);
+			expect(status1).toContain("openai-key");
+			// 注册表条目数：1 个不同 secret → 1 条
+			expect(status1).toMatch(/伪值注册表：1 条/);
+			// clean cache：条目数与命中率（含「命中 x / 检测 y」明细）
+			expect(status1).toMatch(/clean cache：\d+ 条，命中率 \d+%（命中 \d+ \/ 检测 \d+）/);
+			// 各检测器命中计数：openai-key 第一轮 1 次
+			expect(status1).toMatch(/openai-key=1/);
+			// judge 预留位（T5 未合入）
+			expect(status1).toContain("judge：未接入");
+			// 压缩回退计数
+			expect(status1).toMatch(/掩码压缩回退：0 次/);
+
+			// 第二轮：新 secret 入会话 → 计数器递增
+			await h.session.prompt(`rotate to ${OTHER_KEY}`);
+			const status2 = await runCommand(commands, "");
+			// openai-key：第一轮 1 + 第二轮重扫历史 secret 消息 1 + 新 secret 1 = 3
+			expect(status2).toMatch(/openai-key=3/);
+			expect(status2).toMatch(/伪值注册表：2 条/);
+			// clean cache 检测计数递增（第一轮已判定的干净文本被命中短路）
+			const scans1 = Number(status1.match(/检测 (\d+)/)?.[1]);
+			const scans2 = Number(status2.match(/检测 (\d+)/)?.[1]);
+			expect(scans2).toBeGreaterThan(scans1);
+			const hits1 = Number(status1.match(/命中 (\d+)/)?.[1]);
+			const hits2 = Number(status2.match(/命中 (\d+)/)?.[1]);
+			expect(hits2).toBeGreaterThan(hits1);
+		} finally {
+			h.dispose();
+		}
+	});
+
+	test("注入状态对象：压缩回退与 judge 预留位展示计数与原因", async () => {
+		const made = makeCommands();
+		made.compaction.fallbacks = 2;
+		made.compaction.lastFallbackError = "掩码压缩摘要: 摘要为空";
+		const withJudge = createKeepSecretCommandsExtension({
+			loader: made.loader,
+			pipeline: made.pipeline,
+			compaction: made.compaction,
+			judge: { truncations: 3, fallbacks: 1 },
+		});
+		const text = await runCommand(withJudge, "");
+		expect(text).toMatch(/掩码压缩回退：2 次/);
+		expect(text).toContain("掩码压缩摘要: 摘要为空");
+		expect(text).toMatch(/judge：截断 3 次，fail-closed 回退 1 次/);
+	});
+
+	test("非法配置：状态面报配置错误与回退标记（无 UI 模式的错误可见出口）", async () => {
+		const { commands } = makeCommands(
+			JSON.stringify({ detectors: [{ name: "bad", pattern: "corp-[{" }] }),
+		);
+		const text = await runCommand(commands, "");
+		expect(text).toContain("配置错误");
+		expect(text).toMatch(/已回退内置默认集/);
 	});
 });

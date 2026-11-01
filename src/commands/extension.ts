@@ -49,6 +49,62 @@ export function precheckSuspects(text: string): string[] {
 	return [...names];
 }
 
+/** 配置来源描述：默认集 / 配置文件 / 非法回退（状态面第一行用）。 */
+function describeConfigSource(loader: ConfigLoader): string {
+	const config = loader.get();
+	if (!config.exists) {
+		return `内置默认集（未找到配置文件 ${config.path}）`;
+	}
+	if (config.errors.length > 0) {
+		return `配置文件 ${config.path}（非法，已回退内置默认集）`;
+	}
+	return `配置文件 ${config.path}`;
+}
+
+/** 命中率百分比文本（零样本显示「n/a」）。 */
+function hitRate(hits: number, total: number): string {
+	if (total === 0) {
+		return "n/a";
+	}
+	return `${Math.round((hits / total) * 100)}%`;
+}
+
+/** /keep-secret 状态面板文本（数据源：loader/pipeline/compaction/judge）。 */
+export function buildStatusReport(options: KeepSecretCommandsOptions): string {
+	const config = options.loader.get();
+	const lines: string[] = [
+		"pi-keep-secret 状态",
+		`检测器：${config.detectors.length} 个，来源：${describeConfigSource(options.loader)}`,
+		`  名称：${config.detectors.map((d) => d.name).join(", ")}`,
+		`伪值注册表：${options.pipeline.registry.size} 条`,
+	];
+	for (const error of config.errors) {
+		lines.push(`配置错误：${error}（已回退内置默认集）`);
+	}
+	const cache = options.pipeline.cacheStats();
+	lines.push(
+		`clean cache：${cache.size} 条，命中率 ${hitRate(cache.hits, cache.hits + cache.misses)}（命中 ${cache.hits} / 检测 ${cache.misses}）`,
+	);
+	const hits = options.pipeline.detectorHitCounts();
+	lines.push(
+		hits.size === 0
+			? "检测器命中：（无）"
+			: `检测器命中：${[...hits.entries()].map(([name, count]) => `${name}=${count}`).join(", ")}`,
+	);
+	lines.push(
+		options.judge === undefined
+			? "judge：未接入（T5 未合入）"
+			: `judge：截断 ${options.judge.truncations} 次，fail-closed 回退 ${options.judge.fallbacks} 次`,
+	);
+	lines.push(
+		`掩码压缩回退：${options.compaction.fallbacks} 次` +
+			(options.compaction.fallbacks > 0 && options.compaction.lastFallbackError !== undefined
+				? `（最近原因：${options.compaction.lastFallbackError}）`
+				: ""),
+	);
+	return lines.join("\n");
+}
+
 /** 创建 T7 可见性扩展：input 预检通知 + /keep-secret 命令面。 */
 export function createKeepSecretCommandsExtension(options: KeepSecretCommandsOptions) {
 	return (pi: ExtensionAPI): void => {
@@ -65,8 +121,8 @@ export function createKeepSecretCommandsExtension(options: KeepSecretCommandsOpt
 
 		pi.registerCommand("keep-secret", {
 			description: "掩码扩展状态 / 自测 / 配置热重载（status | test | reload）",
-			handler: async (_args, _ctx) => {
-				// 后续切片实现
+			handler: async (args, ctx) => {
+				ctx.ui.notify(buildStatusReport(options), "info");
 			},
 		});
 	};
