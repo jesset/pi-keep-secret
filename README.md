@@ -206,6 +206,36 @@ const compose = (pi: ExtensionAPI): void => {
 - `SettingsManager.inMemory(partial)` 可注入 `compaction.keepRecentTokens`/`reserveTokens`，harness 以此驱动手动/阈值压缩；keepRecentTokens 必须小于会话尾部 token 量，否则 `prepareCompaction` 返回 undefined（"Nothing to compact"）。
 - `bashExecution`/`custom` 自定义消息（`!命令` 等）尚未在出站遍历器覆盖（T2 既有缺口，与压缩无关；待后续 ticket 处理）。
 
+## 入站预检通知 + /keep-secret 命令面（T7，issue #9）
+
+代码：`src/commands/`（extension）；验收用例：`test/commands.test.ts`（接缝 1 + 命令 handler 直测）。
+
+### input 预检
+
+- `pi.on("input")` 对提交文本按**内置默认 regex 集**快扫（与配置无关的固定提示层：掩码执法始终以当前配置检测器集为准），命中即 `ctx.ui.notify(..., "warning")` 列出检测器名；返回 `undefined`（不改写、不阻断）。无 UI（print/json）模式 notify 为 no-op，静默。
+
+### /keep-secret 命令面（三子命令）
+
+- `/keep-secret`（状态）：检测器配置摘要（来源/条数/名列表，含非法配置的错误行与回退标记）、伪值注册表条数、clean cache 条数与命中率（命中 x / 检测 y）、各检测器命中计数（`name=N`）、judge 预留位（未接入/T5 合入后接计数）、掩码压缩回退计数与最近原因。
+- `/keep-secret test`：合成样本（sk- 假 key、URL 藏 key、假密码、干净订单号）逐项过**会话管线**，报告已掩码/未掩码与期望比对；与期望一致为通过，全部通过 info、有未通过 warning。期望针对 regex 层：假密码不命中属 judge 职责（T5 合入后改判）；当前配置未覆盖某样本时如实报告未通过。
+- `/keep-secret reload`：调 `loader.reload()`（变更时同步热应用：applyDetectors + 清空缓存）；检测结果经 notify 报告（已热应用/无变更/配置错误回退）。
+- 未知子命令 → 用法提示。
+
+### 三模式安全降级
+
+输出一律经 `ctx.ui.notify`（TUI 直接可见；RPC 经 extension_ui_request 转发，fire-and-forget 不阻塞；print/json 为 no-op 静默，命令动作照常执行），无任何交互原语（select/confirm/custom）。命令 handler 只依赖 `(args, ctx)` 签名，可直接测试。
+
+### 数据来源与最小增量
+
+- 状态面统一走各模块既有接口：`loader.get()`（配置摘要）、`pipeline.registry.size`、`MaskedCompactionStatus`（组合根 `extension/index.ts` 持有并传给压缩扩展与命令面）。
+- 管线最小增量：`pipeline.detectorHitCounts()`（合并后 span 按检测器名累计；缓存短路不计；applyDetectors 清零）与 `pipeline.cacheStats()`（misses = 实际检测次数）。检测器命中计数在注册表幂等过滤**之前**累计（含每轮重扫的含 secret 文本，随会话事件递增）。
+
+### T7 事实发现（后续 ticket 注意）
+
+- pi 的 `prompt()` 对 `/` 开头文本**先**尝试扩展命令分发（`_tryExecuteExtensionCommand`），命中即返回——input 钩子不会看到 `/keep-secret` 自身；接缝 1 验证命令注册需预置假供应商脚本（未识别的命令会作为 prompt 发给模型并记录请求，requests().length 即信号；**无脚本时 faux 在记录前就报错，零请求不能证明命令被执行**）。
+- harness（SDK 会话）的 `ctx.ui` 是 `noOpUIContext`（mode "print"）：notify 不可观察，命令面断言用 stub pi 提取注册的 handler + 注入记录型 ctx.ui 直调（与 pi 同一调用面，ticket 认可的「命令 handler 直测」）。
+- T5 接入点：`createKeepSecretCommandsExtension({ judge })` 传 `JudgeStats { truncations, fallbacks }` 即点亮状态面 judge 行；自测假密码项的期望届时改为掩码。
+
 ## 约定
 
 - Conventional Commits；分支 `ticket/<n>-<slug>`（每张 ticket 在自己的 worktree 基于 `feat/secret-masking`）。合并到 main 需用户明示许可。

@@ -18,7 +18,7 @@ import {
 	type CompiledRegexDetector,
 	type RegexDetectorSpec,
 } from "../engine/index.ts";
-import { createCleanCache, type CleanCache } from "../cache/index.ts";
+import { createCleanCache, type CleanCache, type CleanCacheStats } from "../cache/index.ts";
 import { DEFAULT_DETECTOR_SPECS } from "./detectors.ts";
 import { createPlaceholderRegistry, type PlaceholderRegistry } from "./registry.ts";
 import type { TextMasker } from "./walk.ts";
@@ -50,9 +50,14 @@ export interface MaskingPipeline {
 	readonly registry: PlaceholderRegistry;
 	/**
 	 * 热应用新检测器集：重编译检测器并清空 clean cache（检测器集变更后
-	 * 旧的干净判定不再可信）。T4 配置层热重载（loader.subscribe）消费。
+	 * 旧的干净判定不再可信）与检测器命中计数（名集合已变）。T4 配置层
+	 * 热重载（loader.subscribe）消费。
 	 */
 	applyDetectors(specs: RegexDetectorSpec[]): void;
+	/** 各检测器命中计数（合并后 span 按检测器名累计；T7 /keep-secret 状态面）。 */
+	detectorHitCounts(): ReadonlyMap<string, number>;
+	/** clean cache 统计（T7 /keep-secret 状态面；misses = 实际检测次数）。 */
+	cacheStats(): CleanCacheStats;
 }
 
 /** 创建会话级掩码管线。检测器 pattern 非法时抛错（配置加载层上报扩展错误的既定语义）。 */
@@ -67,12 +72,18 @@ export function createMaskingPipeline(options: MaskingPipelineOptions = {}): Mas
 	const cleanCache =
 		options.cleanCache ??
 		createCleanCache({ limit: options.cleanCacheLimit, ttlMs: options.cleanCacheTtlMs });
+	/** 检测器名 → 合并后命中次数（实际执行检测时才累计，缓存短路不计）。 */
+	const detectorHits = new Map<string, number>();
 
 	const maskText: TextMasker = (text: string): string => {
 		if (cleanCache.isClean(text)) {
 			return text; // 已判定干净：跳过检测（stats().hits 计短路）
 		}
-		const spans = detectRegexSpans(detectors, text).filter(
+		const detected = detectRegexSpans(detectors, text);
+		for (const span of detected) {
+			detectorHits.set(span.detector, (detectorHits.get(span.detector) ?? 0) + 1);
+		}
+		const spans = detected.filter(
 			(span) => !registry.has(text.slice(span.start, span.end)),
 		);
 		// 命中 secret（或 T5 gate 命中）的文本不缓存，每轮重扫
@@ -94,6 +105,13 @@ export function createMaskingPipeline(options: MaskingPipelineOptions = {}): Mas
 			detectors = specs.map(compileRegexDetector);
 			templates = new Map(detectors.map((detector) => [detector.name, detector.template]));
 			cleanCache.clear();
+			detectorHits.clear();
+		},
+		detectorHitCounts() {
+			return new Map(detectorHits);
+		},
+		cacheStats() {
+			return cleanCache.stats();
 		},
 	};
 }
