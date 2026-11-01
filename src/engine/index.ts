@@ -18,6 +18,6 @@ export { compileRegexDetector, regexSpans, detectRegexSpans } from "./detect";
 export type { Candidate } from "./candidate";
 export { extractCandidates } from "./candidate";
 export { makePlaceholder } from "./placeholder";
-export type { Replacement } from "./redact";
+export type { Replacement, PlaceholderIssuer, RedactOptions } from "./redact";
 export { redactText } from "./redact";
 export { unmaskText } from "./unmask";

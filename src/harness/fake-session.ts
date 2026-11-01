@@ -9,7 +9,7 @@
  *
  * 会话运行在临时目录、内存 settings 与内存 session 里，不触网、不落盘。
  */
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -25,16 +25,22 @@ import {
 import {
 	fauxAssistantMessage,
 	fauxProvider,
+	fauxText,
+	fauxThinking,
 	fauxToolCall,
+	type FauxContentBlock,
 	type FauxResponseStep,
 	type JsonObject,
 	type Message,
 } from "@earendil-works/pi-ai";
 
-/** 一次脚本化的助手响应：文本，或一次工具调用。 */
+/**
+ * 一次脚本化的助手响应：文本（可带 thinking），或一次工具调用
+ * （可带 thinking/伴随文本；带 toolCall 时 stopReason 为 toolUse，轮次继续）。
+ */
 export type ScriptedResponse =
-	| { text: string }
-	| { toolCall: { name: string; arguments: JsonObject } };
+	| { text: string; thinking?: string }
+	| { toolCall: { name: string; arguments: JsonObject }; thinking?: string; text?: string };
 
 /** 假供应商视角看到的一次模型请求：context 钩子之后、发给「供应商」的全部消息。 */
 export interface ProviderRequest {
@@ -65,6 +71,9 @@ export interface HarnessOptions {
 	customTools?: ToolDefinition[];
 	/** 扩展文件/目录路径（如本仓库扩展目录里的正式扩展）。 */
 	extensionPaths?: string[];
+	/** 会话 cwd 临时目录里预置的文件（相对路径 → 内容），如 AGENTS.md
+	 *  项目指令（其内容会进入 system 消息的 sections）。 */
+	cwdFiles?: Record<string, string>;
 }
 
 /** 把一次供应商请求的全部文本叶（含 toolCall 参数深字符串值）拼成可检索文本。 */
@@ -93,13 +102,18 @@ function toRecordedStep(
 			modelId: model.id,
 			messages: structuredClone(context.messages),
 		});
-		if ("text" in scripted) {
-			return fauxAssistantMessage(scripted.text);
+		const blocks: FauxContentBlock[] = [];
+		if (scripted.thinking !== undefined) {
+			blocks.push(fauxThinking(scripted.thinking));
 		}
-		return fauxAssistantMessage(
-			[fauxToolCall(scripted.toolCall.name, scripted.toolCall.arguments)],
-			{ stopReason: "toolUse" },
-		);
+		if ("text" in scripted && scripted.text !== undefined) {
+			blocks.push(fauxText(scripted.text));
+		}
+		if ("toolCall" in scripted) {
+			blocks.push(fauxToolCall(scripted.toolCall.name, scripted.toolCall.arguments));
+			return fauxAssistantMessage(blocks, { stopReason: "toolUse" });
+		}
+		return fauxAssistantMessage(blocks, {});
 	};
 }
 
@@ -109,6 +123,9 @@ export async function createHarnessSession(
 ): Promise<HarnessSession> {
 	const agentDir = mkdtempSync(join(tmpdir(), "pi-keep-secret-harness-"));
 	const cwd = mkdtempSync(join(tmpdir(), "pi-keep-secret-cwd-"));
+	for (const [relativePath, content] of Object.entries(options.cwdFiles ?? {})) {
+		writeFileSync(join(cwd, relativePath), content);
+	}
 	const requests: ProviderRequest[] = [];
 
 	const faux = fauxProvider({
