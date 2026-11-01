@@ -8,6 +8,8 @@ import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type ImageContent, type TextContent } from "@earendil-works/pi-ai";
+import { makePlaceholder } from "../src/engine/index.ts";
+import { createEgressMaskingExtension } from "../src/masking/extension.ts";
 import { createHarnessSession, requestText } from "../src/harness/fake-session.ts";
 
 /** 正式扩展入口（目录扩展 index.ts 工厂，内置默认检测器）。 */
@@ -250,6 +252,57 @@ describe("T2 出站掩码：context_with_system 消息树遍历", () => {
 				.join("\n") ?? "";
 			expect(textParts).not.toContain(AWS_KEY);
 			expect(textParts).toMatch(/AKIA[A-Z2-7]{12}/);
+		} finally {
+			h.dispose();
+		}
+	});
+
+	test("注册表层幂等过滤：助手历史回显的伪值不再嵌套掩码", async () => {
+		// hashLength=30 时伪值本身也命中 sk- 检测器——若无幂等过滤，
+		// 回显伪值会被再掩成「伪值的伪值」，还原链断裂
+		const echoedPh = makePlaceholder(OPENAI_KEY, "sk-{hash}", 30);
+		const h = await createHarnessSession({
+			extensionFactories: [createEgressMaskingExtension({ hashLength: 30 })],
+		});
+		try {
+			h.provider.setScript([
+				// 供应商只见过伪值，脚本化回显伪值
+				{ text: `got the key ${echoedPh}` },
+				{ text: "ok" },
+			]);
+			await h.session.prompt(`use my key ${OPENAI_KEY}`);
+			await h.session.prompt("again");
+
+			// 第二轮出站：user 消息重掩得同一伪值 + 助手回显的伪值原样保留
+			const [, second] = h.provider.requests();
+			const text = requestText(second);
+			expect(text).not.toContain(OPENAI_KEY);
+			expect(text.split(echoedPh).length - 1).toBe(2);
+		} finally {
+			h.dispose();
+		}
+	});
+
+	test("哈希碰撞 x 后缀兜底（端到端）：同轮两个碰撞 secret 各得稳定伪值", async () => {
+		// 两字面量尾部均 ≥20 字符（命中 openai 检测器）且 sha256 首
+		// base32 字符均为 "G"（hashLength=1 时伪值碰撞）
+		const COLLIDE_A = "sk-collide-aaaa-0001-xy";
+		const COLLIDE_B = "sk-collide-aaaa-0005-xy";
+		const h = await createHarnessSession({
+			extensionFactories: [createEgressMaskingExtension({ hashLength: 1 })],
+		});
+		try {
+			h.provider.setScript([{ text: "ok" }]);
+			await h.session.prompt(`keys ${COLLIDE_A} and ${COLLIDE_B}`);
+
+			const [request] = h.provider.requests();
+			const text = requestText(request);
+			expect(text).not.toContain(COLLIDE_A);
+			expect(text).not.toContain(COLLIDE_B);
+			// 一个得 sk-G，另一个得 x 后缀兜底 sk-Gx（与处理顺序无关）
+			expect(text).toContain("sk-G");
+			expect(text).toContain("sk-Gx");
+			expect(text.match(/sk-Gx?/g)).toHaveLength(2);
 		} finally {
 			h.dispose();
 		}
