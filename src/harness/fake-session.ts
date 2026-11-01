@@ -36,11 +36,13 @@ import {
 
 /**
  * 一次脚本化的助手响应：文本（可带 thinking），或一次工具调用
- * （可带 thinking/伴随文本；带 toolCall 时 stopReason 为 toolUse，轮次继续）。
+ * （可带 thinking/伴随文本；带 toolCall 时 stopReason 为 toolUse，轮次继续），
+ * 或一次错误应答（stopReason=error，如掩码摘要失败回退用例）。
  */
 export type ScriptedResponse =
 	| { text: string; thinking?: string }
-	| { toolCall: { name: string; arguments: JsonObject }; thinking?: string; text?: string };
+	| { toolCall: { name: string; arguments: JsonObject }; thinking?: string; text?: string }
+	| { error: string };
 
 /** 假供应商视角看到的一次模型请求：context 钩子之后、发给「供应商」的全部消息。 */
 export interface ProviderRequest {
@@ -74,6 +76,8 @@ export interface HarnessOptions {
 	/** 会话 cwd 临时目录里预置的文件（相对路径 → 内容），如 AGENTS.md
 	 *  项目指令（其内容会进入 system 消息的 sections）。 */
 	cwdFiles?: Record<string, string>;
+	/** 内存 settings 初始值（如调低 compaction.keepRecentTokens 以触发压缩）。 */
+	settings?: Parameters<typeof SettingsManager.inMemory>[0];
 }
 
 /** 把一次供应商请求的全部文本叶（含 toolCall 参数深字符串值）拼成可检索文本。 */
@@ -103,6 +107,9 @@ function toRecordedStep(
 			messages: structuredClone(context.messages),
 		});
 		const blocks: FauxContentBlock[] = [];
+		if ("error" in scripted) {
+			return fauxAssistantMessage([], { stopReason: "error", errorMessage: scripted.error });
+		}
 		if (scripted.thinking !== undefined) {
 			blocks.push(fauxThinking(scripted.thinking));
 		}
@@ -141,7 +148,7 @@ export async function createHarnessSession(
 	});
 	modelRuntime.registerNativeProvider(faux.provider);
 
-	const settingsManager = SettingsManager.inMemory();
+	const settingsManager = SettingsManager.inMemory(options.settings);
 
 	const resourceLoader = new DefaultResourceLoader({
 		cwd,
