@@ -224,7 +224,7 @@ describe("T7 /keep-secret test 合成样本自测", () => {
 		expect(text).toMatch(/sk- 假 key：已掩码（期望：掩码）✓ 通过/);
 		expect(text).toMatch(/URL 藏 key：已掩码（期望：掩码）✓ 通过/);
 		expect(text).toMatch(/干净订单号：未掩码（期望：未掩码）✓ 通过/);
-		expect(text).toMatch(/假密码：未掩码（期望：未掩码——regex 层不命中）✓ 通过/);
+		expect(text).toMatch(/假密码：未掩码（期望：未掩码——regex 层不命中/);
 		expect(text).toMatch(/4\/4 通过/);
 
 		// 自测实际驱动会话管线：两个样本 key 名自册表新增 2 条伪值
