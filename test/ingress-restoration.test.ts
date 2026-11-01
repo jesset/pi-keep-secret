@@ -121,4 +121,19 @@ describe("T3 回程还原：message_end + tool_call", () => {
 			h.dispose();
 		}
 	});
+
+	test("max_tokens 截断的半个伪值：尾部前缀兑底还原为完整真值", async () => {
+		const h = await createHarnessSession({ extensionPaths: [EXTENSION_ENTRY] });
+		try {
+			// 流式在伪值中间被截断：只剩伪值前 len-4 位（尾部重叠 ≥ min(20, len/2)）
+			const truncated = OPENAI_PH.slice(0, OPENAI_PH.length - 4);
+			h.provider.setScript([{ text: `deploying with ${truncated}` }]);
+			await h.session.prompt(`deploy with ${OPENAI_KEY}`);
+
+			// 本地 transcript：半个伪值按前缀兑底还原为完整真值
+			expect(h.session.getLastAssistantText()).toBe(`deploying with ${OPENAI_KEY}`);
+		} finally {
+			h.dispose();
+		}
+	});
 });
