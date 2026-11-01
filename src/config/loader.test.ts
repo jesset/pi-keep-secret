@@ -18,8 +18,9 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { compileRegexDetector } from "../engine/index.ts";
+import { compileRegexDetector, detectRegexSpans } from "../engine/index.ts";
 import { DEFAULT_DETECTOR_SPECS } from "../masking/detectors.ts";
+import { createMaskingPipeline } from "../masking/index.ts";
 import { CONFIG_PATH_ENV, createConfigLoader } from "./loader.ts";
 
 const ENV_KEY = CONFIG_PATH_ENV;
@@ -264,6 +265,146 @@ describe("配置加载与校验", () => {
 		expect(config.path).toBe(
 			join(homedir(), ".pi", "agent", "extensions", "pi-keep-secret", "config.json"),
 		);
+	});
+});
+
+describe("detectorsMode 策略开关（ticket #13 / T13）", () => {
+	test("merge：同名用户项覆盖内置（保持内置序在前），非同名追加在内置之后", () => {
+		const loader = createConfigLoader({
+			path: writeTempConfig(
+				JSON.stringify({
+					detectorsMode: "merge",
+					detectors: [
+						{
+							name: "openai-key",
+							pattern: "sk-live-[A-Za-z0-9_-]{20,}",
+							redactTemplate: "sk-live-{hash}",
+						},
+						{
+							name: "corp-api-key",
+							pattern: "corp-[A-Za-z0-9]{20,}",
+							redactTemplate: "corp-{hash}",
+						},
+					],
+				}),
+			),
+		});
+		const config = loader.get();
+		expect(config.errors).toEqual([]);
+		expect(config.detectorsMode).toBe("merge");
+		// openai-key 在内置位置被用户项覆盖（pattern/redactTemplate 均为用户值），
+		// 其余内置保持原序，corp-api-key 追加在末尾（共 8 个）
+		expect(config.detectors).toEqual([
+			{ name: "openai-key", pattern: "sk-live-[A-Za-z0-9_-]{20,}", template: "sk-live-{hash}" },
+			...DEFAULT_DETECTOR_SPECS.slice(1),
+			{ name: "corp-api-key", pattern: "corp-[A-Za-z0-9]{20,}", template: "corp-{hash}" },
+		]);
+		expect(config.detectors).toHaveLength(8);
+	});
+
+	test("merge 同名覆盖行为：内置旧 pattern 不再命中、新 pattern 命中、template 覆盖生效", () => {
+		const loader = createConfigLoader({
+			path: writeTempConfig(
+				JSON.stringify({
+					detectorsMode: "merge",
+					detectors: [
+						{
+							name: "openai-key",
+							pattern: "sk-live-[A-Za-z0-9_-]{20,}",
+							redactTemplate: "key-{hash}",
+						},
+						],
+				}),
+			),
+		});
+		const config = loader.get();
+		expect(config.errors).toEqual([]);
+		const compiled = config.detectors.map(compileRegexDetector);
+		// 收紧后的 pattern 不再命中内置旧口径的任意 sk- 密钥（如 sk-ant- 形状）
+		expect(detectRegexSpans(compiled, "旧口径 sk-ant-abcdefghijklmnopqrst0123")).toEqual([]);
+		// 新口径命中 openai-key，伪值形状为覆盖后的 template（key-{hash}）
+		const masked = createMaskingPipeline({ detectors: config.detectors }).maskText(
+			"新口径 sk-live-abcdefghijklmnopqrst0123",
+		);
+		expect(masked).toMatch(/^新口径 key-[A-Z2-7]{12}$/);
+		// 内置其余检测器仍在（github-pat 未被移除，仍命中）
+		expect(
+				detectRegexSpans(compiled, "ghp_abcdefghijklmnopqrstuvwxyz0123456789").map((s) => s.detector),
+		).toEqual(["github-pat"]);
+	});
+	test("detectors 未配置：merge 与 replace 等价纯内置集（无行为差异）", () => {
+		for (const detectorsMode of ["replace", "merge"] as const) {
+			const loader = createConfigLoader({
+				path: writeTempConfig(JSON.stringify({ detectorsMode })),
+			});
+			const config = loader.get();
+			expect(config.errors).toEqual([]);
+			expect(config.detectorsMode).toBe(detectorsMode);
+			expect(config.detectors).toEqual(DEFAULT_DETECTOR_SPECS);
+		}
+	});
+
+	test("缺省 detectorsMode 透出 replace（现行为不变）；显式 replace 同样整体替换", () => {
+		const loader = createConfigLoader({
+			path: writeTempConfig(
+				JSON.stringify({
+					detectorsMode: "replace",
+					detectors: [{ name: "corp-api-key", pattern: "corp-[A-Za-z0-9]{20,}" }],
+				}),
+			),
+		});
+		const config = loader.get();
+		expect(config.errors).toEqual([]);
+		expect(config.detectorsMode).toBe("replace");
+		expect(config.detectors).toEqual([
+			{ name: "corp-api-key", pattern: "corp-[A-Za-z0-9]{20,}", template: undefined },
+		]);
+		// 未写 detectorsMode 的既有配置同样缺省 replace
+		const legacy = createConfigLoader({ path: writeTempConfig(CORP_CONFIG) }).get();
+		expect(legacy.detectorsMode).toBe("replace");
+		expect(legacy.detectors).toHaveLength(1);
+	});
+
+	test("非法 detectorsMode 值：错误可见并整体回退内置默认集（mode 回退 replace）", () => {
+		for (const bad of ["union", "MERGE", 1, true, null]) {
+			const loader = createConfigLoader({
+				path: writeTempConfig(
+					JSON.stringify({
+						detectorsMode: bad,
+						detectors: [{ name: "corp-api-key", pattern: "corp-[A-Za-z0-9]{20,}" }],
+					}),
+				),
+			});
+			const config = loader.get();
+			expect(config.errors.join("\n")).toContain('detectorsMode must be "replace" or "merge"');
+			expect(config.detectors).toEqual(DEFAULT_DETECTOR_SPECS);
+			expect(config.detectorsMode).toBe("replace");
+		}
+	});
+
+	test("热重载：replace → merge 指纹变更通知订阅者，生效集切换为合并集", () => {
+		const path = writeTempConfig(
+			JSON.stringify({
+				detectors: [{ name: "corp-api-key", pattern: "corp-[A-Za-z0-9]{20,}" }],
+			}),
+		);
+		const loader = createConfigLoader({ path });
+		expect(loader.get().detectors).toHaveLength(1); // replace：仅用户项
+
+		writeFileSync(
+			path,
+			JSON.stringify({
+				detectorsMode: "merge",
+				detectors: [{ name: "corp-api-key", pattern: "corp-[A-Za-z0-9]{20,}" }],
+			}),
+			"utf8",
+		);
+		const seen: number[] = [];
+		loader.subscribe(() => seen.push(1));
+		const reloaded = loader.reload();
+		expect(reloaded.detectorsMode).toBe("merge");
+		expect(reloaded.detectors).toHaveLength(DEFAULT_DETECTOR_SPECS.length + 1); // 内置 + corp
+		expect(seen).toEqual([1]); // 模式变更同样经指纹通知（含模式）热应用
 	});
 });
 
