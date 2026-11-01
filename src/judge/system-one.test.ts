@@ -137,6 +137,51 @@ describe("SystemOneJudge 两阶段判定", () => {
 		}
 	});
 
+	describe("超长消息分块（24000/块、重叠 min(2000, maxChars/4)）", () => {
+		test("跨块边界的 secret 经重叠完整判定，span 坐标为全文绝对坐标", async () => {
+			// 构造（先拼前缀到精确长度再插入 SECRET 再补尾，杜绝填充循环把
+			// 位置推离预期）：前缀词长 2 < 6 不产候选；SECRET 跨 24000 块界
+			const SECRET = "XboundPass99-Kq7zt4wYhx"; // 23 字符
+			const SECRET_START = 23989; // SECRET 前有 23989 字符，跨入第二块
+			const TOTAL = 50000;
+			const prefix = "ab cd ".repeat(3000).padEnd(SECRET_START, " ");
+			const tail = " xy".padEnd(TOTAL - SECRET_START - SECRET.length, " ");
+			const text = prefix + SECRET + tail;
+			// 构造自检：断言锚点与构造一致
+			expect(prefix.length).toBe(SECRET_START);
+			expect(text.length).toBe(TOTAL);
+			expect(text.slice(SECRET_START, SECRET_START + SECRET.length)).toBe(SECRET);
+			const fake = fakeClassify({
+				gate: () => 0.98,
+				candidate: (value) => (value === SECRET ? 0.96 : 0.02),
+			});
+			const judge = createSystemOneJudge({ classify: fake.classify });
+
+			const verdict = await judge.judgeText(text);
+
+			// 块界 24000 处 secret 被切成 11+12 字符两段，仅重叠块内完整出现
+			expect(verdict.spans).toEqual([
+				{
+					start: SECRET_START,
+					end: SECRET_START + SECRET.length,
+					detector: "systemone-judge",
+				},
+			]);
+			// 50000 字符 → 3 块（步长 24000-2000=22000）：[0,24000) [22000,46000) [44000,50000)
+			const gates = fake.calls.filter((call) => call.questions[0]?.[0] === "gate");
+			expect(gates.map((call) => (call.state.text as string).length)).toEqual([24000, 24000, 6000]);
+			// 每块各 1 次 gate；块 1 的边界残段与块 2 的完整 secret 各 1 个候选批
+			expect(verdict.calls).toBe(5);
+			// 块 1 内 secret 残段（11 字符）被判非凭据丢弃：参判但不产 span
+			const askedValues = fake.calls
+				.filter((call) => call.state.candidates !== undefined)
+				.flatMap((call) => Object.values(call.state.candidates as Record<string, string>));
+			expect(askedValues).toContain("XboundPass9");
+			expect(askedValues).toContain(SECRET);
+			expect(verdict.clean).toBe(false);
+		});
+	});
+
 	describe("分批与批数闸门", () => {
 		/** 生成 count 个互异 6 字符候选（空格分隔）的文本。 */
 		function candidateText(count: number, extra: string[] = []): string {
