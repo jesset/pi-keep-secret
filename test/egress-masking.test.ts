@@ -4,6 +4,7 @@
  * transcript 收到什么。参考 GitHub issue jesset/pi-keep-secret#4 的
  * Acceptance criteria 逐条落成用例。
  */
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -11,6 +12,13 @@ import { Type, type ImageContent, type TextContent } from "@earendil-works/pi-ai
 import { makePlaceholder } from "../src/engine/index.ts";
 import { createEgressMaskingExtension } from "../src/masking/extension.ts";
 import { createHarnessSession, requestText } from "../src/harness/fake-session.ts";
+
+/**
+ * 正式扩展入口（目录扩展 index.ts 工厂）。T4 起入口读取 JSON 配置：
+ * 钉扎环境变量指向确定不存在的路径，使默认集用例不受机器上真实的
+ * ~/.pi 配置文件影响（测试一律不触真实 ~/.pi 路径）。
+ */
+process.env.PI_KEEP_SECRET_CONFIG = join(tmpdir(), `pi-keep-secret-absent-${process.pid}.json`);
 
 /** 正式扩展入口（目录扩展 index.ts 工厂，内置默认检测器）。 */
 const EXTENSION_ENTRY = join(import.meta.dir, "..", "extension", "index.ts");

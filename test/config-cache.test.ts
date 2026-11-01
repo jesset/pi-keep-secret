@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { CONFIG_PATH_ENV } from "../src/config/loader.ts";
+import { createConfiguredMaskingExtension } from "../src/config/index.ts";
 import { createCleanCache } from "../src/cache/index.ts";
 import { createEgressMaskingExtension } from "../src/masking/extension.ts";
 import { createHarnessSession, requestText } from "../src/harness/fake-session.ts";
@@ -106,6 +107,100 @@ describe("T4 clean cache：检测入口挂接（检测计数断言）", () => {
 			for (const request of h.provider.requests()) {
 				expect(requestText(request)).not.toContain(OPENAI_KEY);
 			}
+		} finally {
+			h.dispose();
+		}
+	});
+});
+
+describe("T4 检测器 JSON 配置端到端（真实扩展入口 + 临时配置文件）", () => {
+	const CORP_CONFIG = JSON.stringify({
+		detectors: [
+			{
+				name: "corp-api-key",
+				pattern: "corp-[A-Za-z0-9]{20,}",
+				redactTemplate: "corp-{hash}",
+			},
+		],
+	});
+
+	test("自定义 pattern 生效：经环境变量指向临时配置，正式入口用配置检测器集", async () => {
+		process.env[CONFIG_PATH_ENV] = tempConfig(CORP_CONFIG);
+		const h = await createHarnessSession({ extensionPaths: [EXTENSION_ENTRY] });
+		try {
+			h.provider.setScript([{ text: "ok" }]);
+			await h.session.prompt(`deploy with ${CORP_KEY} and ${OPENAI_KEY}`);
+
+			const [request] = h.provider.requests();
+			const text = requestText(request);
+			// 自定义检测器命中：伪值保持 corp-{hash} 形状
+			expect(text).not.toContain(CORP_KEY);
+			expect(text).toMatch(/corp-[A-Z2-7]{12}/);
+			// 配置 detectors 整体替换内置默认集：未配置的默认格式（sk-）不掩
+			expect(text).toContain(OPENAI_KEY);
+		} finally {
+			h.dispose();
+		}
+	});
+
+	test("非法配置回退内置默认集：默认格式照常掩码，自定义检测器不生效", async () => {
+		process.env[CONFIG_PATH_ENV] = tempConfig(
+			JSON.stringify({ detectors: [{ name: "corp-api-key", pattern: "corp-[A-Za-z0-9{" }] }),
+		);
+		const h = await createHarnessSession({ extensionPaths: [EXTENSION_ENTRY] });
+		try {
+			h.provider.setScript([{ text: "ok" }]);
+			await h.session.prompt(`deploy with ${CORP_KEY} and ${OPENAI_KEY}`);
+
+			const [request] = h.provider.requests();
+			const text = requestText(request);
+			// 回退默认集：sk- 照常掩码
+			expect(text).not.toContain(OPENAI_KEY);
+			expect(text).toMatch(/sk-[A-Z2-7]{12}/);
+			// 自定义检测器未生效：corp 形状按原样放行（错误经 loader.get().errors 可见）
+			expect(text).toContain(CORP_KEY);
+		} finally {
+			h.dispose();
+		}
+	});
+});
+
+describe("T4 配置热重载（load/reload/订阅，T7 /keep-secret reload 消费口径）", () => {
+	const V1 = JSON.stringify({
+		detectors: [
+			{ name: "alpha-key", pattern: "alpha-[A-Za-z0-9]{20,}", redactTemplate: "alpha-{hash}" },
+		],
+	});
+	const V2 = JSON.stringify({
+		detectors: [
+			{ name: "alpha-key", pattern: "alpha-[A-Za-z0-9]{20,}", redactTemplate: "alpha-{hash}" },
+			{ name: "beta-key", pattern: "beta-[A-Za-z0-9]{20,}", redactTemplate: "beta-{hash}" },
+		],
+	});
+	const BETA_KEY = "beta-qwertyuiopasdfghjklz";
+
+	test("reload 换检测器集即时生效，且旧的干净判定失效（缓存清空不泄漏）", async () => {
+		const path = tempConfig(V1);
+		const { factory, loader } = createConfiguredMaskingExtension({ configPath: path });
+		const h = await createHarnessSession({ extensionFactories: [factory] });
+		try {
+			h.provider.setScript([{ text: "ok" }, { text: "done" }]);
+			// 第一轮：beta 形状在 v1 检测器集下干净 → 整条消息缓存为 clean
+			await h.session.prompt(`rotate ${BETA_KEY}`);
+			expect(requestText(h.provider.requests()[0])).toContain(BETA_KEY);
+
+			// 重写配置为 v2（补 beta 检测器）并热重载
+			writeFileSync(path, V2, "utf8");
+			const reloaded = loader.reload();
+			expect(reloaded.errors).toEqual([]);
+			expect(reloaded.detectors.map((d) => d.name)).toContain("beta-key");
+
+			// 第二轮：v1 时代判定干净的 beta 消息必须重新检测并掩码
+			// （检测器集变更清空 clean cache，否则缓存的干净判定会造成泄漏）
+			await h.session.prompt("status");
+			const second = requestText(h.provider.requests()[1]);
+			expect(second).not.toContain(BETA_KEY);
+			expect(second).toMatch(/beta-[A-Z2-7]{12}/);
 		} finally {
 			h.dispose();
 		}
