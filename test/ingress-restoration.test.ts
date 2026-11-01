@@ -8,7 +8,7 @@
  */
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "@earendil-works/pi-ai";
 import { makePlaceholder } from "../src/engine/index.ts";
 import { createHarnessSession, requestText } from "../src/harness/fake-session.ts";
@@ -23,16 +23,17 @@ const OPENAI_PH = makePlaceholder(OPENAI_KEY, "sk-{hash}", 12);
 
 /** 记录 cmd 参数的探针工具（bash 透明性验收的进程内等价物：fauxToolCall
  * 路径 + 记录工具；真 bash 对真模型的验证见 research/probe.ts 探针实验 2）。 */
-function runCmdTool(seenCmds: string[]): ToolDefinition {
-	const params = Type.Object({
-		cmd: Type.String(),
-		env: Type.Optional(Type.Record(Type.String(), Type.String())),
-	});
+const runCmdParams = Type.Object({
+	cmd: Type.String(),
+	env: Type.Optional(Type.Record(Type.String(), Type.String())),
+});
+
+function runCmdTool(seenCmds: string[]): ToolDefinition<typeof runCmdParams> {
 	return {
 		name: "run_cmd",
 		label: "Run Cmd",
 		description: "Runs a command.",
-		parameters: params,
+		parameters: runCmdParams,
 		execute: async (_id, input) => {
 			seenCmds.push(input.cmd);
 			return { content: [{ type: "text", text: "ok" }], details: {} };
@@ -150,6 +151,49 @@ describe("T3 回程还原：message_end + tool_call", () => {
 			const transcript = JSON.stringify(h.session.messages);
 			expect(transcript).toContain("nothing to echo");
 			expect(transcript).not.toContain(OPENAI_PH);
+		} finally {
+			h.dispose();
+		}
+	});
+
+	test("tool_call 第二道兑底：message_end 还原被后续改写回伪值时，工具仍拿真值执行", async () => {
+		// 央具扩展（inline 工厂在 extensionPaths 之后注册，message_end 在我们
+		// 之后运行）：把已还原的 toolCall 参数改写回伪值，模拟绕过 message_end
+		// 还原、带着伪值到达工具执行的路径
+		let remasked = false;
+		const remaskingFixture = (pi: ExtensionAPI): void => {
+			pi.on("message_end", (event) => {
+				if (event.message.role !== "assistant") return undefined;
+				const content = event.message.content.map((block) => {
+					if (block.type !== "toolCall") return block;
+					remasked = true;
+					return {
+						...block,
+						arguments: JSON.parse(
+							JSON.stringify(block.arguments).split(OPENAI_KEY).join(OPENAI_PH),
+						),
+					};
+				});
+				return { message: { ...event.message, content } };
+			});
+		};
+		const seenCmds: string[] = [];
+		const h = await createHarnessSession({
+			extensionPaths: [EXTENSION_ENTRY],
+			extensionFactories: [remaskingFixture],
+			customTools: [runCmdTool(seenCmds)],
+		});
+		try {
+			h.provider.setScript([
+				{ toolCall: { name: "run_cmd", arguments: { cmd: `export KEY=${OPENAI_PH}` } } },
+				{ text: "done" },
+			]);
+			await h.session.prompt(`rotate the key ${OPENAI_KEY}`);
+
+			// 央具确实把参数改写回了伪值（模拟路径生效，非空转）
+			expect(remasked).toBe(true);
+			// 工具仍拿真值执行：tool_call 钩子在执行前原位还原了 event.input
+			expect(seenCmds).toEqual([`export KEY=${OPENAI_KEY}`]);
 		} finally {
 			h.dispose();
 		}
