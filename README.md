@@ -181,7 +181,7 @@ const { factory, loader, pipeline } = createConfiguredMaskingExtension({ configP
 - `session_before_compact` 处理器返回完整 `CompactionResult`，整体替换 pi 自带压缩（manual `/compact`、阈值、overflow 三路径都走此钩子）：preparation 的 messagesToSummarize + turnPrefixMessages → `convertToLlm`（含 branchSummary/compactionSummary 投影）→ 与出站同一掩码管线掩码文本叶 → `serializeConversation` 入摘要提示词 → `ctx.modelRegistry.complete`（当前会话模型）摘要 → 摘要文本按注册表还原 → `{ compaction: { summary, firstKeptEntryId, tokensBefore, usage } }`。
 - 摘要提示词对齐 pi 默认（pi 1.4.0 未公开导出提示词常量，按原文复制于 `src/compaction/prompts.ts`，升级时需同步校对）；previousSummary / customInstructions 掩码后入摘要上下文，结果还原。
 - `session_before_tree` 同模式返回 `{ summary: { summary: 还原后文本, usage } }`（entriesToSummarize 经 `prepareBranchEntries` 投影）。
-- 故障策略（ticket 锁定）：摘要调用不可恢复错误（error/length/工具调用/空文本/抛错）→ 返回 undefined 显式回退 pi 默认压缩 + `ctx.ui.notify` 告警 + 状态栏标记 + `MaskedCompactionStatus` 计数（无 UI 模式仅计数）；绝不能静默回退——默认压缩不掩码，摘要模型会看到真值。用户中止（abort）不算回退，返回 `{ cancel: true }`。
+- 故障策略（spec 故事 24：零泄漏）：摘要调用带重试（2 次重试、短退避；用户中止不重试不算失败）；重试仍失败 → 返回 `{ cancel: true }` 取消本次压缩（会话继续不压缩）+ `ctx.ui.notify` 告警与重试建议 + 状态栏标记 + `MaskedCompactionStatus` 计数（无 UI 模式仅计数）。**不存在「回退 pi 默认压缩」路径**——默认压缩不掩码，回退即泄漏。
 - 出站兑底：压缩/分支摘要消息（`compactionSummary`/`branchSummary` 自定义 AgentMessage，携带还原真值）的 `summary` 字段由遍历器掩码（T6 起进入出站覆盖）。
 
 ```ts
@@ -201,7 +201,7 @@ const compose = (pi: ExtensionAPI): void => {
 ### T6 事实发现（后续 ticket 注意）
 
 - 扩展侧 `ctx.modelRegistry` 是同步兼容门面（`ModelRegistry`）：有 `complete`/`streamSimple`，**无** `completeSimple`（那是 `ModelRuntime` 的方法）；掩码摘要走 `ctx.modelRegistry.complete`（请求时认证）。
-- pi 默认压缩自带重试（`retryAssistantCall`）；掩码压缩的单次 `complete` 无重试，瞬时故障即回退（回退可见性弥补）。若需对齐重试语义，后续可在 `requestSummary` 外套重试。
+- pi 默认压缩自带重试（`retryAssistantCall`）；掩码压缩的摘要调用同样带重试（2 次重试、短退避），瞬时故障被吸收；重试仍失败则取消本次压缩（会话继续不压缩），绝不回退不掩码的默认压缩。
 - 压缩后 `firstKeptEntryId` 之前的历史由 compaction 条目替换，投影生成 `compactionSummary` 角色消息（`summary` 字段携带真值），`convertToLlm` 展开为 user 文本——若遍历器不覆盖该角色，压缩后每一轮出站都会泄漏真值（T6 已补，用例锚定）。
 - `SettingsManager.inMemory(partial)` 可注入 `compaction.keepRecentTokens`/`reserveTokens`，harness 以此驱动手动/阈值压缩；keepRecentTokens 必须小于会话尾部 token 量，否则 `prepareCompaction` 返回 undefined（"Nothing to compact"）。
 - `bashExecution`/`custom` 自定义消息（`!命令` 等）尚未在出站遍历器覆盖（T2 既有缺口，与压缩无关；待后续 ticket 处理）。
@@ -216,7 +216,7 @@ const compose = (pi: ExtensionAPI): void => {
 
 ### /keep-secret 命令面（三子命令）
 
-- `/keep-secret`（状态）：检测器配置摘要（来源/条数/名列表，含非法配置的错误行与回退标记）、伪值注册表条数、clean cache 条数与命中率（命中 x / 检测 y）、各检测器命中计数（`name=N`）、judge 计数（T8 已接入：配置 judge 段后展示已判定/截断/fail-closed/降级计数，未配置显示「未接入」）、掩码压缩回退计数与最近原因。
+- `/keep-secret`（状态）：检测器配置摘要（来源/条数/名列表，含非法配置的错误行与回退标记）、伪值注册表条数、clean cache 条数与命中率（命中 x / 检测 y）、各检测器命中计数（`name=N`）、judge 计数（T8 已接入：配置 judge 段后展示已判定/截断/fail-closed/降级计数，未配置显示「未接入」）、掩码压缩取消计数与最近原因。
 - `/keep-secret test`：合成样本（sk- 假 key、URL 藏 key、假密码、干净订单号）逐项过会话链路（T8 起 judge 启用时经 judge→regex 全链评估，与出站链同序），报告已掩码/未掩码与期望比对；与期望一致为通过，全部通过 info、有未通过 warning。假密码项期望随 judge 是否启用动态化：启用→期望掩码（降级时如实报未通过——降级可见信号）；未启用→期望未掩码（regex 层不命中属预期）。当前配置未覆盖某样本时如实报告未通过。
 - `/keep-secret reload`：调 `loader.reload()`（变更时同步热应用：applyDetectors + 清空缓存）；检测结果经 notify 报告（已热应用/无变更/配置错误回退）。
 - 未知子命令 → 用法提示。
@@ -328,7 +328,7 @@ rm -rf ~/.pi/agent/extensions/pi-keep-secret
 5. **`before_agent_start` 强制 systemPrompt 绕过掩码**：pi 在 context 钩子之后投影强制 systemPrompt，不经 `context_with_system` 掩码；本扩展自身不强制 prompt 不受影响，但其他扩展若把密钥写进强制 prompt 则是泄漏路径（T2 发现，规格外）。
 6. **`bashExecution`/`custom` 自定义消息未覆盖**：出站遍历器覆盖 user/toolResult/assistant/system/compactionSummary/branchSummary 六类；`!命令` 的 bashExecution 与 custom 角色消息尚未进遍历器（T2 既有缺口，待后续处理）。
 7. **input 预检固定内置默认集**：提交提示的非阻塞警告按内置默认 regex 集快扫（与配置无关的固定提示层；掩码执法始终以当前配置为准）（T7）。
-8. **掩码压缩摘要单次无重试**：摘要调用是单次 `complete`（pi 默认压缩自带重试）；瞬时故障即显式回退 pi 默认压缩（回退时摘要模型会看到真值——回退必须可见的原因，见 T6 节）（T6）。
+8. **掩码压缩失败时本次不压缩**：摘要调用带重试（2 次重试、短退避）；重试仍失败 → 取消本次压缩并告警（会话继续不压缩、上下文持续增长，用户可稍后重试 `/compact`）。这是零泄漏的取舍——不存在回退 pi 默认压缩的路径（默认路径不掩码，回退即泄漏）（T6，spec 故事 24）。
 9. **judge 截断护栏**：候选超 `batchSize × maxBatches` 截断保最长（截断计数入 `/keep-secret` 状态），gate 零定位不升级（T5）。
 
 ## T8：端到端加固 + 文档 + 打包（issue #10）

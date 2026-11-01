@@ -44,7 +44,7 @@ function makeCommands(configContent?: string) {
 		writeFileSync(configPath, configContent, "utf8");
 	}
 	const { factory, loader, pipeline } = createConfiguredMaskingExtension({ configPath });
-	const compaction: MaskedCompactionStatus = { fallbacks: 0, lastFallbackError: undefined };
+	const compaction: MaskedCompactionStatus = { cancellations: 0, lastCancellationError: undefined };
 	const commands = createKeepSecretCommandsExtension({ loader, pipeline, compaction });
 	return { factory, commands, loader, pipeline, compaction, configPath };
 }
@@ -188,8 +188,8 @@ describe("T7 /keep-secret 状态面板", () => {
 			expect(status1).toMatch(/openai-key=1/);
 			// judge 预留位（T5 未合入）
 			expect(status1).toContain("judge：未接入");
-			// 压缩回退计数
-			expect(status1).toMatch(/掩码压缩回退：0 次/);
+			// 压缩取消计数
+			expect(status1).toMatch(/掩码压缩取消：0 次/);
 
 			// 第二轮：新 secret 入会话 → 计数器递增
 			await h.session.prompt(`rotate to ${OTHER_KEY}`);
@@ -209,10 +209,10 @@ describe("T7 /keep-secret 状态面板", () => {
 		}
 	});
 
-	test("注入状态对象：压缩回退与 judge 计数展示（已判定/截断/fail-closed/降级）", async () => {
+	test("注入状态对象：压缩取消与 judge 计数展示（已判定/截断/fail-closed/降级）", async () => {
 		const made = makeCommands();
-		made.compaction.fallbacks = 2;
-		made.compaction.lastFallbackError = "掩码压缩摘要: 摘要为空";
+		made.compaction.cancellations = 2;
+		made.compaction.lastCancellationError = "掩码压缩摘要: 摘要为空";
 		const judgeStatus = {
 			...emptyJudgeStatus(),
 			judgedTexts: 7,
@@ -226,7 +226,7 @@ describe("T7 /keep-secret 状态面板", () => {
 			judge: identityJudge(judgeStatus),
 		});
 		const text = await runCommand(withJudge, "");
-		expect(text).toMatch(/掩码压缩回退：2 次/);
+		expect(text).toMatch(/掩码压缩取消：2 次/);
 		expect(text).toContain("掩码压缩摘要: 摘要为空");
 		expect(text).toMatch(/judge：已判定 7 叶，截断 3 次，fail-closed 1 次，降级 0 叶/);
 	});

@@ -8,6 +8,8 @@ import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { makePlaceholder } from "../src/engine/index.ts";
 import { createMaskedCompactionExtension, type MaskedCompactionStatus } from "../src/compaction/index.ts";
+/** 摘要调用重试次数（2 次重试 = 最多 3 次尝试；与扩展实现同锚）。 */
+const SUMMARY_RETRIES = 2;
 import {
 	createHarnessSession,
 	requestText,
@@ -161,9 +163,9 @@ describe("T6 掩码压缩：session_before_compact / session_before_tree", () =>
 		}
 	});
 
-	test("摘要模型故障：显式回退 pi 默认压缩 + 告警计数可见（非静默）", async () => {
+	test("摘要模型故障：重试 2 次后取消本次压缩（绝不回退默认压缩，零真值出站）+ 告警计数可见", async () => {
 		const pipeline = createMaskingPipeline();
-		const status: MaskedCompactionStatus = { fallbacks: 0, lastFallbackError: undefined };
+		const status: MaskedCompactionStatus = { cancellations: 0, lastCancellationError: undefined };
 		const h = await createHarnessSession({
 			extensionFactories: [
 				createEgressMaskingExtension({ pipeline }),
@@ -175,30 +177,72 @@ describe("T6 掩码压缩：session_before_compact / session_before_tree", () =>
 			h.provider.setScript([
 				{ text: "first ack" },
 				{ text: "second ack" },
-				{ error: "summarizer unavailable" }, // 掩码摘要调用失败
-				{ text: "default fallback summary" }, // pi 默认压缩自带的摘要调用
-			]);
+				// 首次 + 2 次重试全部失败（瞬时故障重试也救不回的场景）
+			...Array.from({ length: 1 + SUMMARY_RETRIES }, () => ({
+				error: "summarizer unavailable",
+			})),
+			{ text: "after ack" },
+		]);
+			await h.session.prompt(`deploy with ${OPENAI_KEY}`);
+			await h.session.prompt(PAD);
+			// 取消语义：pi 对 { cancel: true } 抛「Compaction cancelled」（与用户中止同路径）
+			await expect(h.session.compact()).rejects.toThrow("Compaction cancelled");
+
+			const requests = h.provider.requests();
+			expect(requests).toHaveLength(2 + 1 + SUMMARY_RETRIES);
+			// 全部请求（含重试的摘要尝试）零真值：掩码摘要只见伪值；不存在「回退
+			// 默认压缩」的不掩码摘要请求（该路径已移除——spec 故事 24）
+			for (const request of requests) {
+				expect(requestText(request)).not.toContain(OPENAI_KEY);
+			}
+			for (const attempt of requests.slice(2)) {
+				expect(requestText(attempt)).toContain(PLACEHOLDER);
+			}
+
+			// 取消可见：状态计数与最近错误被记录（无 UI 的 harness 模式下即计数）
+			expect(status.cancellations).toBe(1);
+			expect(status.lastCancellationError).toContain("summarizer unavailable");
+
+			// 会话继续不压缩：无 compaction 条目，下一轮对话照常出站且掩码
+			expect(compactionEntry(h)).toBeUndefined();
+			await h.session.prompt("continue");
+			const after = h.provider.requests().at(-1)!;
+			expect(requestText(after)).not.toContain(OPENAI_KEY);
+			expect(requestText(after)).toContain(PLACEHOLDER);
+			expect(JSON.stringify(h.session.messages)).toContain(OPENAI_KEY); // 本地真值不动
+		} finally {
+			h.dispose();
+		}
+	});
+
+	test("瞬时摘要故障被重试救回：第二次尝试成功，压缩照常完成", async () => {
+		const pipeline = createMaskingPipeline();
+		const status: MaskedCompactionStatus = { cancellations: 0, lastCancellationError: undefined };
+		const h = await createHarnessSession({
+			extensionFactories: [
+				createEgressMaskingExtension({ pipeline }),
+				createMaskedCompactionExtension({ pipeline, status }),
+			],
+			settings: { compaction: { keepRecentTokens: 50 } },
+		});
+		try {
+			h.provider.setScript([
+				{ text: "first ack" },
+			{ text: "second ack" },
+			{ error: "transient blip" }, // 首次摘要失败
+			{ text: `## Critical Context\n- 部署密钥 ${PLACEHOLDER}` }, // 重试成功
+		]);
 			await h.session.prompt(`deploy with ${OPENAI_KEY}`);
 			await h.session.prompt(PAD);
 			await h.session.compact();
 
-			const requests = h.provider.requests();
-			expect(requests).toHaveLength(4);
-			// 我们的掩码摘要尝试只见伪值；失败后 pi 默认压缩接管（默认路径不掩码，
-			// 摘要请求带真值——回退的已知权衡，正是回退必须可见的原因）
-			expect(requestText(requests[2]!)).not.toContain(OPENAI_KEY);
-			expect(requestText(requests[2]!)).toContain(PLACEHOLDER);
-			expect(requestText(requests[3]!)).toContain(OPENAI_KEY);
-
-			// 告警可见：状态计数与最近错误被记录（无 UI 的 harness 模式下即计数）
-			expect(status.fallbacks).toBe(1);
-			expect(status.lastFallbackError).toContain("summarizer unavailable");
-
-			// compaction 条目由默认路径生成（非扩展来源）
+			// 重试生效：不取消、不计数，摘要两次尝试后成功落盘真值
+			expect(h.provider.requests()).toHaveLength(4);
+			expect(status.cancellations).toBe(0);
+			expect(status.lastCancellationError).toBeUndefined();
 			const compaction = compactionEntry(h);
-			expect(compaction).toBeDefined();
-			expect(compaction?.fromHook).toBeFalsy();
-			expect(compaction?.summary).toContain("default fallback summary");
+			expect(compaction?.fromHook).toBe(true);
+			expect(compaction?.summary).toContain(OPENAI_KEY);
 		} finally {
 			h.dispose();
 		}
@@ -229,6 +273,44 @@ describe("T6 掩码压缩：session_before_compact / session_before_tree", () =>
 			expect(result.summaryEntry?.summary).toContain(OPENAI_KEY);
 			expect(result.summaryEntry?.summary).not.toContain(PLACEHOLDER);
 			expect(result.summaryEntry?.fromHook).toBe(true);
+		} finally {
+			h.dispose();
+		}
+	});
+
+	test("分支摘要（session_before_tree）摘要故障：重试后取消本次摘要（不回退默认路径）", async () => {
+		const pipeline = createMaskingPipeline();
+		const status: MaskedCompactionStatus = { cancellations: 0, lastCancellationError: undefined };
+		const h = await createHarnessSession({
+			extensionFactories: [
+				createEgressMaskingExtension({ pipeline }),
+				createMaskedCompactionExtension({ pipeline, status }),
+			],
+		});
+		try {
+			h.provider.setScript([
+				{ text: "first ack" },
+			{ text: "second ack" },
+			...Array.from({ length: 1 + SUMMARY_RETRIES }, () => ({
+				error: "branch summarizer down",
+			})),
+		]);
+			await h.session.prompt("plain start");
+			await h.session.prompt(`rotate to ${OPENAI_KEY}`);
+
+			const assistantIds = messageEntryIds(h, "assistant");
+			const result = await h.session.navigateTree(assistantIds[0]!, { summarize: true });
+
+			// 重试后取消：零真值出站、无摘要条目（不回退不掩码的默认分支摘要）
+			const requests = h.provider.requests();
+			expect(requests).toHaveLength(2 + 1 + SUMMARY_RETRIES);
+			for (const request of requests) {
+				expect(requestText(request)).not.toContain(OPENAI_KEY);
+			}
+			expect(result.cancelled).toBe(true);
+			expect(result.summaryEntry).toBeUndefined();
+			expect(status.cancellations).toBe(1);
+			expect(status.lastCancellationError).toContain("branch summarizer down");
 		} finally {
 			h.dispose();
 		}

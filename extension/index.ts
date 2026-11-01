@@ -34,8 +34,8 @@ export function createKeepSecretExtension(options: ConfiguredMaskingOptions = {}
 	return (pi: ExtensionAPI): void => {
 		factory(pi); // 配置错误 notify + 出站掩码（judge（若配置）先于 regex）
 		createIngressRestorationExtension({ registry: pipeline.registry })(pi);
-		// 压缩回退计数由组合根持有，/keep-secret 状态面与压缩扩展共享同一实例
-		const compactionStatus: MaskedCompactionStatus = { fallbacks: 0, lastFallbackError: undefined };
+		// 压缩取消计数由组合根持有，/keep-secret 状态面与压缩扩展共享同一实例
+		const compactionStatus: MaskedCompactionStatus = { cancellations: 0, lastCancellationError: undefined };
 		createMaskedCompactionExtension({ pipeline, status: compactionStatus })(pi);
 		createKeepSecretCommandsExtension({ loader, pipeline, compaction: compactionStatus, judge })(pi);
 	};

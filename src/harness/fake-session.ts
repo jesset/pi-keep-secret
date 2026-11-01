@@ -37,7 +37,7 @@ import {
 /**
  * 一次脚本化的助手响应：文本（可带 thinking），或一次工具调用
  * （可带 thinking/伴随文本；带 toolCall 时 stopReason 为 toolUse，轮次继续），
- * 或一次错误应答（stopReason=error，如掩码摘要失败回退用例）。
+ * 或一次错误应答（stopReason=error，如掩码摘要重试耗尽后取消的用例）。
  */
 export type ScriptedResponse =
 	| { text: string; thinking?: string }

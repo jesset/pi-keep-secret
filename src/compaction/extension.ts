@@ -13,11 +13,12 @@
  * pi 默认（见 prompts.ts）；previousSummary / customInstructions 掩码后入
  * 摘要上下文。
  *
- * 故障策略（ticket #8 锁定）：摘要调用不可恢复错误（模型 error/length/
- * 工具调用/空文本/抛错）→ 显式回退 pi 默认压缩——返回 undefined 让 pi 默认
- * 接管，同时 ctx.ui.notify 告警 + 状态栏标记 + 计数（绝不能静默回退：默认
- * 压缩不掩码，摘要模型会看到真值）；无 UI 模式仅计数。用户中止（abort）
- * 不算回退，返回 { cancel: true } 与 pi 的取消语义对齐。
+ * 故障策略（spec 故事 24：零泄漏）：摘要调用带重试（SUMMARY_RETRIES 次、
+ * 短退避；用户中止不重试不算失败）；重试仍失败 → 返回 `{ cancel: true }`
+ * 取消本次压缩（会话继续不压缩）+ ctx.ui.notify 告警与重试建议 + 状态栏
+ * 标记 + 计数（无 UI 模式仅计数）。**不存在「回退 pi 默认压缩」路径**——
+ * 默认压缩不掩码，摘要模型会看到真值，回退即泄漏。用户中止（abort）与
+ * 失败取消同走 `{ cancel: true }`，但中止不计失败。
  */
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type {
@@ -40,25 +41,30 @@ import {
 /** 分支摘要 token 预算的保留额（对齐 pi 默认 branchSummary.reserveTokens）。 */
 const BRANCH_RESERVE_TOKENS = 16384;
 
-/** 告警状态栏键（回退发生后置为持续可见的标记，由用户清除前一直显示）。 */
+/** 告警状态栏键（取消发生后置为持续可见的标记，由用户清除前一直显示）。 */
 const STATUS_KEY = "keep-secret-compaction";
 
-/** 掩码压缩故障状态：回退默认压缩的计数与最近原因（/keep-secret 状态面与测试断言用）。 */
+/** 摘要调用重试次数（首次失败后再试 2 次；spec 故事 24）。 */
+export const SUMMARY_RETRIES = 2;
+/** 重试退避步长（毫秒）：第 n 次重试前等待 n × 步长（短退避，仅吸收瞬时故障）。 */
+const RETRY_BACKOFF_MS = 200;
+
+/** 掩码压缩故障状态：重试后取消的计数与最近原因（/keep-secret 状态面与测试断言用）。 */
 export interface MaskedCompactionStatus {
-	/** 掩码摘要失败、显式回退 pi 默认压缩的次数。 */
-	fallbacks: number;
-	/** 最近一次回退的原因说明。 */
-	lastFallbackError: string | undefined;
+	/** 摘要重试耗尽而取消本次压缩的次数（会话继续不压缩，零泄漏）。 */
+	cancellations: number;
+	/** 最近一次取消的原因说明。 */
+	lastCancellationError: string | undefined;
 }
 
 export interface MaskedCompactionOptions {
 	/** 会话级掩码管线（与出站钩子共享同一注册表实例，保证伪值一致）。 */
 	pipeline: MaskingPipeline;
-	/** 故障状态（缺省随工厂新建）；需要观测回退的调用方（测试/状态命令）传入。 */
+	/** 故障状态（缺省随工厂新建）；需要观测取消的调用方（测试/状态命令）传入。 */
 	status?: MaskedCompactionStatus;
 }
 
-/** 用户中止（与「摘要失败回退」区分：中止不算回退，直接取消）。 */
+/** 用户中止（与「摘要失败取消」区分：中止不算失败，直接取消）。 */
 class SummaryAbortError extends Error {
 	constructor() {
 		super("掩码摘要被中止");
@@ -78,7 +84,8 @@ interface SummaryCall {
 /** 创建掩码压缩扩展（注册 session_before_compact / session_before_tree）。 */
 export function createMaskedCompactionExtension(options: MaskedCompactionOptions) {
 	const { pipeline } = options;
-	const status: MaskedCompactionStatus = options.status ?? { fallbacks: 0, lastFallbackError: undefined };
+	const status: MaskedCompactionStatus =
+		options.status ?? { cancellations: 0, lastCancellationError: undefined };
 
 	/** 消息 → LLM 形态（convertToLlm，含 branchSummary/compactionSummary 投影）→ 掩码文本叶 → 序列化文本。 */
 	const maskedConversationText = (messages: AgentMessage[]): string => {
@@ -142,18 +149,70 @@ export function createMaskedCompactionExtension(options: MaskedCompactionOptions
 		return { text, usage: response.usage };
 	};
 
-	/** 显式回退：计数 + （有 UI 时）notify 告警与状态栏标记，随后返回 undefined 交给 pi 默认压缩。 */
-	const reportFallback = (ctx: ExtensionContext, scope: string, error: unknown): undefined => {
-		status.fallbacks += 1;
-		status.lastFallbackError = `${scope}: ${messageOf(error)}`;
+	/** 中止感知的短退避：等待 ms 毫秒，期间被中止则按用户中止处理。 */
+	const backoff = (ms: number, signal: AbortSignal) =>
+		new Promise<void>((resolve, reject) => {
+			if (signal.aborted) {
+				reject(new SummaryAbortError());
+				return;
+			}
+			const timer = setTimeout(() => {
+				signal.removeEventListener("abort", onAbort);
+				resolve();
+			}, ms);
+			const onAbort = () => {
+				clearTimeout(timer);
+				reject(new SummaryAbortError());
+			};
+			signal.addEventListener("abort", onAbort, { once: true });
+		});
+
+	/**
+	 * 摘要调用（带重试）：首次失败后短退避重试 SUMMARY_RETRIES 次（仅吸收
+	 * 瞬时故障；对齐 pi 默认压缩自带的重试语义）；用户中止不重试直接抛出。
+	 */
+	const requestSummaryWithRetry = async (
+		ctx: ExtensionContext,
+		model: NonNullable<ExtensionContext["model"]>,
+		promptText: string,
+		signal: AbortSignal,
+	): Promise<SummaryCall> => {
+		let lastError: unknown;
+		for (let attempt = 0; attempt <= SUMMARY_RETRIES; attempt++) {
+			if (attempt > 0) {
+				await backoff(attempt * RETRY_BACKOFF_MS, signal);
+			}
+			try {
+				return await requestSummary(ctx, model, promptText, signal);
+			} catch (error) {
+				if (error instanceof SummaryAbortError) throw error; // 用户中止不重试
+				lastError = error;
+			}
+		}
+		throw lastError;
+	};
+
+	/** 取消本次压缩：计数 + （有 UI 时）notify 告警与重试建议、状态栏标记。
+	 *  返回 { cancel: true }——绝不回退 pi 默认压缩（默认路径不掩码，回退
+	 *  即泄漏，spec 故事 24）。 */
+	const reportCancellation = (
+		ctx: ExtensionContext,
+		scope: string,
+		error: unknown,
+	): { cancel: true } => {
+		status.cancellations += 1;
+		status.lastCancellationError = `${scope}: ${messageOf(error)}`;
 		if (ctx.hasUI) {
 			const warning =
-				`pi-keep-secret: ${scope}失败，已回退 pi 默认压缩（默认压缩不掩码，` +
-				`摘要模型可能看到真值）——${messageOf(error)}`;
+				`pi-keep-secret: ${scope}失败（已重试 ${SUMMARY_RETRIES} 次仍失败），已取消本次压缩——` +
+				`会话保持不压缩、未回退不掩码的默认压缩；稍后可重试 /compact——${messageOf(error)}`;
 			ctx.ui.notify(warning, "warning");
-			ctx.ui.setStatus(STATUS_KEY, `pi-keep-secret 掩码压缩已回退默认 ${status.fallbacks} 次`);
+			ctx.ui.setStatus(
+				STATUS_KEY,
+				`pi-keep-secret 掩码压缩已取消 ${status.cancellations} 次（重试后仍失败）`,
+			);
 		}
-		return undefined;
+		return { cancel: true };
 	};
 
 	return (pi: ExtensionAPI): void => {
@@ -172,7 +231,7 @@ export function createMaskedCompactionExtension(options: MaskedCompactionOptions
 					customInstructions:
 						customInstructions !== undefined ? pipeline.maskText(customInstructions) : undefined,
 				});
-				const { text, usage } = await requestSummary(ctx, model, promptText, signal);
+				const { text, usage } = await requestSummaryWithRetry(ctx, model, promptText, signal);
 				const compaction: CompactionResult = {
 					summary: pipeline.unmaskText(text),
 					firstKeptEntryId: preparation.firstKeptEntryId,
@@ -184,7 +243,7 @@ export function createMaskedCompactionExtension(options: MaskedCompactionOptions
 				if (error instanceof SummaryAbortError) {
 					return { cancel: true };
 				}
-				return reportFallback(ctx, "掩码压缩摘要", error);
+				return reportCancellation(ctx, "掩码压缩摘要", error);
 			}
 		});
 
@@ -205,13 +264,13 @@ export function createMaskedCompactionExtension(options: MaskedCompactionOptions
 							: undefined,
 					replaceInstructions: preparation.replaceInstructions,
 				});
-				const { text, usage } = await requestSummary(ctx, model, promptText, signal);
+				const { text, usage } = await requestSummaryWithRetry(ctx, model, promptText, signal);
 				return { summary: { summary: BRANCH_SUMMARY_PREAMBLE + pipeline.unmaskText(text), usage } };
 			} catch (error) {
 				if (error instanceof SummaryAbortError) {
 					return { cancel: true };
 				}
-				return reportFallback(ctx, "掩码分支摘要", error);
+				return reportCancellation(ctx, "掩码分支摘要", error);
 			}
 		});
 	};

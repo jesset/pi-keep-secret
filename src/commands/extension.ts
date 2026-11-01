@@ -7,7 +7,7 @@
  *   无 UI 模式 notify 为 no-op，静默）。
  * - `/keep-secret`：状态面板（检测器配置摘要/注册表/clean cache/各检测
  *   器命中/judge 计数（T8 接入：配置 judge 段后展示已判定/截断/fail-
- *   closed/降级计数）/压缩回退计数）。
+ *   closed/降级计数）/压缩取消计数）。
  * - `/keep-secret test`：合成样本内联自测（judge 启用时经 judge→regex
  *   全链评估，假密码项期望掩码；降级时如实报未通过）。
  * - `/keep-secret reload`：配置热重载（loader.reload → applyDetectors）。
@@ -29,7 +29,7 @@ export interface KeepSecretCommandsOptions {
 	loader: ConfigLoader;
 	/** 会话级掩码管线（状态面的注册表/缓存/检测器命中计数来源）。 */
 	pipeline: MaskingPipeline;
-	/** 掩码压缩故障状态（状态面的回退计数来源）。 */
+	/** 掩码压缩故障状态（状态面的取消计数来源）。 */
 	compaction: MaskedCompactionStatus;
 	/**
 	 * judge 文本掩码器（T8 正式接线：配置 judge 段时由组合根传入同一实例）。
@@ -97,9 +97,9 @@ function buildStatusReport(options: KeepSecretCommandsOptions): string {
 			: `judge：已判定 ${options.judge.status.judgedTexts} 叶，截断 ${options.judge.status.truncatedCandidates} 次，fail-closed ${options.judge.status.failClosed} 次，降级 ${options.judge.status.degradedTexts} 叶`,
 	);
 	lines.push(
-		`掩码压缩回退：${options.compaction.fallbacks} 次` +
-			(options.compaction.fallbacks > 0 && options.compaction.lastFallbackError !== undefined
-				? `（最近原因：${options.compaction.lastFallbackError}）`
+		`掩码压缩取消：${options.compaction.cancellations} 次` +
+			(options.compaction.cancellations > 0 && options.compaction.lastCancellationError !== undefined
+				? `（最近原因：${options.compaction.lastCancellationError}）`
 				: ""),
 	);
 	return lines.join("\n");
