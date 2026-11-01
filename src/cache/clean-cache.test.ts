@@ -36,6 +36,19 @@ describe("clean cache", () => {
 		expect(cache.stats().size).toBe(0);
 	});
 
+	test("hasSecret 墓碑拦截后续干净结论（T5 gate 命中文本永不缓存）", () => {
+		const cache = createCleanCache();
+		cache.remember(CLEAN_TEXT, { hasSecret: true });
+		// 同一文本后置的零命中结论（如 regex 层）不得覆写墓碑：gate 命中文本每轮重判
+		cache.remember(CLEAN_TEXT, { hasSecret: false });
+		expect(cache.isClean(CLEAN_TEXT)).toBe(false);
+		expect(cache.stats().size).toBe(0);
+		// clear（检测器集热更新）后重新可缓存
+		cache.clear();
+		cache.remember(CLEAN_TEXT, { hasSecret: false });
+		expect(cache.isClean(CLEAN_TEXT)).toBe(true);
+	});
+
 	test("clear 清空条目（检测器集热更新后干净判定失效时使用）", () => {
 		const cache = createCleanCache();
 		cache.remember(CLEAN_TEXT, { hasSecret: false });

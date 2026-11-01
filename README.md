@@ -212,7 +212,7 @@ const compose = (pi: ExtensionAPI): void => {
 - fail_closed：`classify` never-rejects，错误在 `stopReason`。gate 故障 → 该块候选全掩且不追加注定失败的候选批；候选批故障 → 该批全掩、其余批判定结论照常采纳；stop 结果缺应答的候选视为未验证一并掩（≠「判定非凭据」丢弃）。真值由共享注册表保留，本地可恢复。
 - 出站扩展 `createJudgeEgressExtension`（`src/judge/extension.ts`）：注册 `context_with_system`，必须先于 regex 出站扩展（判定需要原文；regex 层幂等跳过已签发伪值）。命中 span 掩码为 `key-{hash}` 确定性伪值（与出站/回程/压缩同一注册表）。
 - classifier 模型解析：配置引用 `{provider, modelId}` → `ctx.modelRegistry.findOfType("classifier", ...)`（T4 JSON 配置合入前由装配方显式传 modelRef；正式组合接线在 T4/T8 落地）。模型缺失 → 显式降级而非静默：notify 一次 + 状态栏标记 + `JudgeStatus` 每请求计数（无 UI 模式仅计数），出站仅 regex 层工作。
-- 与 T4 clean cache 协同（接口预留）：`JudgeVerdict.clean`（零命中、零 gate 命中、零 fail_closed 才为 true）；命中/gate 命中/故障文本均不可缓存 clean，T4 合入后在扩展层接缓存查询。
+- 与 T4 clean cache 协同（已实现）：judge 层 gate 前查询 `pipeline.cleanCache.isClean` 短路（已判干净不再发起 gate）；非 clean 结论（命中/gate 命中/fail_closed）以 `hasSecret=true` 记**墓碑**——同一文本后续的干净结论（后置 regex 层零命中）不得覆写，每轮重判。干净条目仍由 regex 层零命中时写入（clean = 两层都过）；墓碑随 `clear()`（检测器集热更新）失效。
 
 ### 假 classifier 方案（三层验证）
 

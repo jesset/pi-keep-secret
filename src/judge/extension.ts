@@ -140,6 +140,11 @@ export function createJudgeEgressExtension(options: JudgeEgressOptions) {
 			}
 			const activeJudge = judge;
 			await maskMessageTreeAsync(event.messages, async (text) => {
+				// clean cache 协同（T4）：已判干净的文本不再发起 gate（短路）；
+				// 干净条目由后置 regex 层零命中时写入（clean = 两层都过）。
+				if (pipeline.cleanCache.isClean(text)) {
+					return text;
+				}
 				const verdict = await activeJudge.judgeText(text);
 				status.judgedTexts += 1;
 				if (verdict.failClosed) {
@@ -156,6 +161,11 @@ export function createJudgeEgressExtension(options: JudgeEgressOptions) {
 					}
 				}
 				status.truncatedCandidates += verdict.truncatedCandidates;
+				// 非 clean 结论（命中/gate 命中/fail_closed）记墓碑：永不缓存干净，
+				// 且拦截后置 regex 层对同一文本的干净写入——每轮重判
+				if (!verdict.clean) {
+					pipeline.cleanCache.remember(text, { hasSecret: true });
+				}
 				// 幂等：命中串若已是本注册表签发的伪值则跳过（防嵌套伪值，与 regex 管线同语义）
 				const spans = verdict.spans.filter(
 					(span) => !registry.has(text.slice(span.start, span.end)),

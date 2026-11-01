@@ -8,8 +8,9 @@
  * - `createJudgeEgressExtension`：出站扩展工厂（context_with_system 上
  *   的 judge 检测器；模型缺失显式降级仅 regex 层 + 状态计数）。须先于
  *   regex 出站扩展注册。T4 配置层合入前由装配方显式传 modelRef。
- * - `JudgeVerdict.clean`：T4 clean cache 的协同接口（命中/gate 命中/故障
- *   文本不可缓存 clean）；T4 合入后在扩展层接缓存查询。
+ * - `JudgeVerdict.clean`：与 T4 clean cache 的协同依据——judge 层 gate
+ *   前查询短路（已判干净不再发起 gate）；非 clean 结论（命中/gate 命中/
+ *   fail_closed）以 hasSecret=true 记墓碑，拦截后置 regex 层的干净写入。
  */
 export {
 	createJudgeEgressExtension,

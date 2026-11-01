@@ -235,4 +235,42 @@ describe("T5 judge 出站扩展（接缝 1）", () => {
 			h.dispose();
 		}
 	});
+
+	test("与 clean cache 协同：干净消息缓存后不再发起 gate（非 clean 记墓碑）", async () => {
+		const pipeline = createMaskingPipeline();
+		const fake = scriptClassify({
+			gate: (text) => (text.includes(PASSWORD) ? 0.98 : 0.02),
+			candidate: (value) => (value === PASSWORD ? 0.96 : 0.04),
+		});
+		const h = await createHarnessSession({
+			extensionFactories: [
+				createJudgeEgressExtension({
+					modelRef: MODEL_REF,
+					pipeline,
+					resolveModel: () => fakeClassifierModel(),
+					classify: (_model, context) => fake.classify(context),
+				}),
+				createEgressMaskingExtension({ pipeline }),
+			],
+		});
+		try {
+			h.provider.setScript([{ text: "ok" }, { text: "ok" }]);
+			const CLEAN_PROMPT = "just chatting about architecture, no secrets here";
+			await h.session.prompt(CLEAN_PROMPT);
+			const afterFirst = fake.calls.length; // 首轮：system + user 各一次 gate
+			expect(afterFirst).toBeGreaterThanOrEqual(2);
+			// 同一干净消息第二轮仅新增新 user 叶的 gate：旧 system/user 叶缓存短路
+			await h.session.prompt(CLEAN_PROMPT);
+			expect(fake.calls.length).toBe(afterFirst + 1);
+
+			// 非 clean 文本记墓碑：gate 命中文本每轮重判（regex 层零命中也不覆写）
+			const callsWithSecret = fake.calls.length;
+			h.provider.setScript([{ text: "ok" }, { text: "ok" }]);
+			await h.session.prompt(`密码 ${PASSWORD} 但 gate 命中零命中场景`);
+			await h.session.prompt(`密码 ${PASSWORD} 但 gate 命中零命中场景`);
+			expect(fake.calls.length).toBeGreaterThan(callsWithSecret + 1); // 含重复文本重判
+		} finally {
+			h.dispose();
+		}
+	});
 });
