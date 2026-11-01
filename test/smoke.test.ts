@@ -16,11 +16,10 @@ function mask(s: string): string {
 	return s.split(REAL).join(FAKE);
 }
 
-/** 内联哨兵掩码扩展（fixture）：context_with_system 出站把真值替换为伪值。 */
+/** 内联哨兵掩码扩展（fixture）：出站把真值替换为伪值，message_end 回程还原。 */
 function sentinelMaskingExtension(pi: ExtensionAPI): void {
 	pi.on("context_with_system", (event) => {
 		const messages = event.messages.map((message) => {
-			if (message.role !== "user") return message;
 			// AgentMessage 的 user content 在钩子处可能是 string 或 text 块数组，两种都掩
 			if (typeof message.content === "string") {
 				return { ...message, content: mask(message.content) };
@@ -31,8 +30,31 @@ function sentinelMaskingExtension(pi: ExtensionAPI): void {
 					part.type === "text" ? { ...part, text: mask(part.text) } : part,
 				),
 			};
+			// 助手历史（含回程还原后的文本）每轮出站重新掩码
+			if (message.role === "assistant") {
+				return {
+					...message,
+					content: message.content.map((block) =>
+						block.type === "text" ? { ...block, text: mask(block.text) } : block,
+					),
+				};
+			}
+			return message;
 		});
 		return { messages };
+	});
+
+	pi.on("message_end", (event) => {
+		if (event.message.role !== "assistant") return undefined;
+		let changed = false;
+		const content = event.message.content.map((block) => {
+			if (block.type === "text" && block.text.includes(FAKE)) {
+				changed = true;
+				return { ...block, text: block.text.split(FAKE).join(REAL) };
+			}
+			return block;
+		});
+		return changed ? { message: { ...event.message, content } } : undefined;
 	});
 }
 
@@ -65,6 +87,28 @@ describe("测试接缝 1：进程内会话 + 脚本化假供应商", () => {
 			const lastUser = [...h.session.messages].reverse().find((m) => m.role === "user");
 			expect(JSON.stringify(lastUser?.content)).toContain(REAL);
 			expect(JSON.stringify(lastUser?.content)).not.toContain(FAKE);
+		} finally {
+			h.dispose();
+		}
+	});
+
+	test("message_end 还原断言：脚本化回显伪值的助手文本，transcript 落真值", async () => {
+		const h = await createHarnessSession({ extensionFactories: [sentinelMaskingExtension] });
+		try {
+			// 供应商视角回显伪值（模型只见过伪值，只能回显伪值）
+			h.provider.setScript([{ text: `the key is ${FAKE}` }]);
+			await h.session.prompt(`use my key ${REAL}`);
+
+			// 本地 transcript：助手文本已被还原为真值
+			expect(h.session.getLastAssistantText()).toBe(`the key is ${REAL}`);
+
+			// 还原后的助手历史进入本地 transcript；下一轮出站须重新掩码（伪值确定性）
+			h.provider.setScript([{ text: "ok" }]);
+			await h.session.prompt("again");
+			const requests = h.provider.requests();
+			const lastRequest = requests[requests.length - 1];
+			expect(requestText(lastRequest)).not.toContain(REAL);
+			expect(requestText(lastRequest)).toContain(FAKE);
 		} finally {
 			h.dispose();
 		}
