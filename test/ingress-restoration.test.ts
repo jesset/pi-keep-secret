@@ -136,4 +136,22 @@ describe("T3 回程还原：message_end + tool_call", () => {
 			h.dispose();
 		}
 	});
+
+	test("无伪值的响应消息零改动（幂等）：注册表非空也不误还原", async () => {
+		const h = await createHarnessSession({ extensionPaths: [EXTENSION_ENTRY] });
+		try {
+			// 第一轮掩码签发伪值（注册表非空）；响应不含任何伪值
+			const PLAIN = "部署完成，未回显任何凭据。";
+			h.provider.setScript([{ text: PLAIN, thinking: "nothing to echo" }]);
+			await h.session.prompt(`use my key ${OPENAI_KEY}`);
+
+			// 助手消息零改动：文本与 thinking 原样落盘
+			expect(h.session.getLastAssistantText()).toBe(PLAIN);
+			const transcript = JSON.stringify(h.session.messages);
+			expect(transcript).toContain("nothing to echo");
+			expect(transcript).not.toContain(OPENAI_PH);
+		} finally {
+			h.dispose();
+		}
+	});
 });
