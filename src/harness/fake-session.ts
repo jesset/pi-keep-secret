@@ -63,6 +63,8 @@ export interface HarnessOptions {
 	extensionFactories?: InlineExtension[];
 	/** 随会话注册的自定义工具（默认内置 read/bash/edit/write 已禁用）。 */
 	customTools?: ToolDefinition[];
+	/** 扩展文件/目录路径（如本仓库扩展目录里的正式扩展）。 */
+	extensionPaths?: string[];
 }
 
 /** 把一次供应商请求的全部文本叶（含 toolCall 参数深字符串值）拼成可检索文本。 */
@@ -128,6 +130,7 @@ export async function createHarnessSession(
 		cwd,
 		agentDir,
 		settingsManager,
+		additionalExtensionPaths: options.extensionPaths,
 		extensionFactories: options.extensionFactories,
 	});
 	await resourceLoader.reload();

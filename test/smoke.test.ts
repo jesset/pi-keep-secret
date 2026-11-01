@@ -4,6 +4,9 @@
  * 断言只走外部行为：假供应商收到什么（供应商视角）、transcript 与工具执行收到什么。
  * 参考 GitHub issue jesset/pi-keep-secret#1 的 Testing Decisions。
  */
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "@earendil-works/pi-ai";
@@ -198,6 +201,49 @@ describe("测试接缝 1：进程内会话 + 脚本化假供应商", () => {
 			}
 		} finally {
 			h.dispose();
+		}
+	});
+
+	test("扩展目录加载：harness 经 extensionPaths 从扩展文件加载掩码扩展", async () => {
+		// 与内联哨兵扩展等价的扩展文件（模拟本仓库扩展目录里的正式扩展）
+		const extDir = mkdtempSync(join(tmpdir(), "pi-keep-secret-ext-"));
+		try {
+			writeFileSync(
+				join(extDir, "sentinel-mask.ts"),
+				`import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+const REAL = "${REAL}";
+const FAKE = "${FAKE}";
+export default function (pi: ExtensionAPI) {
+	pi.on("context_with_system", (event) => {
+		for (const message of event.messages) {
+			if (message.role !== "user") continue;
+			if (typeof message.content === "string") {
+				message.content = message.content.split(REAL).join(FAKE);
+			} else {
+				for (const part of message.content) {
+					if (part.type === "text") part.text = part.text.split(REAL).join(FAKE);
+				}
+			}
+		}
+		return undefined;
+	});
+}
+`,
+			);
+			const h = await createHarnessSession({
+				extensionPaths: [join(extDir, "sentinel-mask.ts")],
+			});
+			try {
+				h.provider.setScript([{ text: "ack" }]);
+				await h.session.prompt(`file key ${REAL}`);
+				const [request] = h.provider.requests();
+				expect(requestText(request)).toContain(FAKE);
+				expect(requestText(request)).not.toContain(REAL);
+			} finally {
+				h.dispose();
+			}
+		} finally {
+			rmSync(extDir, { recursive: true, force: true });
 		}
 	});
 });
