@@ -20,19 +20,21 @@ import {
 	SettingsManager,
 	type AgentSession,
 	type InlineExtension,
+	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import {
 	fauxAssistantMessage,
 	fauxProvider,
 	fauxToolCall,
 	type FauxResponseStep,
+	type JsonObject,
 	type Message,
 } from "@earendil-works/pi-ai";
 
 /** 一次脚本化的助手响应：文本，或一次工具调用。 */
 export type ScriptedResponse =
 	| { text: string }
-	| { toolCall: { name: string; arguments: Record<string, unknown> } };
+	| { toolCall: { name: string; arguments: JsonObject } };
 
 /** 假供应商视角看到的一次模型请求：context 钩子之后、发给「供应商」的全部消息。 */
 export interface ProviderRequest {
@@ -59,6 +61,8 @@ export interface HarnessSession {
 export interface HarnessOptions {
 	/** 内联扩展工厂（随会话加载，如冒烟用的哨兵掩码扩展）。 */
 	extensionFactories?: InlineExtension[];
+	/** 随会话注册的自定义工具（默认内置 read/bash/edit/write 已禁用）。 */
+	customTools?: ToolDefinition[];
 }
 
 /** 把一次供应商请求的全部文本叶（含 toolCall 参数深字符串值）拼成可检索文本。 */
@@ -136,6 +140,7 @@ export async function createHarnessSession(
 		settingsManager,
 		sessionManager: SessionManager.inMemory(),
 		resourceLoader,
+		customTools: options.customTools,
 		// 假供应商按脚本显式发起工具调用，harness 不启用内置 read/bash/edit/write。
 		noTools: "builtin",
 	});
