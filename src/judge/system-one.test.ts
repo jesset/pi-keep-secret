@@ -307,4 +307,49 @@ describe("SystemOneJudge 两阶段判定", () => {
 			expect(verdict.clean).toBe(false);
 		});
 	});
+
+	describe("classify 调用并发信号量（默认 8 路，跨 judgeText 共享）", () => {
+		/** 统计在途回调峰值与总调用的假 classify（stall 挂起制造并发窗口）。 */
+		function concurrencyTrackingClassify(script: FakeScript) {
+			const fake = fakeClassify({
+				...script,
+				stall: async () => {
+					inFlight++;
+					peak = Math.max(peak, inFlight);
+					await new Promise((resolve) => setTimeout(resolve, 5));
+					inFlight--;
+				},
+			});
+			return fake;
+		}
+		let inFlight = 0;
+		let peak = 0;
+
+		test("单消息多批并发受限：concurrency 2 时 4 批峰值不超 2", async () => {
+			inFlight = 0;
+			peak = 0;
+			// 500 候选 → 128+128+128+116 四批（无信号量时四批同时发起）
+			const tokens = Array.from({ length: 500 }, (_, i) => `t${String(i + 1).padStart(5, "0")}`);
+			const fake = concurrencyTrackingClassify({ gate: () => 0.98, candidate: () => 0.02 });
+			const judge = createSystemOneJudge({ classify: fake.classify, concurrency: 2 });
+
+			const verdict = await judge.judgeText(tokens.join(" "));
+
+			expect(verdict.calls).toBe(5); // gate + 4 批全部发出
+			expect(peak).toBeLessThanOrEqual(2);
+			expect(peak).toBeGreaterThan(1); // 确有并发（串行执行峰值恒为 1）
+		});
+
+		test("消息级并发共享同一信号量：两消息并发且 concurrency 1 时全程串行", async () => {
+			inFlight = 0;
+			peak = 0;
+			const fake = concurrencyTrackingClassify({ gate: () => 0.02 }); // 干净文本：各 1 次 gate
+			const judge = createSystemOneJudge({ classify: fake.classify, concurrency: 1 });
+
+			await Promise.all([judge.judgeText("clean alpha"), judge.judgeText("clean beta")]);
+
+			expect(fake.calls).toHaveLength(2);
+			expect(peak).toBe(1); // 跨消息也互斥
+		});
+	});
 });

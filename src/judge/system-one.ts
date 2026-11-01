@@ -86,6 +86,26 @@ export interface SystemOneJudge {
 	judgeText(text: string): Promise<JudgeVerdict>;
 }
 
+/** FIFO 计数信号量：跨 judgeText（消息级并发）共享的 classify 并发上限。 */
+function createSemaphore(limit: number) {
+	let active = 0;
+	const waiters: Array<() => void> = [];
+	return async function withSlot<T>(task: () => Promise<T>): Promise<T> {
+		if (active >= limit) {
+			await new Promise<void>((resolve) => {
+				waiters.push(resolve);
+			});
+		}
+		active++;
+		try {
+			return await task();
+		} finally {
+			active--;
+			waiters.shift()?.();
+		}
+	};
+}
+
 /** 创建 System One judge 适配器。 */
 export function createSystemOneJudge(options: SystemOneJudgeOptions): SystemOneJudge {
 	const detectorName = options.detectorName ?? DEFAULT_DETECTOR_NAME;
@@ -95,7 +115,9 @@ export function createSystemOneJudge(options: SystemOneJudgeOptions): SystemOneJ
 	const maxBatches = options.maxBatches ?? DEFAULT_MAX_BATCHES;
 	const maxChars = options.maxChars ?? DEFAULT_MAX_CHARS;
 	const minCandidateLength = options.minCandidateLength ?? 6;
+	const concurrency = options.concurrency ?? DEFAULT_CONCURRENCY;
 	const classify = options.classify;
+	const withSlot = createSemaphore(concurrency);
 
 	return {
 		detectorName,
@@ -124,10 +146,12 @@ export function createSystemOneJudge(options: SystemOneJudgeOptions): SystemOneJ
 			let truncatedCandidates = 0;
 			for (const chunk of chunkText(text, maxChars)) {
 				calls++;
-				const gateResult = await classify({
-					state: { text: chunk.text },
-					questions: { [GATE_QUESTION_NAME]: gateQuestion() },
-				});
+				const gateResult = await withSlot(() =>
+					classify({
+						state: { text: chunk.text },
+						questions: { [GATE_QUESTION_NAME]: gateQuestion() },
+					}),
+				);
 				// classify never-rejects：错误在 stopReason。gate 即失败则该块候选
 				// 全部未验证 → 全掩，且不追加注定失败的候选批（不锤已死的 judge）
 				if (gateResult.stopReason !== "stop") {
@@ -165,15 +189,17 @@ export function createSystemOneJudge(options: SystemOneJudgeOptions): SystemOneJ
 				const responses = await Promise.all(
 					batches.map(async (batch) => {
 						calls++;
-						return await classify({
-							state: {
-								text: chunk.text,
-								candidates: Object.fromEntries(batch.map((c, i) => [String(i), c.value])),
-							},
-							questions: Object.fromEntries(
-								batch.map((_, i) => [`cand_${i}`, candidateQuestion(i)]),
-							),
-						});
+						return await withSlot(() =>
+							classify({
+								state: {
+									text: chunk.text,
+									candidates: Object.fromEntries(batch.map((c, i) => [String(i), c.value])),
+								},
+								questions: Object.fromEntries(
+									batch.map((_, i) => [`cand_${i}`, candidateQuestion(i)]),
+								),
+							}),
+						);
 					}),
 				);
 				for (const [b, batch] of batches.entries()) {
