@@ -19,7 +19,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { createConfiguredMaskingExtension } from "../src/config/index.ts";
+import { createConfiguredMaskingExtension, CONFIG_PATH_ENV } from "../src/config/index.ts";
 import type { MaskedCompactionStatus } from "../src/compaction/index.ts";
 import { createKeepSecretCommandsExtension } from "../src/commands/index.ts";
 import { createHarnessSession, requestText } from "../src/harness/fake-session.ts";
@@ -297,5 +297,54 @@ describe("T7 /keep-secret reload 配置热重载", () => {
 		expect(text).toContain("配置错误");
 		expect(text).toMatch(/已回退内置默认集/);
 		expect(made.loader.get().detectors.map((d) => d.name)).toContain("openai-key");
+	});
+});
+
+describe("T7 组合入口与三模式安全降级", () => {
+	/** 正式扩展入口（目录扩展 index.ts 工厂，读 JSON 配置）。 */
+	const EXTENSION_ENTRY = join(import.meta.dir, "..", "extension", "index.ts");
+
+	test("正式入口：三个子命令均被 pi 分发执行（无模型请求），与掩码共享同一管线", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-keep-secret-t7-entry-"));
+		tempDirs.push(dir);
+		const saved = process.env[CONFIG_PATH_ENV];
+		process.env[CONFIG_PATH_ENV] = join(dir, "config.json"); // 不存在 → 内置默认集
+		try {
+			const h = await createHarnessSession({ extensionPaths: [EXTENSION_ENTRY] });
+			try {
+				// 预置脚本：若 /keep-secret 未被识别为命令，会作为 prompt 发给模型并消耗脚本、
+			// 记录请求（.requests() > 0）；命令被分发执行则零请求、脚本零消耗
+				h.provider.setScript([{ text: "ok" }, { text: "ok" }, { text: "ok" }]);
+				await h.session.prompt("/keep-secret");
+				await h.session.prompt("/keep-secret test");
+				await h.session.prompt("/keep-secret reload");
+				expect(h.provider.requests()).toHaveLength(0);
+			} finally {
+				h.dispose();
+			}
+		} finally {
+			if (saved === undefined) {
+				delete process.env[CONFIG_PATH_ENV];
+			} else {
+				process.env[CONFIG_PATH_ENV] = saved;
+			}
+		}
+	});
+
+	test("未知子命令 → 用法提示（不抛错）", async () => {
+		const made = makeCommands();
+		const text = await runCommand(made.commands, "bogus");
+		expect(text).toContain("未知子命令");
+		expect(text).toContain("/keep-secret test");
+	});
+
+	test("print 模式 no-op UI 下三个子命令均正常运行（安全降级：无交互原语）", async () => {
+		const made = makeCommands();
+		const { commandHandler } = registerExtension(made.commands);
+		const { ctx, notifications } = recordingContext("print", false);
+		for (const args of ["", "test", "reload"]) {
+			await commandHandler!(args, ctx);
+		}
+		expect(notifications).toHaveLength(3); // 动作均执行（真实 print 模式 notify 为 no-op，不抛错）
 	});
 });
