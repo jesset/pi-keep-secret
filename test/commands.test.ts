@@ -22,7 +22,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import { createConfiguredMaskingExtension } from "../src/config/index.ts";
 import type { MaskedCompactionStatus } from "../src/compaction/index.ts";
 import { createKeepSecretCommandsExtension } from "../src/commands/index.ts";
-import { createHarnessSession } from "../src/harness/fake-session.ts";
+import { createHarnessSession, requestText } from "../src/harness/fake-session.ts";
 
 const OPENAI_KEY = "sk-live-abcdefghijklmnopqrst";
 
@@ -45,7 +45,7 @@ function makeCommands(configContent?: string) {
 	const { factory, loader, pipeline } = createConfiguredMaskingExtension({ configPath });
 	const compaction: MaskedCompactionStatus = { fallbacks: 0, lastFallbackError: undefined };
 	const commands = createKeepSecretCommandsExtension({ loader, pipeline, compaction });
-	return { factory, commands, loader, pipeline, compaction };
+	return { factory, commands, loader, pipeline, compaction, configPath };
 }
 
 /** stub pi：记录注册的 input 处理器与 /keep-secret 命令 handler（与 pi 同一调用面）。 */
@@ -127,20 +127,17 @@ describe("T7 input 预检通知（默认 regex 集快扫，非阻塞）", () => 
 	});
 });
 
+/** 直调命令 handler 并取全部 notify 文本。 */
+async function runCommand(commands: (pi: ExtensionAPI) => void, args: string): Promise<string> {
+	const { commandHandler } = registerExtension(commands);
+	expect(commandHandler).toBeDefined();
+	const { ctx, notifications } = recordingContext();
+	await commandHandler!(args, ctx);
+	return notifications.map((n) => n.message).join("\n");
+}
+
 describe("T7 /keep-secret 状态面板", () => {
 	const OTHER_KEY = "sk-live-zyxwvutsrqponmlkjih";
-
-	/** 直调命令 handler 并取全部 notify 文本。 */
-	async function runCommand(
-		commands: (pi: ExtensionAPI) => void,
-		args: string,
-	): Promise<string> {
-		const { commandHandler } = registerExtension(commands);
-		expect(commandHandler).toBeDefined();
-		const { ctx, notifications } = recordingContext();
-		await commandHandler!(args, ctx);
-		return notifications.map((n) => n.message).join("\n");
-	}
 
 	test("含各计数器且随会话事件递增（harness 会话驱动）", async () => {
 		const { factory, commands } = makeCommands();
@@ -246,5 +243,59 @@ describe("T7 /keep-secret test 合成样本自测", () => {
 		expect(text).toMatch(/sk- 假 key：未掩码（期望：掩码）✗ 未通过/);
 		expect(text).toMatch(/URL 藏 key：未掩码（期望：掩码）✗ 未通过/);
 		expect(text).toMatch(/2\/4 通过/);
+	});
+});
+
+describe("T7 /keep-secret reload 配置热重载", () => {
+	const ALPHA_CONFIG = JSON.stringify({
+		detectors: [{ name: "alpha-key", pattern: "alpha-[A-Za-z0-9]{20,}", redactTemplate: "alpha-{hash}" }],
+	});
+	const ALPHA_BETA_CONFIG = JSON.stringify({
+		detectors: [
+			{ name: "alpha-key", pattern: "alpha-[A-Za-z0-9]{20,}", redactTemplate: "alpha-{hash}" },
+			{ name: "beta-key", pattern: "beta-[A-Za-z0-9]{20,}", redactTemplate: "beta-{hash}" },
+		],
+	});
+	const BETA_KEY = "beta-qwertyuiopasdfghjklz";
+
+	test("reload 后新 pattern 立即生效（provider 视角），notify 报告已热应用", async () => {
+		const made = makeCommands(ALPHA_CONFIG);
+		const h = await createHarnessSession({ extensionFactories: [made.factory, made.commands] });
+		try {
+			h.provider.setScript([{ text: "ok" }, { text: "done" }]);
+			// v1（仅 alpha）：beta 形状放行
+			await h.session.prompt(`rotate ${BETA_KEY}`);
+			expect(requestText(h.provider.requests()[0])).toContain(BETA_KEY);
+
+			// 重写配置为 v2（补 beta 检测器），经命令面 reload
+			writeFileSync(made.configPath, ALPHA_BETA_CONFIG, "utf8");
+			const text = await runCommand(made.commands, "reload");
+			expect(text).toContain("已热应用");
+			expect(text).toContain("beta-key");
+
+			// 新 pattern 立即生效：历史 beta 消息重掩码出站
+			await h.session.prompt("status");
+			const second = requestText(h.provider.requests()[1]);
+			expect(second).not.toContain(BETA_KEY);
+			expect(second).toMatch(/beta-[A-Z2-7]{12}/);
+		} finally {
+			h.dispose();
+		}
+	});
+
+	test("配置无变更 reload → notify 报告无变更（不动检测器集）", async () => {
+		const made = makeCommands(ALPHA_CONFIG);
+		const text = await runCommand(made.commands, "reload");
+		expect(text).toContain("无变更");
+		expect(made.loader.get().detectors).toHaveLength(1);
+	});
+
+	test("reload 读到非法新配置 → notify 报错并回退内置默认集", async () => {
+		const made = makeCommands(ALPHA_CONFIG);
+		writeFileSync(made.configPath, JSON.stringify({ detectors: [{ name: "bad", pattern: "((" }] }), "utf8");
+		const text = await runCommand(made.commands, "reload");
+		expect(text).toContain("配置错误");
+		expect(text).toMatch(/已回退内置默认集/);
+		expect(made.loader.get().detectors.map((d) => d.name)).toContain("openai-key");
 	});
 });

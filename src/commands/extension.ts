@@ -188,6 +188,27 @@ export function createKeepSecretCommandsExtension(options: KeepSecretCommandsOpt
 					ctx.ui.notify(report.text, report.allPassed ? "info" : "warning");
 					break;
 				}
+				case "reload": {
+					const before = options.loader.get();
+					const after = options.loader.reload(); // 变更时同步触发热应用（applyDetectors + 清空缓存）
+					if (after.errors.length > 0) {
+						ctx.ui.notify(
+							`pi-keep-secret reload：配置错误（已回退内置默认集）——\n${after.errors.join("\n")}`,
+							"error",
+						);
+					} else if (JSON.stringify(before.detectors) !== JSON.stringify(after.detectors)) {
+						ctx.ui.notify(
+							`pi-keep-secret reload：检测器集已热应用（${after.detectors.length} 个：${after.detectors.map((d) => d.name).join(", ")}；hashLength/cleanCache 变更仅新会话生效）`,
+							"info",
+						);
+					} else {
+						ctx.ui.notify(
+							"pi-keep-secret reload：配置已重读，检测器集无变更（hashLength/cleanCache 变更仅新会话生效）",
+							"info",
+						);
+					}
+					break;
+				}
 				default: {
 					ctx.ui.notify(
 						`未知子命令 ${JSON.stringify(args.trim())}。用法：/keep-secret（状态）| /keep-secret test（自测）| /keep-secret reload（配置热重载）`,
