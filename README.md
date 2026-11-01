@@ -85,6 +85,34 @@ const factory = createEgressMaskingExtension({
 - AGENTS.md 等项目指令进入 system 消息 `sections.project_context`，在 `context_with_system` 可见且已被掩码覆盖（验收用例锚定）。
 - 默认 hashLength=12 时伪值 `sk-`+12 位不命中 `sk-` 检测器（{20,}），但配置长哈希后伪值可自匹配——幂等过滤为此必需（用例已锚定）。
 
+## 回程还原（T3，issue #5）
+
+代码：`src/ingress/`（restore/extension）+ 扩展入口组合接线；验收用例：`test/ingress-restoration.test.ts`（接缝 1）。
+
+- `message_end` 钩子：assistant 消息的 text/thinking/toolCall.arguments（深遍历字符串值）伪值→真值，返回替换消息（同 role）；在 transcript 落盘与工具执行之前生效。
+- `tool_call` 钩子：`event.input` 原位还原（深遍历字符串值），防 message_end 之外路径的第二道兑底；突变校验确认钧子敏感性。
+- 还原 tokens 来自与出站掩码共用的注册表实例 `snapshot()`（合并视图）；截断前缀兑底（max_tokens 半个伪值）在引擎 `unmaskText`。
+- 幂等：注册表为空或消息无伪值时零改动（不返回替换消息）。
+
+```ts
+// 组合接线（extension/index.ts）：出站掩码与回程还原共用同一注册表实例
+import { createIngressRestorationExtension } from "./src/ingress/index.ts";
+import { createEgressMaskingExtension, createPlaceholderRegistry } from "./src/masking/index.ts";
+
+const registry = createPlaceholderRegistry();
+const compose = (pi: ExtensionAPI): void => {
+	createEgressMaskingExtension({ registry })(pi);
+	createIngressRestorationExtension({ registry })(pi);
+};
+```
+
+### T3 事实发现（后续 ticket 注意）
+
+- `message_end` 原位改写与返回副本等价：pi 的 `_replaceMessageInPlace` 对 target===replacement 直接返回，且注释明确 bless 原位改写以保持 agent 状态/事件监听/SessionManager 落盘同步。
+- 工具执行参数与 transcript 的 toolCall.arguments 是同一对象（`validateToolArguments` 原位 coercion）：tool_call 钩子的原位还原会同时体现于两者。
+- 扩展加载顺序：`extensionPaths` 先于 `extensionFactories`（inline）注册，同一事件的处理器按此顺序链式传递（message_end 的替换消息会传给后续处理器）。
+- faux 供应商会别掉助手文本的行首空格（测试脚本避免行首空格这种无关变量）。
+
 ## 约定
 
 - Conventional Commits；分支 `ticket/<n>-<slug>`（每张 ticket 在自己的 worktree 基于 `feat/secret-masking`）。合并到 main 需用户明示许可。
