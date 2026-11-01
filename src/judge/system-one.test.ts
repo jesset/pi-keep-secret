@@ -136,4 +136,48 @@ describe("SystemOneJudge 两阶段判定", () => {
 			);
 		}
 	});
+
+	describe("分批与批数闸门", () => {
+		/** 生成 count 个互异 6 字符候选（空格分隔）的文本。 */
+		function candidateText(count: number, extra: string[] = []): string {
+			const tokens = Array.from(
+				{ length: count },
+				(_, i) => `t${String(i + 1).padStart(5, "0")}`, // t00001..t01300，各 6 字符
+			);
+			return [...tokens, ...extra].join(" ");
+		}
+
+		test("候选超过 128 拆批全覆盖：200 候选 → 128 + 72 两批", async () => {
+			const fake = fakeClassify({ gate: () => 0.98, candidate: () => 0.9 });
+			const judge = createSystemOneJudge({ classify: fake.classify });
+
+			const verdict = await judge.judgeText(candidateText(200));
+
+			expect(verdict.calls).toBe(3); // gate + 2 批
+			expect(fake.calls[1].questions).toHaveLength(128);
+			expect(fake.calls[2].questions).toHaveLength(72);
+			expect(verdict.truncatedCandidates).toBe(0);
+			expect(verdict.spans).toHaveLength(200);
+		});
+
+		test("候选超 8 批（1024）截断保最长并计数丢弃数", async () => {
+			const LONG = `LONG${"y".repeat(44)}`; // 48 字符长候选
+			const text = candidateText(1300, [LONG]); // 1301 候选 > 8×128
+			const fake = fakeClassify({ gate: () => 0.98, candidate: () => 0.9 });
+			const judge = createSystemOneJudge({ classify: fake.classify });
+
+			const verdict = await judge.judgeText(text);
+
+			// 8 批 × 128 问，共 1024 候选参判，277 个短候选被丢弃
+			const batchCalls = fake.calls.slice(1);
+			expect(batchCalls).toHaveLength(8);
+			expect(batchCalls.every((call) => call.questions.length === 128)).toBe(true);
+			expect(verdict.truncatedCandidates).toBe(277);
+			// 保最长：48 字符候选参判并命中；末尾短候选（最短群体）被截断丢弃
+			const masked = verdict.spans.map((span) => text.slice(span.start, span.end));
+			expect(masked).toContain(LONG);
+			expect(masked).not.toContain("t01300");
+			expect(verdict.spans).toHaveLength(1024);
+		});
+	});
 });

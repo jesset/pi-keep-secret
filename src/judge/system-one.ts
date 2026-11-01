@@ -116,15 +116,21 @@ export function createSystemOneJudge(options: SystemOneJudgeOptions): SystemOneJ
 					continue; // gate 低短路：不发起候选问题
 				}
 				gateHit = true;
-				const candidates = extractCandidates(chunk.text, minCandidateLength);
+				let candidates = extractCandidates(chunk.text, minCandidateLength);
 				if (candidates.length === 0) {
 					continue;
 				}
-				// 批数闸门：仅当超过 maxBatches 才截断保最长（成本护栏）
+				// 批数闸门：仅当超过 maxBatches 才截断保最长（成本护栏；短候选恰是
+				// minCandidateLen 要兜的低熵密码，因此拆批全覆盖优先，不直接截断）
 				const keep = batchSize * maxBatches;
 				if (candidates.length > keep) {
 					truncatedCandidates += candidates.length - keep;
-					candidates.length = keep;
+					candidates = [
+						...[...candidates]
+							.sort((a, b) => b.end - b.start - (a.end - a.start))
+							.slice(0, keep)
+							.sort((a, b) => a.start - b.start),
+					];
 				}
 				const batches: Candidate[][] = [];
 				for (let i = 0; i < candidates.length; i += batchSize) {
