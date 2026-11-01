@@ -42,9 +42,9 @@ try {
 
 harness 特性：
 
-- 会话运行在临时目录（cwd/agentDir）、内存 settings、内存 session 中，不触网、不落盘。
+- 会话运行在临时目录（cwd/agentDir）、内存 settings、内存 session 中，不触网、不落盘；`settings` 选项可注入内存 settings 初始值（如调低 `compaction.keepRecentTokens` 驱动手动/阈值压缩用例）。
 - 假供应商记录的 `messages` 即「供应商视角」：`context_with_system` 钩子与 `convertToLlm` 之后的消息（LLM 格式）。
-- 脚本化响应按请求顺序逐次消耗；脚本耗尽后再被请求会得到错误消息（`No more faux responses queued`），欠脚本的测试显式失败。
+- 脚本化响应按请求顺序逐次消耗；`{ error }` 变体返回 stopReason=error 应答（故障回退用例）；脚本耗尽后再被请求会得到错误消息（`No more faux responses queued`），欠脚本的测试显式失败。
 
 ### 主路径与回退决策
 
@@ -76,7 +76,7 @@ const factory = createEgressMaskingExtension({
 
 - 管线：`detectRegexSpans`（T1）→ 注册表层幂等过滤（命中文本已是伪值则跳过，防嵌套 mask）→ `redactText` 注入注册表签发器（确定性伪值 + 碰撞 x 后缀兜底 + LRU 写入）。
 - 遍历（笔记 §2）：user（string/text 块）、toolResult text 块、assistant 的 text/thinking/toolCall.arguments 深遍历、system 的 prose 与 sections 字符串值；豁免 ImageContent.data、*Signature、id/name/role/type、toolsAdded/toolsRemoved、nestedCalls、argumentsError、toolResult.details。
-- 内置默认检测器：openai-key（`sk-`，排除 `sk-ant-`）、github-pat（`ghp_`）、aws-access-key-id（`AKIA`+16）、google-api-key（`AIza`+35）、slack-bot-token（`xoxb-`）；PEM/JWT 留待 T4 配置化与 T5 judge。
+- 内置默认检测器：openai-key（`sk-`，排除 `sk-ant-`）、github-pat（`ghp_`）、aws-access-key-id（`AKIA`+16）、google-api-key（`AIza`+35）、slack-bot-token（`xoxb-`）；PEM/JWT 已由 T4 补入默认集（见 T4 节）。
 - 伪值注册表（`createPlaceholderRegistry`，会话生命周期闭包状态，供 T3/T5 共用）：`issue(secret, template)`（幂等，写入刷新 LRU，碰撞 x 后缀）、`has`/`get`（幂等过滤/还原查值）、`snapshot()`（T3 还原 tokens 副本）、`size`/`clear`。
 
 ### T2 事实发现（后续 ticket 注意）
@@ -84,6 +84,34 @@ const factory = createEgressMaskingExtension({
 - `before_agent_start` 返回的 `systemPrompt` 强制覆盖在 context 钩子**之后**由 pi 的 `_installAgentForcedPromptProjection` 投影为请求头部，**绕过 `context_with_system` 掩码**——扩展自身不强制 prompt 不受影响；若未来某扩展把密钥写进强制 prompt 则是泄漏路径（规格外的已知限制）。
 - AGENTS.md 等项目指令进入 system 消息 `sections.project_context`，在 `context_with_system` 可见且已被掩码覆盖（验收用例锚定）。
 - 默认 hashLength=12 时伪值 `sk-`+12 位不命中 `sk-` 检测器（{20,}），但配置长哈希后伪值可自匹配——幂等过滤为此必需（用例已锚定）。
+
+## 回程还原（T3，issue #5）
+
+代码：`src/ingress/`（restore/extension）+ 扩展入口组合接线；验收用例：`test/ingress-restoration.test.ts`（接缝 1）。
+
+- `message_end` 钩子：assistant 消息的 text/thinking/toolCall.arguments（深遍历字符串值）伪值→真值，返回替换消息（同 role）；在 transcript 落盘与工具执行之前生效。
+- `tool_call` 钩子：`event.input` 原位还原（深遍历字符串值），防 message_end 之外路径的第二道兑底；突变校验确认钧子敏感性。
+- 还原 tokens 来自与出站掩码共用的注册表实例 `snapshot()`（合并视图）；截断前缀兑底（max_tokens 半个伪值）在引擎 `unmaskText`。
+- 幂等：注册表为空或消息无伪值时零改动（不返回替换消息）。
+
+```ts
+// 组合接线（extension/index.ts）：出站掩码与回程还原共用同一注册表实例
+import { createIngressRestorationExtension } from "./src/ingress/index.ts";
+import { createEgressMaskingExtension, createPlaceholderRegistry } from "./src/masking/index.ts";
+
+const registry = createPlaceholderRegistry();
+const compose = (pi: ExtensionAPI): void => {
+	createEgressMaskingExtension({ registry })(pi);
+	createIngressRestorationExtension({ registry })(pi);
+};
+```
+
+### T3 事实发现（后续 ticket 注意）
+
+- `message_end` 原位改写与返回副本等价：pi 的 `_replaceMessageInPlace` 对 target===replacement 直接返回，且注释明确 bless 原位改写以保持 agent 状态/事件监听/SessionManager 落盘同步。
+- 工具执行参数与 transcript 的 toolCall.arguments 是同一对象（`validateToolArguments` 原位 coercion）：tool_call 钩子的原位还原会同时体现于两者。
+- 扩展加载顺序：`extensionPaths` 先于 `extensionFactories`（inline）注册，同一事件的处理器按此顺序链式传递（message_end 的替换消息会传给后续处理器）。
+- faux 供应商会别掉助手文本的行首空格（测试脚本避免行首空格这种无关变量）。
 
 ## 检测器 JSON 配置 + clean cache（T4，issue #6）
 
@@ -121,8 +149,9 @@ loader.get();          // ResolvedConfig { path, exists, detectors, hashLength?,
 loader.reload();       // 重读并返回；指纹变更时同步通知订阅者
 loader.subscribe(fn);  // 订阅变更，返回解绑（订阅不回放当前值）
 
-// 配置化组合（正式入口 extension/index.ts 的装配方式）
-const { factory, loader } = createConfiguredMaskingExtension({ configPath?, cleanCache?, registry? });
+// 配置化组合（正式入口 extension/index.ts 的装配方式；合并 T3/T6 后与回程还原、掩码压缩
+// 共享同一管线：const { factory, loader, pipeline } = createConfiguredMaskingExtension(...)
+const { factory, loader, pipeline } = createConfiguredMaskingExtension({ configPath?, cleanCache?, registry? });
 ```
 
 - 热重载语义：`reload()` 后检测器集变更**即时生效**（重编译 + 清空 clean cache——检测器集变更后旧的干净判定不再可信，验收用例锚定防泄漏）；`hashLength`/`cleanCache` 变更仅新会话生效（伪值注册表与缓存参数在工厂创建时定格）。T7 的 `/keep-secret reload` 直接调 `loader.reload()`。
@@ -131,7 +160,7 @@ const { factory, loader } = createConfiguredMaskingExtension({ configPath?, clea
 ### clean cache
 
 - `createCleanCache({ limit=20000, ttlMs=24h, now })`：sha256(文本) → 过期时刻，写时刷新 LRU 位序、命中不续期（对齐参考实现 OrderedDict 语义）；`isClean`/`remember({ hasSecret })`/`stats()/clear()`。
-- 挂接在掩码管线检测入口（`createEgressMaskingExtension` 的 maskText）：`isClean` 未命中才执行检测，干净结论入缓存——第二轮请求同历史消息不再重复检测（每轮成本 O(新增消息)），含 secret 的文本永不缓存、每轮重扫；`stats().misses` 即实际检测次数（验收「检测计数」断言口径，`hits` 为缓存短路次数）。
+- 挂接在掩码管线检测入口（`createMaskingPipeline` 的 maskText，出站钩子与掩码压缩共用）：`isClean` 未命中才执行检测，干净结论入缓存——第二轮请求同历史消息不再重复检测（每轮成本 O(新增消息)），含 secret 的文本永不缓存、每轮重扫；`stats().misses` 即实际检测次数（验收「检测计数」断言口径，`hits` 为缓存短路次数）。热应用入口 `pipeline.applyDetectors(specs)`（重编译 + 清空缓存）。
 - `ScanOutcome.hasSecret` 是语义位预留：T5 judge gate 命中同样置 true（不缓存、每轮重扫）。
 
 ### 内置默认检测器集（T4 补全）
@@ -145,6 +174,37 @@ const { factory, loader } = createConfiguredMaskingExtension({ configPath?, clea
 - 正式入口的默认导出从 `createEgressMaskingExtension()` 求值改为传函数本身：环境变量在每次扩展装配时读取（模块缓存不影响按会话指向不同配置文件）。
 - `test/egress-masking.test.ts` 钉扎 `PI_KEEP_SECRET_CONFIG` 指向确定不存在的路径，保证默认集用例不受机器上真实 `~/.pi` 配置影响（测试一律不触真实 `~/.pi` 路径）。
 - `ctx.ui.notify` 在无 UI 模式（print/RPC）是 no-op：配置错误在无 UI 环境只经 `loader.get().errors` 可见，T7 status 负责展示。
+## 掩码压缩（T6，issue #8）
+
+代码：`src/compaction/`（extension/prompts）；验收用例：`test/compaction.test.ts`（接缝 1）。
+
+- `session_before_compact` 处理器返回完整 `CompactionResult`，整体替换 pi 自带压缩（manual `/compact`、阈值、overflow 三路径都走此钩子）：preparation 的 messagesToSummarize + turnPrefixMessages → `convertToLlm`（含 branchSummary/compactionSummary 投影）→ 与出站同一掩码管线掩码文本叶 → `serializeConversation` 入摘要提示词 → `ctx.modelRegistry.complete`（当前会话模型）摘要 → 摘要文本按注册表还原 → `{ compaction: { summary, firstKeptEntryId, tokensBefore, usage } }`。
+- 摘要提示词对齐 pi 默认（pi 1.4.0 未公开导出提示词常量，按原文复制于 `src/compaction/prompts.ts`，升级时需同步校对）；previousSummary / customInstructions 掩码后入摘要上下文，结果还原。
+- `session_before_tree` 同模式返回 `{ summary: { summary: 还原后文本, usage } }`（entriesToSummarize 经 `prepareBranchEntries` 投影）。
+- 故障策略（ticket 锁定）：摘要调用不可恢复错误（error/length/工具调用/空文本/抛错）→ 返回 undefined 显式回退 pi 默认压缩 + `ctx.ui.notify` 告警 + 状态栏标记 + `MaskedCompactionStatus` 计数（无 UI 模式仅计数）；绝不能静默回退——默认压缩不掩码，摘要模型会看到真值。用户中止（abort）不算回退，返回 `{ cancel: true }`。
+- 出站兑底：压缩/分支摘要消息（`compactionSummary`/`branchSummary` 自定义 AgentMessage，携带还原真值）的 `summary` 字段由遍历器掩码（T6 起进入出站覆盖）。
+
+```ts
+// 组合接线（extension/index.ts）：出站掩码、回程还原、掩码压缩共享同一管线
+import { createMaskedCompactionExtension } from "./src/compaction/index.ts";
+import { createIngressRestorationExtension } from "./src/ingress/index.ts";
+import { createEgressMaskingExtension, createMaskingPipeline } from "./src/masking/index.ts";
+
+const pipeline = createMaskingPipeline();
+const compose = (pi: ExtensionAPI): void => {
+	createEgressMaskingExtension({ pipeline })(pi);
+	createIngressRestorationExtension({ registry: pipeline.registry })(pi);
+	createMaskedCompactionExtension({ pipeline })(pi);
+};
+```
+
+### T6 事实发现（后续 ticket 注意）
+
+- 扩展侧 `ctx.modelRegistry` 是同步兼容门面（`ModelRegistry`）：有 `complete`/`streamSimple`，**无** `completeSimple`（那是 `ModelRuntime` 的方法）；掩码摘要走 `ctx.modelRegistry.complete`（请求时认证）。
+- pi 默认压缩自带重试（`retryAssistantCall`）；掩码压缩的单次 `complete` 无重试，瞬时故障即回退（回退可见性弥补）。若需对齐重试语义，后续可在 `requestSummary` 外套重试。
+- 压缩后 `firstKeptEntryId` 之前的历史由 compaction 条目替换，投影生成 `compactionSummary` 角色消息（`summary` 字段携带真值），`convertToLlm` 展开为 user 文本——若遍历器不覆盖该角色，压缩后每一轮出站都会泄漏真值（T6 已补，用例锚定）。
+- `SettingsManager.inMemory(partial)` 可注入 `compaction.keepRecentTokens`/`reserveTokens`，harness 以此驱动手动/阈值压缩；keepRecentTokens 必须小于会话尾部 token 量，否则 `prepareCompaction` 返回 undefined（"Nothing to compact"）。
+- `bashExecution`/`custom` 自定义消息（`!命令` 等）尚未在出站遍历器覆盖（T2 既有缺口，与压缩无关；待后续 ticket 处理）。
 
 ## 约定
 

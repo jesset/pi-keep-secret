@@ -70,7 +70,9 @@ function maskJsonStrings(value: unknown, maskText: TextMasker): void {
  * 对消息树的文本叶原位掩码。覆盖：UserMessage（string/text 块）、
  * ToolResultMessage 的 text 块（ImageContent.data 豁免）、AssistantMessage
  * 的 text/thinking 块与 toolCall.arguments 深遍历字符串值、SystemMessage
- * 的 prose 与 sections 字符串值（toolsAdded/toolsRemoved 豁免）。
+ * 的 prose 与 sections 字符串值（toolsAdded/toolsRemoved 豁免）、
+ * pi 压缩/分支摘要消息的 summary 字段（掩码压缩后携带还原真值进上下文，
+ * 出站必须重掩码；T6 引入）。
  */
 export function maskMessageTree(messages: AgentMessage[], maskText: TextMasker): void {
 	for (const message of messages) {
@@ -100,6 +102,16 @@ export function maskMessageTree(messages: AgentMessage[], maskText: TextMasker):
 					} else if (block.type === "toolCall") {
 						maskJsonStrings(block.arguments, maskText);
 					}
+				}
+				break;
+			}
+			case "compactionSummary":
+			case "branchSummary": {
+				// 结构式访问：pi 经 CustomAgentMessages 注入的压缩/分支摘要消息，
+				// summary 是进 LLM 上下文的 prose（convertToLlm 展开为 user 文本）
+				const summary = (message as { summary?: unknown }).summary;
+				if (typeof summary === "string") {
+					(message as { summary: string }).summary = maskText(summary);
 				}
 				break;
 			}
