@@ -69,6 +69,30 @@ describe("redactText", () => {
 		expect(() => redactText(text, [spanIn(text, SECRET2, "unknown")], templates)).toThrow(/unknown/);
 	});
 
+	describe("注入伪值签发器", () => {
+		test("issuePlaceholder 覆盖默认哈希签发(注册表层碰撞兜底的注入点)", () => {
+			const text = `keys ${SECRET} and ${SECRET2}`;
+			const issued = new Map<string, string>([
+				[SECRET, "sk-COLLIDED"],
+			[SECRET2, "sk-COLLIDEDx"],
+			]);
+			const { text: out, replacements } = redactText(
+				text,
+				[spanIn(text, SECRET, "openai"), spanIn(text, SECRET2, "openai")],
+				templates,
+				{ hashLength: undefined, issuePlaceholder: (secret) => issued.get(secret)! },
+			);
+			expect(out).toBe("keys sk-COLLIDED and sk-COLLIDEDx");
+			expect(replacements.map((r) => r.placeholder)).toEqual(["sk-COLLIDED", "sk-COLLIDEDx"]);
+		});
+
+		test("缺省注入时行为不变(仍走 makePlaceholder 确定性哈希)", () => {
+			const text = `key ${SECRET}`;
+			const { text: out } = redactText(text, [spanIn(text, SECRET, "openai")], templates, {});
+			expect(out).toBe("key sk-GYY3L4LYIDPR");
+		});
+	});
+
 	test("替换只动 span 区间,前后文及句读不动", () => {
 		const text = `My key: ${SECRET}.`;
 		const { text: out } = redactText(text, [spanIn(text, SECRET, "openai")], templates);
