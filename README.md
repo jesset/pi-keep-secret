@@ -76,7 +76,7 @@ const factory = createEgressMaskingExtension({
 
 - 管线：`detectRegexSpans`（T1）→ 注册表层幂等过滤（命中文本已是伪值则跳过，防嵌套 mask）→ `redactText` 注入注册表签发器（确定性伪值 + 碰撞 x 后缀兜底 + LRU 写入）。
 - 遍历（笔记 §2）：user（string/text 块）、toolResult text 块、assistant 的 text/thinking/toolCall.arguments 深遍历、system 的 prose 与 sections 字符串值；豁免 ImageContent.data、*Signature、id/name/role/type、toolsAdded/toolsRemoved、nestedCalls、argumentsError、toolResult.details。
-- 内置默认检测器：openai-key（`sk-`，排除 `sk-ant-`）、github-pat（`ghp_`）、aws-access-key-id（`AKIA`+16）、google-api-key（`AIza`+35）、slack-bot-token（`xoxb-`）；PEM/JWT 留待 T4 配置化与 T5 judge。
+- 内置默认检测器：openai-key（`sk-`，排除 `sk-ant-`）、github-pat（`ghp_`）、aws-access-key-id（`AKIA`+16）、google-api-key（`AIza`+35）、slack-bot-token（`xoxb-`）；PEM/JWT 已由 T4 补入默认集（见 T4 节）。
 - 伪值注册表（`createPlaceholderRegistry`，会话生命周期闭包状态，供 T3/T5 共用）：`issue(secret, template)`（幂等，写入刷新 LRU，碰撞 x 后缀）、`has`/`get`（幂等过滤/还原查值）、`snapshot()`（T3 还原 tokens 副本）、`size`/`clear`。
 
 ### T2 事实发现（后续 ticket 注意）
@@ -113,6 +113,67 @@ const compose = (pi: ExtensionAPI): void => {
 - 扩展加载顺序：`extensionPaths` 先于 `extensionFactories`（inline）注册，同一事件的处理器按此顺序链式传递（message_end 的替换消息会传给后续处理器）。
 - faux 供应商会别掉助手文本的行首空格（测试脚本避免行首空格这种无关变量）。
 
+## 检测器 JSON 配置 + clean cache（T4，issue #6）
+
+代码：`src/config/`（loader/extension）+ `src/cache/`（clean-cache）；验收用例：`test/config-cache.test.ts`（接缝 1）、`src/config/loader.test.ts`、`src/cache/clean-cache.test.ts`、`src/masking/detectors.test.ts`（接缝 2）。
+
+### 配置 schema 与路径解析
+
+配置文件是 JSON 对象，未知键（含拼写错误）一律报错，防 typo 静默失效：
+
+```json
+{
+  "detectors": [
+    { "name": "corp-api-key", "pattern": "corp-[A-Za-z0-9]{20,}",
+      "redactTemplate": "corp-{hash}" }
+  ],
+  "hashLength": 20,
+  "cleanCache": { "limit": 20000, "ttlMs": 86400000 }
+}
+```
+
+- `detectors`：检测器列表（`name`/`pattern`/`redactTemplate`，模板缺省 `{hash}`；`{hash}` 可多次出现保持形状，如 JWT `"eyJ{hash}.{hash}.{hash}"`）。**整体替换**内置默认集（对齐参考实现 secret_detectors 语义）；空列表非法（防止意外关掉全部本地检测）。
+- `hashLength`：伪值哈希段长度，整数 1..52（base32(sha256) 长度），缺省 12。
+- `cleanCache`：`limit`/`ttlMs` 调参，缺省 20000 / 24h。
+- 路径解析优先级：显式参数 > 环境变量 `PI_KEEP_SECRET_CONFIG` > 默认 `~/.pi/agent/extensions/pi-keep-secret/config.json`。
+- 文件不存在 → 内置默认集、无错误；任何非法（读失败/JSON 解析/schema/regex 编译）→ `ResolvedConfig.errors` 可见 + **整体回退**内置默认集（全有或全无）。配置错误的 pi 侧可见性：首个请求起经 `ctx.ui.notify(..., "error")` 逐条上报（TUI 可见；print/RPC 无 UI 时错误仍可从 `loader.get().errors` 读出，T7 status 展示）。
+
+### 加载与热重载接口（load/reload/订阅）
+
+```ts
+import { createConfigLoader, createConfiguredMaskingExtension } from "./src/config/index.ts";
+
+// 纯 loader：load（创建即加载）/ reload（重读磁盘，内容变更才通知订阅者）
+const loader = createConfigLoader({ path?: string });
+loader.get();          // ResolvedConfig { path, exists, detectors, hashLength?, cleanCache?, errors }
+loader.reload();       // 重读并返回；指纹变更时同步通知订阅者
+loader.subscribe(fn);  // 订阅变更，返回解绑（订阅不回放当前值）
+
+// 配置化组合（正式入口 extension/index.ts 的装配方式；合并 T3/T6 后与回程还原、掩码压缩
+// 共享同一管线：const { factory, loader, pipeline } = createConfiguredMaskingExtension(...)
+const { factory, loader, pipeline } = createConfiguredMaskingExtension({ configPath?, cleanCache?, registry? });
+```
+
+- 热重载语义：`reload()` 后检测器集变更**即时生效**（重编译 + 清空 clean cache——检测器集变更后旧的干净判定不再可信，验收用例锚定防泄漏）；`hashLength`/`cleanCache` 变更仅新会话生效（伪值注册表与缓存参数在工厂创建时定格）。T7 的 `/keep-secret reload` 直接调 `loader.reload()`。
+- 配置解析出的 `detectors` 即引擎 `RegexDetectorSpec[]`（`redactTemplate` 映射为 `template`），可直接喂 `createEgressMaskingExtension`。
+
+### clean cache
+
+- `createCleanCache({ limit=20000, ttlMs=24h, now })`：sha256(文本) → 过期时刻，写时刷新 LRU 位序、命中不续期（对齐参考实现 OrderedDict 语义）；`isClean`/`remember({ hasSecret })`/`stats()/clear()`。
+- 挂接在掩码管线检测入口（`createMaskingPipeline` 的 maskText，出站钩子与掩码压缩共用）：`isClean` 未命中才执行检测，干净结论入缓存——第二轮请求同历史消息不再重复检测（每轮成本 O(新增消息)），含 secret 的文本永不缓存、每轮重扫；`stats().misses` 即实际检测次数（验收「检测计数」断言口径，`hits` 为缓存短路次数）。热应用入口 `pipeline.applyDetectors(specs)`（重编译 + 清空缓存）。
+- `ScanOutcome.hasSecret` 是语义位预留：T5 judge gate 命中同样置 true（不缓存、每轮重扫）。
+
+### 内置默认检测器集（T4 补全）
+
+- 新增 `pem-private-key`（多行 `-----BEGIN [A-Z]+ )?PRIVATE KEY-----` 块，含 RSA/EC/DSA/OPENSSH/ENCRYPTED 变体，伪值仍是合法形状的 PEM 块）与 `jwt`（`eyJ` 三段 base64url，每段 ≥10 字符，两段截断不命中；伪值 `eyJ{hash}.{hash}.{hash}` 三段保持 JWT 形状）。
+- 引擎 `makePlaceholder` 改为 `replaceAll("{hash}")`：模板中多个 `{hash}` 均替换为同一哈希段（单段模板行为不变）。
+
+### T4 事实发现（后续 ticket 注意）
+
+- 同会话内 system 消息文本叶跨轮字节稳定（实测锚定）——clean cache 的检测计数断言因此可精确到「第二轮只检测新增文本」（system + 历史 user 各叶全部命中缓存）。
+- 正式入口的默认导出从 `createEgressMaskingExtension()` 求值改为传函数本身：环境变量在每次扩展装配时读取（模块缓存不影响按会话指向不同配置文件）。
+- `test/egress-masking.test.ts` 钉扎 `PI_KEEP_SECRET_CONFIG` 指向确定不存在的路径，保证默认集用例不受机器上真实 `~/.pi` 配置影响（测试一律不触真实 `~/.pi` 路径）。
+- `ctx.ui.notify` 在无 UI 模式（print/RPC）是 no-op：配置错误在无 UI 环境只经 `loader.get().errors` 可见，T7 status 负责展示。
 ## 掩码压缩（T6，issue #8）
 
 代码：`src/compaction/`（extension/prompts）；验收用例：`test/compaction.test.ts`（接缝 1）。
