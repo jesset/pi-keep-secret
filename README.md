@@ -145,6 +145,20 @@ const compose = (pi: ExtensionAPI): void => {
 - `SettingsManager.inMemory(partial)` 可注入 `compaction.keepRecentTokens`/`reserveTokens`，harness 以此驱动手动/阈值压缩；keepRecentTokens 必须小于会话尾部 token 量，否则 `prepareCompaction` 返回 undefined（"Nothing to compact"）。
 - `bashExecution`/`custom` 自定义消息（`!命令` 等）尚未在出站遍历器覆盖（T2 既有缺口，与压缩无关；待后续 ticket 处理）。
 
+## System One judge（T5，issue #7）
+
+- 适配器 `createSystemOneJudge`（`src/judge/system-one.ts`）：classify 通道注入（`ClassifyFn`）——扩展层绑 `ctx.modelRegistry.classify`，纯逻辑测试注入进程内假函数。两阶段：gate 单 bool 问（阈值 0.5）低短路 → 候选批量逐个 bool 问（阈值 0.7）；128 问/批拆批全覆盖，仅超 8 批才截断保最长（`truncatedCandidates` 计数，gate 零定位不升级）；超长文本 24000/块、重叠 min(2000, maxChars/4)；全部 classify 调用走会话级共享 FIFO 信号量（默认 8 路，消息级并发安全）。
+- fail_closed：`classify` never-rejects，错误在 `stopReason`。gate 故障 → 该块候选全掩且不追加注定失败的候选批；候选批故障 → 该批全掩、其余批判定结论照常采纳；stop 结果缺应答的候选视为未验证一并掩（≠「判定非凭据」丢弃）。真值由共享注册表保留，本地可恢复。
+- 出站扩展 `createJudgeEgressExtension`（`src/judge/extension.ts`）：注册 `context_with_system`，必须先于 regex 出站扩展（判定需要原文；regex 层幂等跳过已签发伪值）。命中 span 掩码为 `key-{hash}` 确定性伪值（与出站/回程/压缩同一注册表）。
+- classifier 模型解析：配置引用 `{provider, modelId}` → `ctx.modelRegistry.findOfType("classifier", ...)`（T4 JSON 配置合入前由装配方显式传 modelRef；正式组合接线在 T4/T8 落地）。模型缺失 → 显式降级而非静默：notify 一次 + 状态栏标记 + `JudgeStatus` 每请求计数（无 UI 模式仅计数），出站仅 regex 层工作。
+- 与 T4 clean cache 协同（接口预留）：`JudgeVerdict.clean`（零命中、零 gate 命中、零 fail_closed 才为 true）；命中/gate 命中/故障文本均不可缓存 clean，T4 合入后在扩展层接缓存查询。
+
+### 假 classifier 方案（三层验证）
+
+1. **适配器纯替身**（`src/judge/system-one.test.ts`）：进程内假 classify 按问题 id 应答，概率脚本锚定真实网关实测校准数字（密码 0.96 / 订单号 0.04 / gate 0.98），同时记录全部调用锚定两阶段形态。
+2. **harness 注入点**（`test/judge-egress.test.ts`，接缝 1）：扩展工厂的 `resolveModel`/`classify` 选项挂进程内替身，驱动完整钩子链（judge → regex 串联、降级、fail_closed 全链路）；模型缺失用例走缺省 `findOfType` 路径（harness 注册表无该模型）。
+3. **真实网关验证**（`research/systemone-gateway.test.ts`）：默认跳过，三个环境变量齐备才启用（`PI_KEEP_SECRET_JUDGE_BASE_URL`/`_MODEL`/`_API_KEY`；凭据仅环境变量，严禁入库）；直接 POST 线缆级 noul 问题断言校准锚点区间。
+
 ## 约定
 
 - Conventional Commits；分支 `ticket/<n>-<slug>`（每张 ticket 在自己的 worktree 基于 `feat/secret-masking`）。合并到 main 需用户明示许可。
