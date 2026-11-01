@@ -75,7 +75,7 @@ function buildStatusReport(options: KeepSecretCommandsOptions): string {
 	const config = options.loader.get();
 	const lines: string[] = [
 		"pi-keep-secret 状态",
-		`检测器：${config.detectors.length} 个，来源：${describeConfigSource(options.loader)}`,
+		`检测器：${config.detectors.length} 个（模式：${config.detectorsMode}），来源：${describeConfigSource(options.loader)}`,
 		`  名称：${config.detectors.map((d) => d.name).join(", ")}`,
 		`伪值注册表：${options.pipeline.registry.size} 条`,
 	];
@@ -192,7 +192,7 @@ async function buildSelfTestReport(
 		options.judge.status.degradedTexts > 0 &&
 		!allPassed
 	) {
-		lines.push("注意：judge 已降级（classifier 模型不可用，仅 regex 检测层工作）——假密码项未通过即降级信号");
+		lines.push("注意：judge 已降级（classifier 模型不可用或 judge.api 与模型注册 api 不一致，仅 regex 检测层工作）——假密码项未通过即降级信号");
 	}
 	if (failClosedNoModel) {
 		lines.push(

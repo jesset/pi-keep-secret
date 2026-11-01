@@ -211,6 +211,37 @@ describe("T7 /keep-secret 状态面板", () => {
 		}
 	});
 
+	test("状态面显示 detectorsMode 与生效检测器数（T13：merge 计数含内置+新增）", async () => {
+		// replace（缺省）：用户集整体替换，1 个
+		const replaceText = await runCommand(
+			makeCommands(
+				JSON.stringify({
+					detectors: [
+						{ name: "corp-api-key", pattern: "corp-[A-Za-z0-9]{20,}", redactTemplate: "corp-{hash}" },
+					],
+				}),
+			).commands,
+			"",
+		);
+		expect(replaceText).toMatch(/检测器：1 个（模式：replace）/);
+
+		// merge：内置 7（同名 openai-key 被覆盖仍在原位）+ 新增 corp，共 8 个
+		const mergeText = await runCommand(
+			makeCommands(
+				JSON.stringify({
+					detectorsMode: "merge",
+					detectors: [
+						{ name: "openai-key", pattern: "sk-live-[A-Za-z0-9_-]{20,}", redactTemplate: "key-{hash}" },
+						{ name: "corp-api-key", pattern: "corp-[A-Za-z0-9]{20,}", redactTemplate: "corp-{hash}" },
+					],
+				}),
+			).commands,
+			"",
+		);
+		expect(mergeText).toMatch(/检测器：8 个（模式：merge）/);
+		expect(mergeText).toContain("corp-api-key");
+	});
+
 	test("注入状态对象：压缩取消与 judge 计数展示（已判定/截断/fail-closed/降级）", async () => {
 		const made = makeCommands();
 		made.compaction.cancellations = 2;

@@ -11,15 +11,20 @@
  *   "hashLength": 20,
  *   "cleanCache": { "limit": 20000, "ttlMs": 86400000 },
  *   "judge": { "provider": "litellm", "modelId": "typesafe/jev-latest",
- *             "onMissing": "fail_closed" }
+ *             "onMissing": "fail_closed", "api": "systemone" }
  * }
  * ```
- * - `detectors` **整体替换**内置默认集（对齐参考实现 secret_detectors
- *   语义，用户故事 30「tune detectors」）；`redactTemplate` 映射为引擎
- *   RegexDetectorSpec.template，产物可直接喂 createEgressMaskingExtension。
+ * - `detectors` 装配语义由 `detectorsMode`（T13，默认 replace）决定：
+ *   replace——整体替换内置默认集（对齐参考实现 secret_detectors 语义，
+ *   用户故事 30「tune detectors」）；merge——内置集 + 用户项合并，同名
+ *   用户项原位覆盖内置（可微调 pattern/redactTemplate），非同名项追加
+ *   在内置之后。`redactTemplate` 映射为引擎 RegexDetectorSpec.template，
+ *   产物可直接喂 createEgressMaskingExtension。
  * - `judge`（T8 正式接线）：System One 判定检测器配置——provider/modelId
- *   必填 + 阈值/批参/并发/伪值模板/onMissing 策略可调；未配置即不接入
- *   judge（仅 regex 检测层）。模型缺失时按 onMissing 处理（默认
+ *   必填 + 阈值/批参/并发/伪值模板/onMissing 策略可调（T14 起另有 api
+ *   线缆协议提示：systemone|decisions，缺省跟随模型注册条目的 api 字段，
+ *   填写则装配处比对一致性，见 JudgeApi）；未配置即不接入 judge
+ *   （仅 regex 检测层）。模型缺失时按 onMissing 处理（默认
  *   fail_closed——未验证候选一律掩码；regex_only——降级仅 regex 层，
  *   见 src/judge/extension.ts 与 JudgeOnMissing）。
  *   judge 段变更与 hashLength/cleanCache 同语义：仅新会话生效（会话内
@@ -47,6 +52,14 @@ export function defaultConfigPath(): string {
 	return join(homedir(), ".pi", "agent", "extensions", "pi-keep-secret", "config.json");
 }
 
+/**
+ * 检测器策略开关（ticket #13 / T13）：replace（默认）——用户 detectors
+ * 整体替换内置默认集（现行为）；merge——内置默认集 + 用户 detectors
+ * 合并，同名用户项覆盖对应内置项（允许微调 pattern/redactTemplate），
+ * 非同名项追加在内置之后（内置序保持在前）。
+ */
+export type DetectorsMode = "replace" | "merge";
+
 /** clean cache 调参（缺省项由 createCleanCache 的默认值兜底）。 */
 export interface CleanCacheConfig {
 	/** 容量上限（默认 20000）。 */
@@ -61,6 +74,15 @@ export interface CleanCacheConfig {
  * （显式知情选择）——降级仅 regex 检测层（文本原样放行 + 可见计数）。
  */
 export type JudgeOnMissing = "fail_closed" | "regex_only";
+
+/**
+ * judge 判定线缆协议提示（T14，ticket #14）：systemone——pi-ai
+ * `typesafe-system-one`（POST <baseUrl>/systemone，bool→noul）；
+ * decisions——pi-ai `openai-decisions`（POST <baseUrl>/decisions，
+ * bool→predicate、criteria 折进 instructions、state 为 JSON 文本）。
+ * 两种协议同一 LiteLLM 网关后端路由，baseUrl 都配 `https://<host>/v1`。
+ */
+export type JudgeApi = "systemone" | "decisions";
 
 /**
  * judge（T5 System One 判定检测器）配置段（T8 正式接线）：未配置即
@@ -90,6 +112,13 @@ export interface JudgeConfig {
 	redactTemplate?: string;
 	/** classifier 模型缺失策略，默认 fail_closed（见 JudgeOnMissing）。 */
 	onMissing?: JudgeOnMissing;
+	/** 判定线缆协议提示（见 JudgeApi）。缺省 undefined 跟随模型注册条目
+	 *  的 api 字段（不校验）；填写则装配时与模型注册 api 比对一致性
+	 *  （typesafe-system-one↔systemone、openai-decisions↔decisions，见
+	 *  src/judge/extension.ts 的 MODEL_API_BY_JUDGE_API）——不一致按配置
+	 *  错误处理：不装配 judge、仅 regex 层、错误可见。分工：loader 只校验
+	 *  合法值，装配处比对并报错。 */
+	api?: JudgeApi;
 }
 
 /** 一次加载的解析结果（错误非空时 detectors 为内置默认集回退）。 */
@@ -98,8 +127,10 @@ export interface ResolvedConfig {
 	path: string;
 	/** 配置文件是否存在。 */
 	exists: boolean;
-	/** 生效检测器 specs（可直接喂 createEgressMaskingExtension）。 */
+	/** 生效检测器 specs（可直接喂 createEgressMaskingExtension；装配语义见 detectorsMode）。 */
 	detectors: RegexDetectorSpec[];
+	/** 检测器策略开关（replace 整体替换 / merge 同名覆盖合并；缺省与回退均为 replace）。 */
+	detectorsMode: DetectorsMode;
 	/** 伪值哈希段长度；未配置为 undefined（引擎默认 12）。 */
 	hashLength?: number;
 	/** clean cache 调参；未配置为 undefined（默认 20000/24h）。 */
@@ -115,7 +146,7 @@ function defaultDetectors(): RegexDetectorSpec[] {
 	return DEFAULT_DETECTOR_SPECS.map((spec) => ({ ...spec }));
 }
 
-const ROOT_KEYS = new Set(["detectors", "hashLength", "cleanCache", "judge"]);
+const ROOT_KEYS = new Set(["detectors", "detectorsMode", "hashLength", "cleanCache", "judge"]);
 const DETECTOR_KEYS = new Set(["name", "pattern", "redactTemplate"]);
 const CLEAN_CACHE_KEYS = new Set(["limit", "ttlMs"]);
 const JUDGE_KEYS = new Set([
@@ -130,6 +161,7 @@ const JUDGE_KEYS = new Set([
 	"concurrency",
 	"redactTemplate",
 	"onMissing",
+	"api",
 ]);
 /** base32(sha256) 无 padding 共 52 字符，哈希段长度上限由此决定。 */
 const MAX_HASH_LENGTH = 52;
@@ -153,6 +185,7 @@ function isProbability(value: unknown): value is number {
  */
 function validateConfig(json: unknown): {
 	detectors?: RegexDetectorSpec[];
+	detectorsMode?: DetectorsMode;
 	hashLength?: number;
 	cleanCache?: CleanCacheConfig;
 	judge?: JudgeConfig;
@@ -225,6 +258,15 @@ function validateConfig(json: unknown): {
 			if (errors.length === 0) {
 				detectors = specs;
 			}
+		}
+	}
+
+	let detectorsMode: DetectorsMode | undefined;
+	if (json.detectorsMode !== undefined) {
+		if (json.detectorsMode !== "replace" && json.detectorsMode !== "merge") {
+			errors.push('detectorsMode must be "replace" or "merge"');
+		} else {
+			detectorsMode = json.detectorsMode;
 		}
 	}
 
@@ -325,6 +367,14 @@ function validateConfig(json: unknown): {
 				errors.push('judge.onMissing must be "fail_closed" or "regex_only"');
 				valid = false;
 			}
+			if (
+				section.api !== undefined &&
+				section.api !== "systemone" &&
+				section.api !== "decisions"
+			) {
+				errors.push('judge.api must be "systemone" or "decisions"');
+				valid = false;
+			}
 			if (valid) {
 				judge = {
 					provider: section.provider as string,
@@ -338,6 +388,7 @@ function validateConfig(json: unknown): {
 					concurrency: section.concurrency as number | undefined,
 					redactTemplate: section.redactTemplate as string | undefined,
 					onMissing: section.onMissing as JudgeOnMissing | undefined,
+					api: section.api as JudgeApi | undefined,
 				};
 			}
 		}
@@ -345,7 +396,27 @@ function validateConfig(json: unknown): {
 
 	return errors.length > 0
 		? { errors }
-		: { detectors, hashLength, cleanCache, judge, errors };
+		: { detectors, detectorsMode, hashLength, cleanCache, judge, errors };
+}
+
+/**
+ * 生效检测器集装配（T13）：detectors 未配置时两种模式均等价纯内置集；
+ * replace——用户集整体替换；merge——内置序在前（同名用户项原位覆盖，
+ * 仅 pattern/redactTemplate 微调生效），非同名用户项追加在后。
+ */
+function effectiveDetectors(mode: DetectorsMode, detectors?: RegexDetectorSpec[]): RegexDetectorSpec[] {
+	if (detectors === undefined) {
+		return defaultDetectors();
+	}
+	if (mode === "replace") {
+		return detectors;
+	}
+	const overrides = new Map(detectors.map((spec) => [spec.name, spec]));
+	const builtinNames = new Set(DEFAULT_DETECTOR_SPECS.map((spec) => spec.name));
+	return [
+		...DEFAULT_DETECTOR_SPECS.map((spec) => overrides.get(spec.name) ?? { ...spec }),
+		...detectors.filter((spec) => !builtinNames.has(spec.name)),
+	];
 }
 
 /** 从磁盘读取并解析一次配置（错误都落 errors，绝不抛出）。 */
@@ -356,12 +427,13 @@ function loadFromDisk(path: string): ResolvedConfig {
 	} catch (error) {
 		const notFound = error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT";
 		if (notFound) {
-			return { path, exists: false, detectors: defaultDetectors(), errors: [] };
+			return { path, exists: false, detectors: defaultDetectors(), detectorsMode: "replace", errors: [] };
 		}
 		return {
 			path,
 			exists: false,
 			detectors: defaultDetectors(),
+			detectorsMode: "replace",
 			errors: [`failed to read config file: ${error instanceof Error ? error.message : String(error)}`],
 		};
 	}
@@ -374,18 +446,21 @@ function loadFromDisk(path: string): ResolvedConfig {
 			path,
 			exists: true,
 			detectors: defaultDetectors(),
+			detectorsMode: "replace",
 			errors: [`invalid JSON: ${error instanceof Error ? error.message : String(error)}`],
 		};
 	}
 
 	const validated = validateConfig(json);
 	if (validated.errors.length > 0) {
-		return { path, exists: true, detectors: defaultDetectors(), errors: validated.errors };
+		return { path, exists: true, detectors: defaultDetectors(), detectorsMode: "replace", errors: validated.errors };
 	}
+	const detectorsMode = validated.detectorsMode ?? "replace";
 	return {
 		path,
 		exists: true,
-		detectors: validated.detectors ?? defaultDetectors(),
+		detectors: effectiveDetectors(detectorsMode, validated.detectors),
+		detectorsMode,
 		hashLength: validated.hashLength,
 		cleanCache: validated.cleanCache,
 		judge: validated.judge,
@@ -398,6 +473,7 @@ export function configFingerprint(config: ResolvedConfig): string {
 	return JSON.stringify([
 		config.exists,
 		config.detectors,
+		config.detectorsMode,
 		config.hashLength,
 		config.cleanCache,
 		config.judge,
