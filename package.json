@@ -16,5 +16,10 @@
   "trustedDependencies": [
     "@google/genai",
     "protobufjs"
-  ]
+  ],
+  "pi": {
+    "extensions": [
+      "extension/index.ts"
+    ]
+  }
 }

@@ -85,6 +85,11 @@ export interface JudgeEgressOptions extends Omit<SystemOneJudgeOptions, "classif
 	resolveModel?: ModelResolver;
 	/** classify 通道注入点（测试替身）。 */
 	classify?: ClassifyChannel;
+	/**
+	 * 复用既有掩码器（T8 组合根与命令面共享同一实例/状态时传入；
+	 * 提供时本扩展直接使用它，其余 judge 选项由掩码器创建方 consumed）。
+	 */
+	masker?: JudgeTextMasker;
 }
 
 const defaultResolveModel: ModelResolver = (ctx, ref) =>
@@ -127,12 +132,22 @@ export function createJudgeTextMasker(options: JudgeEgressOptions): JudgeTextMas
 
 	const mask = async (text: string, ctx: ExtensionContext): Promise<string> => {
 		if (judge === undefined) {
-			const model = (options.resolveModel ?? defaultResolveModel)(ctx, modelRef);
+			let model: ClassifierModel<ClassifierApi> | undefined;
+			let resolutionError: string | undefined;
+			try {
+				model = (options.resolveModel ?? defaultResolveModel)(ctx, modelRef);
+			} catch (error) {
+				// 解析通道异常与模型缺失同语义：降级（不静默、不中断掩码链）
+				resolutionError = `classifier 模型解析失败：${
+					error instanceof Error ? error.message : String(error)
+				}`;
+			}
 			if (model === undefined) {
 				// 模型缺失：显式降级（计数、告警一次），文本原样放行，后置 regex
 				// 出站扩展继续工作；墓碑防 judge 恢复后被 clean cache 短路
 				status.degradedTexts += 1;
-				status.lastResolutionError = `classifier 模型未注册：${modelRef.provider}/${modelRef.modelId}`;
+				status.lastResolutionError =
+					resolutionError ?? `classifier 模型未注册：${modelRef.provider}/${modelRef.modelId}`;
 				pipeline.cleanCache.remember(text, { hasSecret: true });
 				if (!notifiedModelMissing) {
 					notifiedModelMissing = true;
@@ -199,7 +214,7 @@ export function createJudgeTextMasker(options: JudgeEgressOptions): JudgeTextMas
 
 /** 创建 judge 出站扩展（ExtensionFactory）。模型解析失败不抛错——降级仅 regex 层。 */
 export function createJudgeEgressExtension(options: JudgeEgressOptions) {
-	const masker = createJudgeTextMasker(options);
+	const masker = options.masker ?? createJudgeTextMasker(options);
 	return (pi: ExtensionAPI): void => {
 		pi.on("context_with_system", async (event, ctx) => {
 			await maskMessageTreeAsync(event.messages, (text) => masker.mask(text, ctx));
