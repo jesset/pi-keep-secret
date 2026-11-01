@@ -1,0 +1,25 @@
+{
+  "name": "pi-keep-secret",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Transparent egress secret masking for pi sessions (extension)",
+  "scripts": {
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "1.4.0",
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@types/bun": "^1.4.4"
+  },
+  "trustedDependencies": [
+    "@google/genai",
+    "protobufjs"
+  ],
+  "pi": {
+    "extensions": [
+      "extension/index.ts"
+    ]
+  }
+}
