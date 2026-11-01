@@ -75,7 +75,7 @@ function buildStatusReport(options: KeepSecretCommandsOptions): string {
 	const config = options.loader.get();
 	const lines: string[] = [
 		"pi-keep-secret 状态",
-		`检测器：${config.detectors.length} 个，来源：${describeConfigSource(options.loader)}`,
+		`检测器：${config.detectors.length} 个（模式：${config.detectorsMode}），来源：${describeConfigSource(options.loader)}`,
 		`  名称：${config.detectors.map((d) => d.name).join(", ")}`,
 		`伪值注册表：${options.pipeline.registry.size} 条`,
 	];
