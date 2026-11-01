@@ -11,7 +11,7 @@
  *   "hashLength": 20,
  *   "cleanCache": { "limit": 20000, "ttlMs": 86400000 },
  *   "judge": { "provider": "litellm", "modelId": "typesafe/jev-latest",
- *             "onMissing": "fail_closed" }
+ *             "onMissing": "fail_closed", "api": "systemone" }
  * }
  * ```
  * - `detectors` **整体替换**内置默认集（对齐参考实现 secret_detectors
@@ -63,6 +63,15 @@ export interface CleanCacheConfig {
 export type JudgeOnMissing = "fail_closed" | "regex_only";
 
 /**
+ * judge 判定线缆协议提示（T14，ticket #14）：systemone——pi-ai
+ * `typesafe-system-one`（POST <baseUrl>/systemone，bool→noul）；
+ * decisions——pi-ai `openai-decisions`（POST <baseUrl>/decisions，
+ * bool→predicate、criteria 折进 instructions、state 为 JSON 文本）。
+ * 两种协议同一 LiteLLM 网关后端路由，baseUrl 都配 `https://<host>/v1`。
+ */
+export type JudgeApi = "systemone" | "decisions";
+
+/**
  * judge（T5 System One 判定检测器）配置段（T8 正式接线）：未配置即
  * 不接入 judge（仅 regex 检测层）；配置后 provider/modelId 必填。
  * 模型缺失时按 onMissing 策略处理（默认 fail_closed，见 JudgeOnMissing）。
@@ -90,6 +99,13 @@ export interface JudgeConfig {
 	redactTemplate?: string;
 	/** classifier 模型缺失策略，默认 fail_closed（见 JudgeOnMissing）。 */
 	onMissing?: JudgeOnMissing;
+	/** 判定线缆协议提示（见 JudgeApi）。缺省 undefined 跟随模型注册条目
+	 *  的 api 字段（不校验）；填写则装配时与模型注册 api 比对一致性
+	 *  （typesafe-system-one↔systemone、openai-decisions↔decisions，见
+	 *  src/judge/extension.ts 的 MODEL_API_BY_JUDGE_API）——不一致按配置
+	 *  错误处理：不装配 judge、仅 regex 层、错误可见。分工：loader 只校验
+	 *  合法值，装配处比对并报错。 */
+	api?: JudgeApi;
 }
 
 /** 一次加载的解析结果（错误非空时 detectors 为内置默认集回退）。 */
@@ -130,6 +146,7 @@ const JUDGE_KEYS = new Set([
 	"concurrency",
 	"redactTemplate",
 	"onMissing",
+	"api",
 ]);
 /** base32(sha256) 无 padding 共 52 字符，哈希段长度上限由此决定。 */
 const MAX_HASH_LENGTH = 52;
@@ -325,6 +342,14 @@ function validateConfig(json: unknown): {
 				errors.push('judge.onMissing must be "fail_closed" or "regex_only"');
 				valid = false;
 			}
+			if (
+				section.api !== undefined &&
+				section.api !== "systemone" &&
+				section.api !== "decisions"
+			) {
+				errors.push('judge.api must be "systemone" or "decisions"');
+				valid = false;
+			}
 			if (valid) {
 				judge = {
 					provider: section.provider as string,
@@ -338,6 +363,7 @@ function validateConfig(json: unknown): {
 					concurrency: section.concurrency as number | undefined,
 					redactTemplate: section.redactTemplate as string | undefined,
 					onMissing: section.onMissing as JudgeOnMissing | undefined,
+					api: section.api as JudgeApi | undefined,
 				};
 			}
 		}
