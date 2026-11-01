@@ -86,7 +86,7 @@ export type ClassifyChannel = (
 export interface JudgeStatus {
 	/** classifier 模型解析失败而降级放行的文本叶数（onMissing=regex_only 时
 	 *  递增；judge.api 与模型注册 api 不一致的配置错误降级同样递增——
-	 *  两部都是 judge 层不工作、文本交后置 regex 层）。 */
+	 *  两者都是 judge 层不工作、文本交后置 regex 层）。 */
 	degradedTexts: number;
 	/** 最近一次模型解析/协议一致性失败原因（降级与 fail_closed 两路径都记录）。 */
 	lastResolutionError: string | undefined;
