@@ -75,7 +75,7 @@ const factory = createEgressMaskingExtension({
 ```
 
 - 管线：`detectRegexSpans`（T1）→ 注册表层幂等过滤（命中文本已是伪值则跳过，防嵌套 mask）→ `redactText` 注入注册表签发器（确定性伪值 + 碰撞 x 后缀兜底 + LRU 写入）。
-- 遍历（笔记 §2）：user（string/text 块）、toolResult text 块、assistant 的 text/thinking/toolCall.arguments 深遍历、system 的 prose 与 sections 字符串值；豁免 ImageContent.data、*Signature、id/name/role/type、toolsAdded/toolsRemoved、nestedCalls、argumentsError、toolResult.details。
+- 遍历（笔记 §2）：user（string/text 块）、toolResult text 块、assistant 的 text/thinking/toolCall.arguments 深遍历、system 的 prose 与 sections 字符串值、bashExecution 的 command/output 与 custom 消息的 content（两者经 pi convertToLlm 投影为 user 文本进模型上下文；custom 的 details 不进上下文不动）；豁免 ImageContent.data、*Signature、id/name/role/type、toolsAdded/toolsRemoved、nestedCalls、argumentsError、toolResult.details。
 - 内置默认检测器：openai-key（`sk-`，排除 `sk-ant-`）、github-pat（`ghp_`）、aws-access-key-id（`AKIA`+16）、google-api-key（`AIza`+35）、slack-bot-token（`xoxb-`）；PEM/JWT 已由 T4 补入默认集（见 T4 节）。
 - 伪值注册表（`createPlaceholderRegistry`，会话生命周期闭包状态，供 T3/T5 共用）：`issue(secret, template)`（幂等，写入刷新 LRU，碰撞 x 后缀）、`has`/`get`（幂等过滤/还原查值）、`snapshot()`（T3 还原 tokens 副本）、`size`/`clear`。
 
@@ -181,7 +181,7 @@ const { factory, loader, pipeline } = createConfiguredMaskingExtension({ configP
 - `session_before_compact` 处理器返回完整 `CompactionResult`，整体替换 pi 自带压缩（manual `/compact`、阈值、overflow 三路径都走此钩子）：preparation 的 messagesToSummarize + turnPrefixMessages → `convertToLlm`（含 branchSummary/compactionSummary 投影）→ 与出站同一掩码管线掩码文本叶 → `serializeConversation` 入摘要提示词 → `ctx.modelRegistry.complete`（当前会话模型）摘要 → 摘要文本按注册表还原 → `{ compaction: { summary, firstKeptEntryId, tokensBefore, usage } }`。
 - 摘要提示词对齐 pi 默认（pi 1.4.0 未公开导出提示词常量，按原文复制于 `src/compaction/prompts.ts`，升级时需同步校对）；previousSummary / customInstructions 掩码后入摘要上下文，结果还原。
 - `session_before_tree` 同模式返回 `{ summary: { summary: 还原后文本, usage } }`（entriesToSummarize 经 `prepareBranchEntries` 投影）。
-- 故障策略（ticket 锁定）：摘要调用不可恢复错误（error/length/工具调用/空文本/抛错）→ 返回 undefined 显式回退 pi 默认压缩 + `ctx.ui.notify` 告警 + 状态栏标记 + `MaskedCompactionStatus` 计数（无 UI 模式仅计数）；绝不能静默回退——默认压缩不掩码，摘要模型会看到真值。用户中止（abort）不算回退，返回 `{ cancel: true }`。
+- 故障策略（spec 故事 24：零泄漏）：摘要调用带重试（2 次重试、短退避；用户中止不重试不算失败）；重试仍失败 → 返回 `{ cancel: true }` 取消本次压缩（会话继续不压缩）+ `ctx.ui.notify` 告警与重试建议 + 状态栏标记 + `MaskedCompactionStatus` 计数（无 UI 模式仅计数）。**不存在「回退 pi 默认压缩」路径**——默认压缩不掩码，回退即泄漏。
 - 出站兑底：压缩/分支摘要消息（`compactionSummary`/`branchSummary` 自定义 AgentMessage，携带还原真值）的 `summary` 字段由遍历器掩码（T6 起进入出站覆盖）。
 
 ```ts
@@ -201,10 +201,10 @@ const compose = (pi: ExtensionAPI): void => {
 ### T6 事实发现（后续 ticket 注意）
 
 - 扩展侧 `ctx.modelRegistry` 是同步兼容门面（`ModelRegistry`）：有 `complete`/`streamSimple`，**无** `completeSimple`（那是 `ModelRuntime` 的方法）；掩码摘要走 `ctx.modelRegistry.complete`（请求时认证）。
-- pi 默认压缩自带重试（`retryAssistantCall`）；掩码压缩的单次 `complete` 无重试，瞬时故障即回退（回退可见性弥补）。若需对齐重试语义，后续可在 `requestSummary` 外套重试。
+- pi 默认压缩自带重试（`retryAssistantCall`）；掩码压缩的摘要调用同样带重试（2 次重试、短退避），瞬时故障被吸收；重试仍失败则取消本次压缩（会话继续不压缩），绝不回退不掩码的默认压缩。
 - 压缩后 `firstKeptEntryId` 之前的历史由 compaction 条目替换，投影生成 `compactionSummary` 角色消息（`summary` 字段携带真值），`convertToLlm` 展开为 user 文本——若遍历器不覆盖该角色，压缩后每一轮出站都会泄漏真值（T6 已补，用例锚定）。
 - `SettingsManager.inMemory(partial)` 可注入 `compaction.keepRecentTokens`/`reserveTokens`，harness 以此驱动手动/阈值压缩；keepRecentTokens 必须小于会话尾部 token 量，否则 `prepareCompaction` 返回 undefined（"Nothing to compact"）。
-- `bashExecution`/`custom` 自定义消息（`!命令` 等）尚未在出站遍历器覆盖（T2 既有缺口，与压缩无关；待后续 ticket 处理）。
+- `bashExecution`/`custom` 自定义消息（`!命令`、sendMessage 注入）经 pi `convertToLlm` 投影为 user 文本进 LLM 上下文（`bashExecutionToText` 含 command+output；custom 的 content 直投影）——已在出站遍历器覆盖（T2 补齐，用例锚定；`!!` 前缀的 excludeFromContext 消息不投影，掩码对其无副作用）。
 
 ## 入站预检通知 + /keep-secret 命令面（T7，issue #9）
 
@@ -216,9 +216,9 @@ const compose = (pi: ExtensionAPI): void => {
 
 ### /keep-secret 命令面（三子命令）
 
-- `/keep-secret`（状态）：检测器配置摘要（来源/条数/名列表，含非法配置的错误行与回退标记）、伪值注册表条数、clean cache 条数与命中率（命中 x / 检测 y）、各检测器命中计数（`name=N`）、judge 计数（T8 已接入：配置 judge 段后展示已判定/截断/fail-closed/降级计数，未配置显示「未接入」）、掩码压缩回退计数与最近原因。
-- `/keep-secret test`：合成样本（sk- 假 key、URL 藏 key、假密码、干净订单号）逐项过会话链路（T8 起 judge 启用时经 judge→regex 全链评估，与出站链同序），报告已掩码/未掩码与期望比对；与期望一致为通过，全部通过 info、有未通过 warning。假密码项期望随 judge 是否启用动态化：启用→期望掩码（降级时如实报未通过——降级可见信号）；未启用→期望未掩码（regex 层不命中属预期）。当前配置未覆盖某样本时如实报告未通过。
-- `/keep-secret reload`：调 `loader.reload()`（变更时同步热应用：applyDetectors + 清空缓存）；检测结果经 notify 报告（已热应用/无变更/配置错误回退）。
+- `/keep-secret`（状态）：检测器配置摘要（来源/条数/名列表，含非法配置的错误行与回退标记）、伪值注册表条数、clean cache 条数与命中率（命中 x / 检测 y）、各检测器命中计数（`name=N`）、judge 计数（T8 已接入：配置 judge 段后展示已判定/截断/fail-closed/降级计数与生效的模型缺失策略，未配置显示「未接入」）、掩码压缩取消计数与最近原因。
+- `/keep-secret test`：合成样本（sk- 假 key、URL 藏 key、假密码、干净订单号）逐项过会话链路（T8 起 judge 启用时经 judge→regex 全链评估，与出站链同序），报告已掩码/未掩码与期望比对；与期望一致为通过，全部通过 info、有未通过 warning。假密码项期望随 judge 是否启用动态化：启用→期望掩码（regex_only 降级时如实报未通过——降级可见信号）；未启用→期望未掩码（regex 层不命中属预期）。当前配置未覆盖某样本时如实报告未通过。模型缺失 + fail_closed（默认）生效时全部样本期望掩码（未验证候选一律兑底掩码，含干净订单号）并附说明行。
+- `/keep-secret reload`：调 `loader.reload()`（变更时同步热应用：applyDetectors + 清空缓存）；变更判定与 loader 同口径（`configFingerprint`），结果经 notify 报告（检测器集变更→已热应用 / 检测器集未变但其他段变更（judge/hashLength/cleanCache）→ 已重读且仅新会话生效 / 无变更 / 配置错误回退）。
 - 未知子命令 → 用法提示。
 
 ### 三模式安全降级
@@ -238,10 +238,10 @@ const compose = (pi: ExtensionAPI): void => {
 
 ## System One judge（T5，issue #7）
 
-- 适配器 `createSystemOneJudge`（`src/judge/system-one.ts`）：classify 通道注入（`ClassifyFn`）——扩展层绑 `ctx.modelRegistry.classify`，纯逻辑测试注入进程内假函数。两阶段：gate 单 bool 问（阈值 0.5）低短路 → 候选批量逐个 bool 问（阈值 0.7）；128 问/批拆批全覆盖，仅超 8 批才截断保最长（`truncatedCandidates` 计数，gate 零定位不升级）；超长文本 24000/块、重叠 min(2000, maxChars/4)；全部 classify 调用走会话级共享 FIFO 信号量（默认 8 路，消息级并发安全）。
+- 适配器 `createSystemOneJudge`（`src/judge/system-one.ts`）：classify 通道注入（`ClassifyFn`）——扩展层绑 `ctx.modelRegistry.classify`，纯逻辑测试注入进程内假函数。两阶段：gate 单 bool 问（阈值 0.5）低短路 → 候选批量逐个 bool 问（阈值 0.7）；128 问/批拆批全覆盖，仅超 8 批才截断保最长——丢弃的候选按未验证一律掩码（未验证定义上不该出站）+ `truncatedCandidates` 计数；超长文本 24000/块、重叠 min(2000, maxChars/4)；全部 classify 调用走会话级共享 FIFO 信号量（默认 8 路，消息级并发安全）。
 - fail_closed：`classify` never-rejects，错误在 `stopReason`。gate 故障 → 该块候选全掩且不追加注定失败的候选批；候选批故障 → 该批全掩、其余批判定结论照常采纳；stop 结果缺应答的候选视为未验证一并掩（≠「判定非凭据」丢弃）。真值由共享注册表保留，本地可恢复。
 - 出站扩展 `createJudgeEgressExtension`（`src/judge/extension.ts`）：注册 `context_with_system`，必须先于 regex 出站扩展（判定需要原文；regex 层幂等跳过已签发伪值）。命中 span 掩码为 `key-{hash}` 确定性伪值（与出站/回程/压缩同一注册表）。
-- classifier 模型解析：配置引用 `{provider, modelId}`（T8 起由 config.json 的 judge 段驱动正式组合接线）→ `ctx.modelRegistry.findOfType("classifier", ...)`。模型缺失（含解析通道异常）→ 显式降级而非静默：notify 一次 + 状态栏标记 + `JudgeStatus` 按文本叶计数（`degradedTexts`；无 UI 模式仅计数），出站仅 regex 层工作；降级叶记 clean cache 墓碑（T8：防 judge 恢复后被缓存短路漏判，见 T8 节）。
+- classifier 模型解析：配置引用 `{provider, modelId}`（T8 起由 config.json 的 judge 段驱动正式组合接线）→ `ctx.modelRegistry.findOfType("classifier", ...)`。模型缺失（含解析通道异常）→ 按 `judge.onMissing` 策略处理（spec 故事 19「down judge never means an unmasked request」）：**fail_closed（默认）**——与 classify 故障同路径，该消息未验证候选（engine 抽取）一律掩码（真值注册表本地保留）+ failClosed 计数 + notify/状态栏；**regex_only（显式知情选择）**——降级放行仅 regex 层 + `degradedTexts` 按文本叶计数（无 UI 模式仅计数）。两策略的降级叶都记 clean cache 墓碑（T8：防 judge 恢复后被缓存短路漏判，见 T8 节）。
 - 与 T4 clean cache 协同（已实现）：judge 层 gate 前查询 `pipeline.cleanCache.isClean` 短路（已判干净不再发起 gate）；非 clean 结论（命中/gate 命中/fail_closed）以 `hasSecret=true` 记**墓碑**——同一文本后续的干净结论（后置 regex 层零命中）不得覆写，每轮重判。干净条目仍由 regex 层零命中时写入（clean = 两层都过）；墓碑随 `clear()`（检测器集热更新）失效。
 
 ### 假 classifier 方案（三层验证）
@@ -314,7 +314,7 @@ rm -rf ~/.pi/agent/extensions/pi-keep-secret
 ```
 
 - `detectors`：整体替换内置默认集（openai-key/github-pat/aws-access-key-id/google-api-key/slack-bot-token/pem-private-key/jwt）；空列表非法。
-- `judge`（T8）：System One 判定检测器。`provider`/`modelId` 必填——指向一个 **classifier 类型**的模型（models.json 注册或扩展 `pi.registerProvider`；端点须兼容 System One 协议，如 LiteLLM 网关 `/v1/systemone`）。阈值（`gateThreshold` 默认 0.5 / `candidateThreshold` 默认 0.7）、批参（`batchSize` 128 / `maxBatches` 8 / `maxChars` 24000 / `minCandidateLength` 6）、`concurrency`（8）、`redactTemplate`（`key-{hash}`）可调；未知键报错。未配置该段即不接入 judge（仅 regex 层）；配置了但模型不可解析/未注册 → 显式降级（见 T8 节降级路径）。
+- `judge`（T8）：System One 判定检测器。`provider`/`modelId` 必填——指向一个 **classifier 类型**的模型（models.json 注册或扩展 `pi.registerProvider`；端点须兼容 System One 协议，如 LiteLLM 网关 `/v1/systemone`）。阈值（`gateThreshold` 默认 0.5 / `candidateThreshold` 默认 0.7）、批参（`batchSize` 128 / `maxBatches` 8 / `maxChars` 24000 / `minCandidateLength` 6）、`concurrency`（8）、`redactTemplate`（`key-{hash}`）、`onMissing`（模型缺失策略：`fail_closed` 默认 / `regex_only` 显式知情降级，见 T5/T8 节）可调；未知键报错。未配置该段即不接入 judge（仅 regex 层）。
 - judge 段变更与 `hashLength`/`cleanCache` 同语义：仅新会话生效（会话内装配在工厂创建时定格）；`detectors` 变更可经 `/keep-secret reload` 热应用。
 
 ## 已知限制汇总（0.1.0）
@@ -322,14 +322,13 @@ rm -rf ~/.pi/agent/extensions/pi-keep-secret
 各票实现过程中的发现与接受的取舍，集中列出：
 
 1. **流式期间短暂显示伪值**：`message_update` 为纯通知（不可改写），TUI 流式渲染期间助手输出短暂显示伪值，消息完成（`message_end` 还原）后转为真值（规格 #1 用户故事 18 已接受；T3）。
-2. **judge 降级期间 regex 不可见的 secret 会出站**：classifier 模型缺失/不可解析时降级仅 regex 层（可见：notify 一次 + 状态栏 + `/keep-secret` 降级计数 + 自测假密码项未通过）；fail_closed 仅覆盖「判定通道故障」（classify 出错/缺应答），不覆盖「judge 未装配」（T5/T8）。
+2. **judge.onMissing=regex_only 降级期间 regex 不可见的 secret 会出站**：classifier 模型缺失/不可解析时默认 fail_closed（未验证候选一律掩码，零泄漏）；显式配置 `onMissing: "regex_only"` 才会降级仅 regex 层（可见：notify 一次 + 状态栏 + `/keep-secret` 降级计数 + 自测假密码项未通过）——低熵密码等 regex 不可见的 secret 在该模式下会出站，属知情取舍（T5/T8）。
 3. **judge 供应商需可信**：judge 判定会把消息文本发给判定模型（System One 端点）；该供应商必须与主会话供应商同级别的可信边界（规格 #1；T5）。
 4. **transcript 本地保留真值**：会话文件按设计保留真值（本地磁盘保护是独立关注点，规格外）；仅出站请求恒伪值（T2 起，各票锚定）。
 5. **`before_agent_start` 强制 systemPrompt 绕过掩码**：pi 在 context 钩子之后投影强制 systemPrompt，不经 `context_with_system` 掩码；本扩展自身不强制 prompt 不受影响，但其他扩展若把密钥写进强制 prompt 则是泄漏路径（T2 发现，规格外）。
-6. **`bashExecution`/`custom` 自定义消息未覆盖**：出站遍历器覆盖 user/toolResult/assistant/system/compactionSummary/branchSummary 六类；`!命令` 的 bashExecution 与 custom 角色消息尚未进遍历器（T2 既有缺口，待后续处理）。
-7. **input 预检固定内置默认集**：提交提示的非阻塞警告按内置默认 regex 集快扫（与配置无关的固定提示层；掩码执法始终以当前配置为准）（T7）。
-8. **掩码压缩摘要单次无重试**：摘要调用是单次 `complete`（pi 默认压缩自带重试）；瞬时故障即显式回退 pi 默认压缩（回退时摘要模型会看到真值——回退必须可见的原因，见 T6 节）（T6）。
-9. **judge 截断护栏**：候选超 `batchSize × maxBatches` 截断保最长（截断计数入 `/keep-secret` 状态），gate 零定位不升级（T5）。
+6. **input 预检固定内置默认集**：提交提示的非阻塞警告按内置默认 regex 集快扫（与配置无关的固定提示层；掩码执法始终以当前配置为准）（T7）。
+7. **掩码压缩失败时本次不压缩**：摘要调用带重试（2 次重试、短退避）；重试仍失败 → 取消本次压缩并告警（会话继续不压缩、上下文持续增长，用户可稍后重试 `/compact`）。这是零泄漏的取舍——不存在回退 pi 默认压缩的路径（默认路径不掩码，回退即泄漏）（T6，spec 故事 24）。
+8. **judge 截断护栏**：候选超 `batchSize × maxBatches` 截断保最长，丢弃的候选按未验证一律掩码（零未验证出站；截断计数入 `/keep-secret` 状态）——代价是病态大块下掩码偏保守（短低熵串可能被一并掩为伪值）（T5，故事 19）。
 
 ## T8：端到端加固 + 文档 + 打包（issue #10）
 
@@ -338,8 +337,8 @@ rm -rf ~/.pi/agent/extensions/pi-keep-secret
 ### 正式组合接线（judge 接入）
 
 - **装配**：`createConfiguredMaskingExtension` 读取 config.json 的 `judge` 段（provider/modelId/阈值/批参/并发/模板）创建 `JudgeTextMasker`，出站工厂按「judge 先于 regex」顺序注册（judge 判定需要原文；regex 层对已签发伪值幂等跳过，两层串联安全）；`extension/index.ts` 的 `createKeepSecretExtension` 把同一掩码器实例交给 `/keep-secret` 命令面（状态计数与自测共用），并与回程还原、掩码压缩共享同一管线（同一注册表 + clean cache）。
-- **降级路径**：未配置 judge 段 → 完全不装配 judge 扩展（仅 regex 层，状态面「未接入」）；配置了但 classifier 模型缺失/解析通道异常 → **显式降级**：文本原样放行（后置 regex 层继续工作）+ notify 一次 + 状态栏标记 + `JudgeStatus.degradedTexts` 按文本叶计数 + 自测假密码项如实报未通过；降级叶在 clean cache 记**墓碑**——regex 层的零命中结论不得把降级放行过的文本写成干净，否则 judge（模型后来注册）恢复后会被 clean cache 短路而漏判（clean = 两层都过的不变量；用例锚定「恢复后重判」）。
-- **classify 通道故障 ≠ 降级**：模型在位但 classify 返回错误（judge 不可达）→ fail_closed（未验证候选一律掩码，真值注册表本地可恢复）；两者都计入 `/keep-secret` 状态（failClosed / degradedTexts）。
+- **降级路径**：未配置 judge 段 → 完全不装配 judge 扩展（仅 regex 层，状态面「未接入」）；配置了但 classifier 模型缺失/解析通道异常 → 按 `judge.onMissing` 策略（spec 故事 19）：默认 **fail_closed**——该消息未验证候选（engine 抽取）一律掩码（真值注册表本地保留）+ `failClosed` 计数 + notify/状态栏 + 自测全部样本期望掩码；显式 `regex_only`——降级放行仅 regex 层 + `degradedTexts` 按文本叶计数 + 自测假密码项如实报未通过。两策略的降级叶都在 clean cache 记**墓碑**——regex 层的零命中结论不得把降级处理过的文本写成干净，否则 judge（模型后来注册）恢复后会被 clean cache 短路而漏判（clean = 两层都过的不变量；用例锚定「恢复后重判」）。
+- **classify 通道故障与模型缺失同则**：模型在位但 classify 返回错误（judge 不可达）→ fail_closed（未验证候选一律掩码，真值注册表本地可恢复）；两者都计入 `/keep-secret` 状态（failClosed / degradedTexts）与生效策略展示（模型缺失策略：fail_closed|regex_only）。
 - **注入点**：`createKeepSecretExtension({ configPath, resolveModel, classify })`——测试替身经 judge 扩展既有注入点进入正式装配；默认导出（目录扩展加载）读 `PI_KEEP_SECRET_CONFIG`。
 - **打包**：`package.json` 增加 `"pi": { "extensions": ["extension/index.ts"] }` 清单——pi 对目录扩展先读 package.json 的 pi 清单再找 index.ts，`--extension <repo>` 与用户级目录发现共用该入口；`extension/index.ts` 的 `../src/...` 相对导入在安装布局（清单所在目录为根）下保持成立。
 

@@ -1,11 +1,13 @@
 /**
  * 消息树遍历器：对请求本地副本（pi 已 structuredClone）的文本叶做掩码，
  * 研究笔记 §2 规则（规格 #1 Implementation Decisions「Message walk」）。
- * 按消息种类逐步覆盖（user → toolResult → assistant → system）。
+ * 按消息种类逐步覆盖（user → toolResult → assistant → system →
+ * bashExecution/custom 自定义消息）。
  *
  * 豁免（结构字段，永不改写）：ImageContent.data、*Signature、id/name/
  * role/type/mimeType 类键、toolsAdded/toolsRemoved（工具 schema）、
- * nestedCalls（不发模型）、argumentsError、toolResult.details（工具私有）。
+ * nestedCalls（不发模型）、argumentsError、toolResult.details（工具私有）、
+ * custom 消息的 details（不进模型上下文）。
  *
  * 原位修改（事件 messages 即请求本地副本，链式转换的既定模式），
  * 会话 transcript 不受影响。
@@ -75,7 +77,10 @@ function maskJsonStrings(value: unknown, maskText: TextMasker): void {
  * 的 text/thinking 块与 toolCall.arguments 深遍历字符串值、SystemMessage
  * 的 prose 与 sections 字符串值（toolsAdded/toolsRemoved 豁免）、pi
  * 压缩/分支摘要消息的 summary 字段（掩码压缩后携带还原真值进上下文，
- * 出站必须重掩码；T6 引入）。
+ * 出站必须重掩码；T6 引入）、bashExecution 的 command/output 与 custom
+ * 消息的 content——两者经 pi convertToLlm 投影为 user 文本进 LLM 上下文
+ * （bashExecutionToText / content 直投影；!! 前缀的 excludeFromContext
+ * 消息不投影，掩码对其无副作用）。
  */
 export function maskMessageTree(messages: AgentMessage[], maskText: TextMasker): void {
 	for (const message of messages) {
@@ -105,6 +110,23 @@ export function maskMessageTree(messages: AgentMessage[], maskText: TextMasker):
 					} else if (block.type === "toolCall") {
 						maskJsonStrings(block.arguments, maskText);
 					}
+				}
+				break;
+			}
+			case "bashExecution": {
+				// pi 经 bashExecutionToText 把 command+output 投影为 user 文本进
+				// LLM 上下文（!! 前缀的 excludeFromContext 消息不投影，掩码无副作用）
+				message.command = maskText(message.command);
+				message.output = maskText(message.output);
+				break;
+			}
+			case "custom": {
+				// CustomMessage.content（string 或 text 块）投影为 user 消息（details
+				// 不进模型上下文，不动）
+				if (typeof message.content === "string") {
+					message.content = maskText(message.content);
+				} else {
+					maskTextParts(message.content, maskText);
 				}
 				break;
 			}
@@ -181,8 +203,15 @@ async function maskJsonStringsAsync(value: unknown, maskText: AsyncTextMasker): 
 /**
  * maskMessageTree 的异步孪生：judge（LLM 判定检测器，ticket #7）等异步
  * 掩码路径的出站遍历。覆盖范围与同步版逐角色一致（含 T6 摘要消息的
- * summary 字段）；同步遍历保持 T2/T6 路径零开销，不因异步检测器行变。
+ * summary 字段与 bashExecution/custom 自定义消息）；同步遍历保持 T2/T6
+ * 路径零开销，不因异步检测器行变。
  * 按消息并发（消息级并发，对齐参考实现：LLM 调用另有会话级信号量限流）。
+ *
+ * 同步/异步孪生是有意保留的重复（去重压制理由）：若合并为接受
+ * `string | Promise<string>` 的单一通用遍历器，同步路径（regex 出站与
+ * 掩码压缩——每请求热路径）的每个文本叶都要跨 await/promise 包装，
+ * 破坏「同步路径零开销」的既有理由；因此逐角色镜像两份，新增角色必须
+ * 两份同步修改（用例分别锚定同步链与 judge 异步链）。
  */
 export async function maskMessageTreeAsync(
 	messages: AgentMessage[],
@@ -216,6 +245,20 @@ export async function maskMessageTreeAsync(
 						} else if (block.type === "toolCall") {
 							await maskJsonStringsAsync(block.arguments, maskText);
 						}
+					}
+					break;
+				}
+				case "bashExecution": {
+					// 与同步版同覆盖：command/output 投影为 user 文本进 LLM 上下文
+					message.command = await maskText(message.command);
+					message.output = await maskText(message.output);
+					break;
+				}
+				case "custom": {
+					if (typeof message.content === "string") {
+						message.content = await maskText(message.content);
+					} else {
+						await maskTextPartsAsync(message.content, maskText);
 					}
 					break;
 				}

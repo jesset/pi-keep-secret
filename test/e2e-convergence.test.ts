@@ -179,10 +179,49 @@ describe("T8 正式组合接线（judge 接入 extension/index.ts）", () => {
 		expect(selfTest).toMatch(/4\/4 通过/);
 	});
 
-	test("配置 judge 但模型不可用：降级仅 regex 层，命令面降级可见（正式入口文件路径）", async () => {
+	test("配置 judge 但模型不可用（默认 fail_closed）：未验证候选一律掩码，命令面 fail-closed 计数与策略可见", async () => {
 		// 不注入 resolveModel：默认解析走 ctx.modelRegistry，harness 注册表无该
-		// classifier 模型 → 降级路径（与用户级安装后未注册 classifier 同形态）
+		// classifier 模型 → 模型缺失路径（spec 故事 19：与 classify 故障同则）
 		setConfigEnv(writeTempConfig(JUDGE_CONFIG));
+		const h = await createHarnessSession({ extensionPaths: [EXTENSION_ENTRY] });
+		try {
+			h.provider.setScript([{ text: "ack" }]);
+			await h.session.prompt(`部署密码 ${PASSWORD}，订单 ${ORDER}，密钥 ${OPENAI_KEY}`);
+			const out = requestText(h.provider.requests()[0]);
+			expect(out).not.toContain(OPENAI_KEY); // sk- 密钥同为未验证候选，被 judge 兑底掩码
+			expect(out).not.toContain(PASSWORD); // 模型缺失 fail_closed：未验证候选一律掩码
+			expect(out).not.toContain(ORDER);
+			expect(out).toMatch(/key-[A-Z2-7]{12}/);
+		} finally {
+			h.dispose();
+		}
+		// 同一配置的工厂形态：fail-closed 计数与缺省策略展示；自测全过（fail_closed 掩码）
+		const ext = createKeepSecretExtension({ configPath: process.env[CONFIG_PATH_ENV] });
+		const h2 = await createHarnessSession({ extensionFactories: [ext] });
+		try {
+			h2.provider.setScript([{ text: "ack" }, { text: "ack" }]);
+			await h2.session.prompt(`部署密码 ${PASSWORD}，密钥 ${OPENAI_KEY}`);
+			await h2.session.prompt("继续");
+			const status = await runKeepSecretCommand(ext, "");
+			expect(status).toMatch(
+				/judge：已判定 0 叶，截断 0 次，fail-closed [1-9]\d* 次，降级 0 叶（模型缺失策略：fail_closed）/,
+			);
+			const selfTest = await runKeepSecretCommand(ext, "test");
+			expect(selfTest).toMatch(/假密码：已掩码（期望：掩码/);
+			expect(selfTest).toMatch(/4\/4 通过/);
+		} finally {
+			h2.dispose();
+		}
+	});
+
+	test("配置 judge.onMissing=regex_only 且模型不可用：降级仅 regex 层，命令面降级可见（正式入口文件路径）", async () => {
+		const regexOnlyConfig = JSON.stringify({
+			judge: {
+				...JSON.parse(JUDGE_CONFIG).judge,
+				onMissing: "regex_only", // 显式知情选择：模型缺失时降级仅 regex 层
+			},
+		});
+		setConfigEnv(writeTempConfig(regexOnlyConfig));
 		const h = await createHarnessSession({ extensionPaths: [EXTENSION_ENTRY] });
 		try {
 			h.provider.setScript([{ text: "ack" }]);
@@ -194,7 +233,7 @@ describe("T8 正式组合接线（judge 接入 extension/index.ts）", () => {
 		} finally {
 			h.dispose();
 		}
-		// 同一配置的工厂形态：降级计数与自测降级提示可见
+		// 同一配置的工厂形态：降级计数与策略展示可见，自测假密码项如实报未通过
 		const ext = createKeepSecretExtension({ configPath: process.env[CONFIG_PATH_ENV] });
 		const h2 = await createHarnessSession({ extensionFactories: [ext] });
 		try {
@@ -202,7 +241,9 @@ describe("T8 正式组合接线（judge 接入 extension/index.ts）", () => {
 			await h2.session.prompt(`部署密码 ${PASSWORD}，密钥 ${OPENAI_KEY}`);
 			await h2.session.prompt("继续");
 			const status = await runKeepSecretCommand(ext, "");
-			expect(status).toMatch(/judge：已判定 0 叶，截断 0 次，fail-closed 0 次，降级 \d+ 叶/);
+			expect(status).toMatch(
+				/judge：已判定 0 叶，截断 0 次，fail-closed 0 次，降级 \d+ 叶（模型缺失策略：regex_only）/,
+			);
 			const selfTest = await runKeepSecretCommand(ext, "test");
 			expect(selfTest).toMatch(/假密码：未掩码（期望：掩码/);
 			expect(selfTest).toMatch(/3\/4 通过/);

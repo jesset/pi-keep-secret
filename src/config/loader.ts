@@ -10,15 +10,18 @@
  *   ],
  *   "hashLength": 20,
  *   "cleanCache": { "limit": 20000, "ttlMs": 86400000 },
- *   "judge": { "provider": "litellm", "modelId": "typesafe/jev-latest" }
+ *   "judge": { "provider": "litellm", "modelId": "typesafe/jev-latest",
+ *             "onMissing": "fail_closed" }
  * }
  * ```
  * - `detectors` **整体替换**内置默认集（对齐参考实现 secret_detectors
  *   语义，用户故事 30「tune detectors」）；`redactTemplate` 映射为引擎
  *   RegexDetectorSpec.template，产物可直接喂 createEgressMaskingExtension。
  * - `judge`（T8 正式接线）：System One 判定检测器配置——provider/modelId
- *   必填 + 阈值/批参/并发/伪值模板可调；未配置即不接入 judge（仅 regex
- *   检测层）；模型解析失败时扩展显式降级（见 src/judge/extension.ts）。
+ *   必填 + 阈值/批参/并发/伪值模板/onMissing 策略可调；未配置即不接入
+ *   judge（仅 regex 检测层）。模型缺失时按 onMissing 处理（默认
+ *   fail_closed——未验证候选一律掩码；regex_only——降级仅 regex 层，
+ *   见 src/judge/extension.ts 与 JudgeOnMissing）。
  *   judge 段变更与 hashLength/cleanCache 同语义：仅新会话生效（会话内
  *   的 judge 装配在工厂创建时定格）。
  * - 路径解析优先级：显式参数 > 环境变量 PI_KEEP_SECRET_CONFIG > 默认
@@ -53,9 +56,16 @@ export interface CleanCacheConfig {
 }
 
 /**
+ * judge 模型缺失策略（spec 故事 19：down judge never means an unmasked
+ * request）：fail_closed（默认）——该消息未验证候选一律掩码；regex_only
+ * （显式知情选择）——降级仅 regex 检测层（文本原样放行 + 可见计数）。
+ */
+export type JudgeOnMissing = "fail_closed" | "regex_only";
+
+/**
  * judge（T5 System One 判定检测器）配置段（T8 正式接线）：未配置即
- * 不接入 judge（仅 regex 检测层）；配置后 provider/modelId 必填，
- * 模型解析失败时扩展显式降级（见 src/judge/extension.ts）。
+ * 不接入 judge（仅 regex 检测层）；配置后 provider/modelId 必填。
+ * 模型缺失时按 onMissing 策略处理（默认 fail_closed，见 JudgeOnMissing）。
  */
 export interface JudgeConfig {
 	/** classifier 供应商名（models.json/registerProvider 注册名）。 */
@@ -78,6 +88,8 @@ export interface JudgeConfig {
 	concurrency?: number;
 	/** judge 命中伪值模板（默认 "key-{hash}"）。 */
 	redactTemplate?: string;
+	/** classifier 模型缺失策略，默认 fail_closed（见 JudgeOnMissing）。 */
+	onMissing?: JudgeOnMissing;
 }
 
 /** 一次加载的解析结果（错误非空时 detectors 为内置默认集回退）。 */
@@ -117,6 +129,7 @@ const JUDGE_KEYS = new Set([
 	"minCandidateLength",
 	"concurrency",
 	"redactTemplate",
+	"onMissing",
 ]);
 /** base32(sha256) 无 padding 共 52 字符，哈希段长度上限由此决定。 */
 const MAX_HASH_LENGTH = 52;
@@ -304,6 +317,14 @@ function validateConfig(json: unknown): {
 				errors.push("judge.redactTemplate must be a non-empty string");
 				valid = false;
 			}
+			if (
+				section.onMissing !== undefined &&
+				section.onMissing !== "fail_closed" &&
+				section.onMissing !== "regex_only"
+			) {
+				errors.push('judge.onMissing must be "fail_closed" or "regex_only"');
+				valid = false;
+			}
 			if (valid) {
 				judge = {
 					provider: section.provider as string,
@@ -316,6 +337,7 @@ function validateConfig(json: unknown): {
 					minCandidateLength: section.minCandidateLength as number | undefined,
 					concurrency: section.concurrency as number | undefined,
 					redactTemplate: section.redactTemplate as string | undefined,
+					onMissing: section.onMissing as JudgeOnMissing | undefined,
 				};
 			}
 		}
@@ -371,8 +393,8 @@ function loadFromDisk(path: string): ResolvedConfig {
 	};
 }
 
-/** 配置内容指纹（reload 变更判定与订阅通知依据）。 */
-function fingerprint(config: ResolvedConfig): string {
+/** 配置内容指纹（reload 变更判定与订阅通知的唯一口径；命令面 reload 复用）。 */
+export function configFingerprint(config: ResolvedConfig): string {
 	return JSON.stringify([
 		config.exists,
 		config.detectors,
@@ -409,7 +431,7 @@ export function createConfigLoader(options: ConfigLoaderOptions = {}): ConfigLoa
 		},
 		reload() {
 			const next = loadFromDisk(path);
-			const changed = fingerprint(next) !== fingerprint(current);
+			const changed = configFingerprint(next) !== configFingerprint(current);
 			current = next;
 			if (changed) {
 				for (const listener of [...listeners]) {

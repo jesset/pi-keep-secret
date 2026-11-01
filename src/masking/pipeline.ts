@@ -17,6 +17,7 @@ import {
 	unmaskText,
 	type CompiledRegexDetector,
 	type RegexDetectorSpec,
+	type Span,
 } from "../engine/index.ts";
 import { createCleanCache, type CleanCache, type CleanCacheStats } from "../cache/index.ts";
 import { DEFAULT_DETECTOR_SPECS } from "./detectors.ts";
@@ -62,6 +63,28 @@ export interface MaskingPipeline {
 	cacheStats(): CleanCacheStats;
 }
 
+/** span 掩码共享尾段：注册表幂等过滤（已是本注册表伪值的 span 跳过，防嵌
+ *  套）→ redactText（注入注册表签发器：确定性伪值 + 碰撞兑底 + LRU 写入）。
+ *  regex 管线（maskText）与 judge 掩码器（命中/兑底 span）同形去重；返回
+ *  应用后的文本与应用的 span 数（0 = 原样返回）。 */
+export function redactSpansWithRegistry(
+	text: string,
+	spans: readonly Span[],
+	registry: PlaceholderRegistry,
+	templates: Map<string, string>,
+): { text: string; applied: number } {
+	const applicable = spans.filter((span) => !registry.has(text.slice(span.start, span.end)));
+	if (applicable.length === 0) {
+		return { text, applied: 0 };
+	}
+	return {
+		text: redactText(text, applicable, templates, {
+			issuePlaceholder: (secret, detector) => registry.issue(secret, templates.get(detector)!),
+		}).text,
+		applied: applicable.length,
+	};
+}
+
 /** 创建会话级掩码管线。检测器 pattern 非法时抛错（配置加载层上报扩展错误的既定语义）。 */
 export function createMaskingPipeline(options: MaskingPipelineOptions = {}): MaskingPipeline {
 	let detectors: CompiledRegexDetector[] = (options.detectors ?? DEFAULT_DETECTOR_SPECS).map(
@@ -85,18 +108,10 @@ export function createMaskingPipeline(options: MaskingPipelineOptions = {}): Mas
 		for (const span of detected) {
 			detectorHits.set(span.detector, (detectorHits.get(span.detector) ?? 0) + 1);
 		}
-		const spans = detected.filter(
-			(span) => !registry.has(text.slice(span.start, span.end)),
-		);
+		const { text: masked, applied } = redactSpansWithRegistry(text, detected, registry, templates);
 		// 命中 secret（或 T5 gate 命中）的文本不缓存，每轮重扫
-		cleanCache.remember(text, { hasSecret: spans.length > 0 });
-		if (spans.length === 0) {
-			return text;
-		}
-		return redactText(text, spans, templates, {
-			issuePlaceholder: (secret, detector) =>
-				registry.issue(secret, templates.get(detector)!),
-		}).text;
+		cleanCache.remember(text, { hasSecret: applied > 0 });
+		return masked;
 	};
 
 	return {

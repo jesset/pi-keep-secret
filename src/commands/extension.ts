@@ -7,7 +7,7 @@
  *   无 UI 模式 notify 为 no-op，静默）。
  * - `/keep-secret`：状态面板（检测器配置摘要/注册表/clean cache/各检测
  *   器命中/judge 计数（T8 接入：配置 judge 段后展示已判定/截断/fail-
- *   closed/降级计数）/压缩回退计数）。
+ *   closed/降级计数）/压缩取消计数）。
  * - `/keep-secret test`：合成样本内联自测（judge 启用时经 judge→regex
  *   全链评估，假密码项期望掩码；降级时如实报未通过）。
  * - `/keep-secret reload`：配置热重载（loader.reload → applyDetectors）。
@@ -21,6 +21,7 @@ import { compileRegexDetector, detectRegexSpans, type CompiledRegexDetector } fr
 import { DEFAULT_DETECTOR_SPECS } from "../masking/detectors.ts";
 import type { MaskingPipeline } from "../masking/index.ts";
 import type { ConfigLoader } from "../config/index.ts";
+import { configFingerprint } from "../config/index.ts";
 import type { MaskedCompactionStatus } from "../compaction/index.ts";
 import type { JudgeTextMasker } from "../judge/index.ts";
 
@@ -29,7 +30,7 @@ export interface KeepSecretCommandsOptions {
 	loader: ConfigLoader;
 	/** 会话级掩码管线（状态面的注册表/缓存/检测器命中计数来源）。 */
 	pipeline: MaskingPipeline;
-	/** 掩码压缩故障状态（状态面的回退计数来源）。 */
+	/** 掩码压缩故障状态（状态面的取消计数来源）。 */
 	compaction: MaskedCompactionStatus;
 	/**
 	 * judge 文本掩码器（T8 正式接线：配置 judge 段时由组合根传入同一实例）。
@@ -91,15 +92,16 @@ function buildStatusReport(options: KeepSecretCommandsOptions): string {
 			? "检测器命中：（无）"
 			: `检测器命中：${[...hits.entries()].map(([name, count]) => `${name}=${count}`).join(", ")}`,
 	);
+	const judgeMode = config.judge?.onMissing ?? "fail_closed";
 	lines.push(
 		options.judge === undefined
 			? "judge：未接入（未配置 judge 段，仅 regex 检测层）"
-			: `judge：已判定 ${options.judge.status.judgedTexts} 叶，截断 ${options.judge.status.truncatedCandidates} 次，fail-closed ${options.judge.status.failClosed} 次，降级 ${options.judge.status.degradedTexts} 叶`,
+			: `judge：已判定 ${options.judge.status.judgedTexts} 叶，截断 ${options.judge.status.truncatedCandidates} 次，fail-closed ${options.judge.status.failClosed} 次，降级 ${options.judge.status.degradedTexts} 叶（模型缺失策略：${judgeMode}）`,
 	);
 	lines.push(
-		`掩码压缩回退：${options.compaction.fallbacks} 次` +
-			(options.compaction.fallbacks > 0 && options.compaction.lastFallbackError !== undefined
-				? `（最近原因：${options.compaction.lastFallbackError}）`
+		`掩码压缩取消：${options.compaction.cancellations} 次` +
+			(options.compaction.cancellations > 0 && options.compaction.lastCancellationError !== undefined
+				? `（最近原因：${options.compaction.lastCancellationError}）`
 				: ""),
 	);
 	return lines.join("\n");
@@ -148,18 +150,28 @@ async function buildSelfTestReport(
 	ctx: ExtensionCommandContext,
 ): Promise<{ text: string; allPassed: boolean }> {
 	const judgeEnabled = options.judge !== undefined;
+	// 模型缺失 + fail_closed（默认）：未验证候选一律掩码——全部样本期望掩码
+	//（含干净订单号：候选被兑底掩码属预期，而非配置问题）
+	const failClosedNoModel =
+		options.judge !== undefined &&
+		options.judge.onMissing === "fail_closed" &&
+		options.judge.modelMissing;
 	const lines = ["pi-keep-secret 自测（合成样本，当前生效检测器集）"];
 	let passed = 0;
 	for (const sample of SELF_TEST_SAMPLES) {
 		// 与出站链同序：judge 先判原文，regex 后兑底（伪值幂等跳过）；
-		// judge 降级时 mask 原样返回，仅 regex 层结果——假密码项如实报未通过
+		// judge 降级（regex_only）时 mask 原样返回，仅 regex 层结果——假密码项如实报未通过
 		let current = sample.text;
 		if (options.judge !== undefined) {
 			current = await options.judge.mask(current, ctx);
 		}
 		current = options.pipeline.maskText(current);
 		const masked = current !== sample.text;
-		const expectMasked = judgeEnabled ? (sample.expectMaskedWithJudge ?? sample.expectMasked) : sample.expectMasked;
+		const expectMasked = failClosedNoModel
+			? true
+			: judgeEnabled
+				? (sample.expectMaskedWithJudge ?? sample.expectMasked)
+				: sample.expectMasked;
 		const ok = masked === expectMasked;
 		if (ok) {
 			passed += 1;
@@ -181,6 +193,11 @@ async function buildSelfTestReport(
 		!allPassed
 	) {
 		lines.push("注意：judge 已降级（classifier 模型不可用，仅 regex 检测层工作）——假密码项未通过即降级信号");
+	}
+	if (failClosedNoModel) {
+		lines.push(
+			"注意：judge classifier 模型缺失，fail_closed 已生效（未验证候选一律掩码）——样本全部掩码属预期兑底；请注册 classifier 模型，或显式配置 judge.onMissing=\"regex_only\"",
+		);
 	}
 	return { text: lines.join("\n"), allPassed };
 }
@@ -214,20 +231,30 @@ export function createKeepSecretCommandsExtension(options: KeepSecretCommandsOpt
 				}
 				case "reload": {
 					const before = options.loader.get();
+					const beforeFingerprint = configFingerprint(before);
 					const after = options.loader.reload(); // 变更时同步触发热应用（applyDetectors + 清空缓存）
 					if (after.errors.length > 0) {
 						ctx.ui.notify(
 							`pi-keep-secret reload：配置错误（已回退内置默认集）——\n${after.errors.join("\n")}`,
 							"error",
 						);
-					} else if (JSON.stringify(before.detectors) !== JSON.stringify(after.detectors)) {
-						ctx.ui.notify(
-							`pi-keep-secret reload：检测器集已热应用（${after.detectors.length} 个：${after.detectors.map((d) => d.name).join(", ")}；hashLength/cleanCache 变更仅新会话生效）`,
-							"info",
-						);
+					} else if (configFingerprint(after) !== beforeFingerprint) {
+						// 变更判定与 loader.reload/订阅同口径（configFingerprint）；检测器
+						// 集是否变化仅决定提示语（热应用 vs 仅新会话生效）
+						if (JSON.stringify(before.detectors) !== JSON.stringify(after.detectors)) {
+							ctx.ui.notify(
+								`pi-keep-secret reload：检测器集已热应用（${after.detectors.length} 个：${after.detectors.map((d) => d.name).join(", ")}；hashLength/cleanCache 变更仅新会话生效）`,
+								"info",
+							);
+						} else {
+							ctx.ui.notify(
+								"pi-keep-secret reload：配置已重读，检测器集无变更（judge/hashLength/cleanCache 变更仅新会话生效）",
+								"info",
+							);
+						}
 					} else {
 						ctx.ui.notify(
-							"pi-keep-secret reload：配置已重读，检测器集无变更（hashLength/cleanCache 变更仅新会话生效）",
+							"pi-keep-secret reload：配置无变更",
 							"info",
 						);
 					}

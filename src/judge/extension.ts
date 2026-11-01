@@ -11,8 +11,13 @@
  * classifier 模型解析：配置引用（provider/modelId；T8 起由 config.json 的
  * judge 段驱动正式组合接线，装配方亦可显式传入）→
  * `ctx.modelRegistry.findOfType("classifier", ...)`。
- * 模型缺失 → 显式降级而非静默：ctx.ui.notify（有 UI 时）+ 状态栏标记 +
- * JudgeStatus 每请求计数（无 UI 模式仅计数），出站仅 regex 层工作。
+ * 模型缺失（含解析通道异常）→ 按 `onMissing` 策略处理（spec 故事 19
+ * 「down judge never means an unmasked request」）：
+ * - fail_closed（默认）：与 classify 故障同路径——该消息未验证候选
+ *   （engine 抽取）一律掩码（真值由注册表本地保留，可恢复）；
+ * - regex_only（显式知情选择）：降级放行——文本原样交后置 regex 层，
+ *   ctx.ui.notify（有 UI 时）+ 状态栏标记 + JudgeStatus 每请求计数
+ *   （无 UI 模式仅计数）。
  *
  * fail_closed：judge verdict 中未验证候选已并入 spans 掩码（真值由注册表
  * 本地保留，可恢复）；classify 错误计入状态并（有 UI 时）告警。
@@ -24,9 +29,10 @@ import type {
 	ClassifierModel,
 	ClassifierResult,
 } from "@earendil-works/pi-ai";
-import { redactText } from "../engine/index.ts";
+import { extractCandidates, type Span } from "../engine/index.ts";
+import type { JudgeOnMissing } from "../config/loader.ts";
 import type { MaskingPipeline } from "../masking/index.ts";
-import { maskMessageTreeAsync } from "../masking/index.ts";
+import { maskMessageTreeAsync, redactSpansWithRegistry } from "../masking/index.ts";
 import {
 	DEFAULT_DETECTOR_NAME,
 	createSystemOneJudge,
@@ -60,15 +66,17 @@ export type ClassifyChannel = (
 
 /** judge 故障与降级状态（/keep-secret 状态面与测试断言用；不静默降级）。 */
 export interface JudgeStatus {
-	/** classifier 模型解析失败而降级放行的文本叶数（该类叶仅 regex 层工作）。 */
+	/** classifier 模型解析失败而降级放行的文本叶数（onMissing=regex_only 时
+	 *  递增；该类叶仅 regex 层工作）。 */
 	degradedTexts: number;
-	/** 最近一次模型解析失败原因。 */
+	/** 最近一次模型解析失败原因（fail_closed / regex_only 两策略都记录）。 */
 	lastResolutionError: string | undefined;
 	/** 已判定文本叶数（至少发起一次 gate）。 */
 	judgedTexts: number;
-	/** fail_closed 生效（存在未验证候选被兜底掩码）的判定次数。 */
+	/** fail_closed 生效（存在未验证候选被兜底掩码）的次数：classify 故障，或
+	 *  （onMissing=fail_closed 默认）classifier 模型缺失。 */
 	failClosed: number;
-	/** 累计被 maxBatches 截断丢弃的候选数（gate 零定位不升级，仅记录）。 */
+	/** 累计被 maxBatches 截断丢弃的候选数（丢弃者按未验证掩码，仅记录）。 */
 	truncatedCandidates: number;
 }
 
@@ -90,6 +98,8 @@ export interface JudgeEgressOptions extends Omit<SystemOneJudgeOptions, "classif
 	 * 提供时本扩展直接使用它，其余 judge 选项由掩码器创建方 consumed）。
 	 */
 	masker?: JudgeTextMasker;
+	/** classifier 模型缺失策略，默认 fail_closed（见 config/loader.ts JudgeOnMissing）。 */
+	onMissing?: JudgeOnMissing;
 }
 
 const defaultResolveModel: ModelResolver = (ctx, ref) =>
@@ -100,20 +110,30 @@ const defaultResolveModel: ModelResolver = (ctx, ref) =>
  * 出站钩子与 /keep-secret 自测共用同一实例（同一状态计数与 clean cache
  * 协同）。
  *
- * 降级（classifier 模型缺失）：文本原样放行（后置 regex 层继续工作）+
- * 状态计数 + 记**墓碑**——降级叶不得被 regex 层的零命中结论写成干净，
- * 否则 judge 恢复后会被 clean cache 短路而漏判（clean = 两层都过）。
+ * 模型缺失按 onMissing 策略处理：regex_only（显式知情选择）——文本原样
+ * 放行（后置 regex 层继续工作）+ 状态计数；fail_closed（默认）——未验证
+ * 候选一律掩码（与 classify 故障同路径）。两策略都记**墓碑**——该文本
+ * 不得被 regex 层的零命中结论写成干净，否则 judge 恢复后会被 clean cache
+ * 短路而漏判（clean = 两层都过）。
  */
 export interface JudgeTextMasker {
 	/** 故障与降级状态（/keep-secret 状态面与组合根共享同一实例）。 */
 	readonly status: JudgeStatus;
-	/** 对一段文本判定并掩码；降级时原样返回。 */
+	/** 生效的模型缺失策略（fail_closed / regex_only；状态面与自测期望动态化用）。 */
+	readonly onMissing: JudgeOnMissing;
+	/** 最近一次 mask 时 classifier 模型是否缺失（自测期望动态化：fail_closed 下
+	 *  未验证候选一律掩码，全部样本期望掩码）。 */
+	readonly modelMissing: boolean;
+	/** 对一段文本判定并掩码；模型缺失按 onMissing 策略（默认 fail_closed 掩码，
+	 *  regex_only 原样返回交 regex 层）。 */
 	mask(text: string, ctx: ExtensionContext): Promise<string>;
 }
 
-/** 创建 judge 文本掩码器（模型解析失败不抛错——降级仅 regex 层）。 */
+/** 创建 judge 文本掩码器（模型缺失不抛错——按 onMissing 策略 fail_closed 或降级）。 */
 export function createJudgeTextMasker(options: JudgeEgressOptions): JudgeTextMasker {
 	const { modelRef, pipeline } = options;
+	const onMissing: JudgeOnMissing = options.onMissing ?? "fail_closed";
+	const minCandidateLength = options.minCandidateLength ?? 6;
 	const status: JudgeStatus = options.status ?? {
 		degradedTexts: 0,
 		lastResolutionError: undefined,
@@ -129,6 +149,19 @@ export function createJudgeTextMasker(options: JudgeEgressOptions): JudgeTextMas
 	let judge: SystemOneJudge | undefined;
 	let notifiedModelMissing = false;
 	let notifiedError: string | undefined;
+	let modelMissing = false;
+
+	/** 模型缺失的 fail_closed 兜底：与 classify 故障同路径——该文本抽取出的
+	 *  候选未获判定结论，一律掩码（与 regex 管线共享掩码尾段，幂等过滤已是
+	 *  伪值的候选，防嵌套）。 */
+	const maskUnverifiedLocally = (text: string): string => {
+		const spans: Span[] = extractCandidates(text, minCandidateLength).map((candidate) => ({
+			start: candidate.start,
+			end: candidate.end,
+			detector: detectorName,
+		}));
+		return redactSpansWithRegistry(text, spans, registry, templates).text;
+	};
 
 	const mask = async (text: string, ctx: ExtensionContext): Promise<string> => {
 		if (judge === undefined) {
@@ -137,31 +170,50 @@ export function createJudgeTextMasker(options: JudgeEgressOptions): JudgeTextMas
 			try {
 				model = (options.resolveModel ?? defaultResolveModel)(ctx, modelRef);
 			} catch (error) {
-				// 解析通道异常与模型缺失同语义：降级（不静默、不中断掩码链）
+				// 解析通道异常与模型缺失同语义：按 onMissing 策略处理（不静默、不中断掩码链）
 				resolutionError = `classifier 模型解析失败：${
 					error instanceof Error ? error.message : String(error)
 				}`;
 			}
 			if (model === undefined) {
-				// 模型缺失：显式降级（计数、告警一次），文本原样放行，后置 regex
-				// 出站扩展继续工作；墓碑防 judge 恢复后被 clean cache 短路
-				status.degradedTexts += 1;
+				modelMissing = true;
 				status.lastResolutionError =
 					resolutionError ?? `classifier 模型未注册：${modelRef.provider}/${modelRef.modelId}`;
-				pipeline.cleanCache.remember(text, { hasSecret: true });
 				if (!notifiedModelMissing) {
 					notifiedModelMissing = true;
 					if (ctx.hasUI) {
 						ctx.ui.notify(
-							`pi-keep-secret: judge classifier 模型 ${modelRef.provider}/${modelRef.modelId} 未注册，出站仅 regex 检测层工作`,
+							onMissing === "regex_only"
+								? `pi-keep-secret: judge classifier 模型 ${modelRef.provider}/${modelRef.modelId} 未注册（onMissing=regex_only），出站仅 regex 检测层工作`
+								: `pi-keep-secret: judge classifier 模型 ${modelRef.provider}/${modelRef.modelId} 未注册，已 fail_closed（未验证候选一律掩码）——请注册该 classifier 模型，或显式配置 judge.onMissing="regex_only"`,
 							"warning",
 						);
-						ctx.ui.setStatus(STATUS_KEY, "pi-keep-secret judge 已降级（仅 regex 检测）");
+						ctx.ui.setStatus(
+							STATUS_KEY,
+							onMissing === "regex_only"
+								? "pi-keep-secret judge 已降级（仅 regex 检测）"
+								: "pi-keep-secret judge fail_closed（classifier 模型缺失）",
+						);
 					}
 				}
-				return text;
+				if (onMissing === "regex_only") {
+					// 显式知情选择：降级放行（后置 regex 出站扩展继续工作）+ 计数；
+					// 墓碑防 judge 恢复后被 clean cache 短路
+					status.degradedTexts += 1;
+					pipeline.cleanCache.remember(text, { hasSecret: true });
+					return text;
+				}
+				// fail_closed（默认）：模型缺失与 classify 故障同路径——未验证候选
+				// 一律掩码（真值注册表本地保留）；已判干净（两层都过）的文本不重复兜底
+				if (pipeline.cleanCache.isClean(text)) {
+					return text;
+				}
+				status.failClosed += 1;
+				pipeline.cleanCache.remember(text, { hasSecret: true }); // 墓碑同记
+				return maskUnverifiedLocally(text);
 			}
 			// classify 通道绑定首次解析到的 modelRegistry 与模型（会话生命周期稳定）
+			modelMissing = false;
 			const channel: ClassifyChannel =
 				options.classify ?? ((m, context) => ctx.modelRegistry.classify(m, context));
 			judge = createSystemOneJudge({
@@ -197,22 +249,16 @@ export function createJudgeTextMasker(options: JudgeEgressOptions): JudgeTextMas
 		if (!verdict.clean) {
 			pipeline.cleanCache.remember(text, { hasSecret: true });
 		}
-		// 幂等：命中串若已是本注册表签发的伪值则跳过（防嵌套伪值，与 regex 管线同语义）
-		const spans = verdict.spans.filter(
-			(span) => !registry.has(text.slice(span.start, span.end)),
-		);
-		if (spans.length === 0) {
-			return text;
-		}
-		return redactText(text, spans, templates, {
-			issuePlaceholder: (secret) => registry.issue(secret, templates.get(detectorName)!),
-		}).text;
+		// 幂等与签发在共享尾段内完成（redactSpansWithRegistry：已是本注册表
+		// 伪值的命中跳过，防嵌套；与 regex 管线同语义）
+		return redactSpansWithRegistry(text, verdict.spans, registry, templates).text;
 	};
 
-	return { status, mask };
+	return { status, onMissing, get modelMissing() { return modelMissing; }, mask };
 }
 
-/** 创建 judge 出站扩展（ExtensionFactory）。模型解析失败不抛错——降级仅 regex 层。 */
+/** 创建 judge 出站扩展（ExtensionFactory）。模型缺失不抛错——按 onMissing 策略
+ *  fail_closed（默认）或显式降级 regex_only。 */
 export function createJudgeEgressExtension(options: JudgeEgressOptions) {
 	const masker = options.masker ?? createJudgeTextMasker(options);
 	return (pi: ExtensionAPI): void => {

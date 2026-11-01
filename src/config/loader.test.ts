@@ -181,7 +181,25 @@ describe("配置加载与校验", () => {
 			minCandidateLength: undefined,
 			concurrency: undefined,
 			redactTemplate: "secret-{hash}",
+			onMissing: undefined,
 		});
+	});
+
+	test("judge.onMissing 解析：fail_closed / regex_only 两合法值透出（缺省 undefined → 消费方默认 fail_closed）", () => {
+		for (const onMissing of ["fail_closed", "regex_only"] as const) {
+			const loader = createConfigLoader({
+				path: writeTempConfig(
+					JSON.stringify({ judge: { provider: "litellm", modelId: "jev", onMissing } }),
+				),
+			});
+			const config = loader.get();
+			expect(config.errors).toEqual([]);
+			expect(config.judge?.onMissing).toBe(onMissing);
+		}
+		const loader = createConfigLoader({
+			path: writeTempConfig(JSON.stringify({ judge: { provider: "litellm", modelId: "jev" } })),
+		});
+		expect(loader.get().judge?.onMissing).toBeUndefined(); // 未配置即默认 fail_closed
 	});
 
 	test("judge 段非法：错误可见、judge 不生效（整体回退语义）", () => {
@@ -197,6 +215,8 @@ describe("配置加载与校验", () => {
 			{ json: { judge: { provider: "litellm", modelId: "jev", minCandidateLength: 0 } }, fragment: "minCandidateLength" },
 			{ json: { judge: { provider: "litellm", modelId: "jev", concurrency: 0 } }, fragment: "concurrency" },
 			{ json: { judge: { provider: "litellm", modelId: "jev", redactTemplate: "" } }, fragment: "redactTemplate" },
+			{ json: { judge: { provider: "litellm", modelId: "jev", onMissing: "permissive" } }, fragment: "onMissing" }, // 只允许 fail_closed | regex_only
+			{ json: { judge: { provider: "litellm", modelId: "jev", onMissing: true } }, fragment: "onMissing" },
 			{ json: { judge: { provider: "litellm", modelId: "jev", gate: 0.5 } }, fragment: "judge" }, // 键名 typo 不被静默忽略
 			{ json: { judge: "litellm" }, fragment: "judge" },
 		];

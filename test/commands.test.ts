@@ -44,7 +44,7 @@ function makeCommands(configContent?: string) {
 		writeFileSync(configPath, configContent, "utf8");
 	}
 	const { factory, loader, pipeline } = createConfiguredMaskingExtension({ configPath });
-	const compaction: MaskedCompactionStatus = { fallbacks: 0, lastFallbackError: undefined };
+	const compaction: MaskedCompactionStatus = { cancellations: 0, lastCancellationError: undefined };
 	const commands = createKeepSecretCommandsExtension({ loader, pipeline, compaction });
 	return { factory, commands, loader, pipeline, compaction, configPath };
 }
@@ -149,8 +149,8 @@ function emptyJudgeStatus(): JudgeStatus {
 }
 
 /** 恒等掩码器的 judge 句柄（状态可注入；自测时假密码不被掩码）。 */
-function identityJudge(status: JudgeStatus = emptyJudgeStatus()): JudgeTextMasker {
-	return { status, mask: async (text) => text };
+function identityJudge(status: JudgeStatus = emptyJudgeStatus(), onMissing: "fail_closed" | "regex_only" = "fail_closed"): JudgeTextMasker {
+	return { status, onMissing, modelMissing: false, mask: async (text) => text };
 }
 
 /** 自测假密码样本里的真值（judge 启用时期望被掩码的串）。 */
@@ -160,6 +160,8 @@ const SELF_TEST_PASSWORD = "Xk9$mQzT7vLw2Pn4";
 function passwordJudgingJudge(status: JudgeStatus = emptyJudgeStatus()): JudgeTextMasker {
 	return {
 		status,
+		onMissing: "fail_closed",
+		modelMissing: false,
 		mask: async (text) => text.split(SELF_TEST_PASSWORD).join("key-JUDGEDFAKE1"),
 	};
 }
@@ -188,8 +190,8 @@ describe("T7 /keep-secret 状态面板", () => {
 			expect(status1).toMatch(/openai-key=1/);
 			// judge 预留位（T5 未合入）
 			expect(status1).toContain("judge：未接入");
-			// 压缩回退计数
-			expect(status1).toMatch(/掩码压缩回退：0 次/);
+			// 压缩取消计数
+			expect(status1).toMatch(/掩码压缩取消：0 次/);
 
 			// 第二轮：新 secret 入会话 → 计数器递增
 			await h.session.prompt(`rotate to ${OTHER_KEY}`);
@@ -209,10 +211,10 @@ describe("T7 /keep-secret 状态面板", () => {
 		}
 	});
 
-	test("注入状态对象：压缩回退与 judge 计数展示（已判定/截断/fail-closed/降级）", async () => {
+	test("注入状态对象：压缩取消与 judge 计数展示（已判定/截断/fail-closed/降级）", async () => {
 		const made = makeCommands();
-		made.compaction.fallbacks = 2;
-		made.compaction.lastFallbackError = "掩码压缩摘要: 摘要为空";
+		made.compaction.cancellations = 2;
+		made.compaction.lastCancellationError = "掩码压缩摘要: 摘要为空";
 		const judgeStatus = {
 			...emptyJudgeStatus(),
 			judgedTexts: 7,
@@ -226,7 +228,7 @@ describe("T7 /keep-secret 状态面板", () => {
 			judge: identityJudge(judgeStatus),
 		});
 		const text = await runCommand(withJudge, "");
-		expect(text).toMatch(/掩码压缩回退：2 次/);
+		expect(text).toMatch(/掩码压缩取消：2 次/);
 		expect(text).toContain("掩码压缩摘要: 摘要为空");
 		expect(text).toMatch(/judge：已判定 7 叶，截断 3 次，fail-closed 1 次，降级 0 叶/);
 	});
@@ -275,6 +277,32 @@ describe("T7 /keep-secret test 合成样本自测", () => {
 			expect(text).toMatch(/假密码：已掩码（期望：掩码/);
 			expect(text).toMatch(/4\/4 通过/);
 			expect(text).not.toMatch(/✗/);
+		});
+
+		test("judge 模型缺失 + fail_closed（默认）：全部样本期望掩码（含干净订单号）+ 兑底说明行", async () => {
+			const made = makeCommands();
+			// 模拟模型缺失的 fail_closed 掩码器：全部 ASCII 候选一律掩码（与真实实现同则）
+			const failClosedJudge: JudgeTextMasker = {
+				status: emptyJudgeStatus(),
+				onMissing: "fail_closed",
+				modelMissing: true,
+				mask: async (text) =>
+					text
+						.replace(/ORD-\d{8}-\d{6}/, "key-FAKEFAKEFAKE")
+						.split(SELF_TEST_PASSWORD)
+						.join("key-FAKEFAILCLS"),
+			};
+			const commands = createKeepSecretCommandsExtension({
+				loader: made.loader,
+				pipeline: made.pipeline,
+				compaction: made.compaction,
+				judge: failClosedJudge,
+			});
+			const text = await runCommand(commands, "test");
+			expect(text).toMatch(/干净订单号：已掩码（期望：掩码）✓ 通过/); // 兑底掩码属预期
+			expect(text).toMatch(/4\/4 通过/);
+			expect(text).toContain("fail_closed 已生效");
+			expect(text).toContain("judge.onMissing=\"regex_only\"");
 		});
 
 		test("judge 启用但降级（模型不可用）：假密码未被掩码，如实报未通过（warning，降级可见）", async () => {
@@ -357,6 +385,24 @@ describe("T7 /keep-secret reload 配置热重载", () => {
 		const text = await runCommand(made.commands, "reload");
 		expect(text).toContain("无变更");
 		expect(made.loader.get().detectors).toHaveLength(1);
+	});
+
+	test("非检测器段变更（judge 配置）reload → 配置已重读、检测器集无变更且仅新会话生效", async () => {
+		const made = makeCommands(ALPHA_CONFIG);
+		// 检测器集不变，仅新增 judge 段（与 loader 的 fingerprint 同口径判定为变更）
+		writeFileSync(
+			made.configPath,
+			JSON.stringify({
+				detectors: JSON.parse(ALPHA_CONFIG).detectors,
+				judge: { provider: "litellm", modelId: "typesafe/jev-latest" },
+			}),
+			"utf8",
+		);
+		const text = await runCommand(made.commands, "reload");
+		expect(text).toContain("检测器集无变更");
+		expect(text).toContain("仅新会话生效");
+		expect(text).not.toContain("已热应用"); // 检测器集未变：不触发热应用
+		expect(made.loader.get().judge?.modelId).toBe("typesafe/jev-latest");
 	});
 
 	test("reload 读到非法新配置 → notify 报错并回退内置默认集", async () => {

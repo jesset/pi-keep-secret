@@ -6,3 +6,4 @@ export {
 	type CleanCacheStats,
 	type ScanOutcome,
 } from "./clean-cache.ts";
+export { evictLRU } from "./lru.ts";

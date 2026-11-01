@@ -14,6 +14,7 @@
  * - `snapshot()`：伪值→真值副本（引擎 unmaskText 的 tokens 入参）。
  */
 import { makePlaceholder } from "../engine/index.ts";
+import { evictLRU } from "../cache/lru.ts";
 
 /** 注册表默认容量上限（对齐参考实现 registry 5000 LRU）。 */
 const DEFAULT_LIMIT = 5000;
@@ -62,11 +63,7 @@ export function createPlaceholderRegistry(
 			// 重复写入（含幂等重签）都刷新为最新（Map 尾部 = 最近使用）
 			entries.delete(placeholder);
 			entries.set(placeholder, secret);
-			while (entries.size > limit) {
-				const oldest = entries.keys().next().value;
-				if (oldest === undefined) break;
-				entries.delete(oldest);
-			}
+			evictLRU(entries, limit);
 			return placeholder;
 		},
 		has(placeholder) {
