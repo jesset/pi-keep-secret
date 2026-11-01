@@ -48,6 +48,8 @@ export interface MaskingPipeline {
 	readonly unmaskText: (text: string) => string;
 	/** 共享注册表（T3 回程还原 / T5 judge 共用）。 */
 	readonly registry: PlaceholderRegistry;
+	/** 共享 clean cache（T5 judge 接入：gate 前查询短路、非 clean 结论记墓碑）。 */
+	readonly cleanCache: CleanCache;
 	/**
 	 * 热应用新检测器集：重编译检测器并清空 clean cache（检测器集变更后
 	 * 旧的干净判定不再可信）与检测器命中计数（名集合已变）。T4 配置层
@@ -101,6 +103,7 @@ export function createMaskingPipeline(options: MaskingPipelineOptions = {}): Mas
 		maskText,
 		unmaskText: (text) => unmaskText(text, registry.snapshot()),
 		registry,
+		cleanCache,
 		applyDetectors(specs) {
 			detectors = specs.map(compileRegexDetector);
 			templates = new Map(detectors.map((detector) => [detector.name, detector.template]));

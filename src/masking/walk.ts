@@ -15,6 +15,9 @@ import type { ImageContent, SystemMessage, TextContent } from "@earendil-works/p
 /** 单文本叶的掩码函数（由检测管线提供）。 */
 export type TextMasker = (text: string) => string;
 
+/** 异步单文本叶掩码函数（judge 等 LLM 判定检测器）。 */
+export type AsyncTextMasker = (text: string) => Promise<string>;
+
 /** SystemMessage 的 prose：content（string/text 块）与 sections 字符串值；toolsAdded/toolsRemoved 豁免。 */
 function maskSystemProse(message: SystemMessage, maskText: TextMasker): void {
 	if (typeof message.content === "string") {
@@ -70,8 +73,8 @@ function maskJsonStrings(value: unknown, maskText: TextMasker): void {
  * 对消息树的文本叶原位掩码。覆盖：UserMessage（string/text 块）、
  * ToolResultMessage 的 text 块（ImageContent.data 豁免）、AssistantMessage
  * 的 text/thinking 块与 toolCall.arguments 深遍历字符串值、SystemMessage
- * 的 prose 与 sections 字符串值（toolsAdded/toolsRemoved 豁免）、
- * pi 压缩/分支摘要消息的 summary 字段（掩码压缩后携带还原真值进上下文，
+ * 的 prose 与 sections 字符串值（toolsAdded/toolsRemoved 豁免）、pi
+ * 压缩/分支摘要消息的 summary 字段（掩码压缩后携带还原真值进上下文，
  * 出站必须重掩码；T6 引入）。
  */
 export function maskMessageTree(messages: AgentMessage[], maskText: TextMasker): void {
@@ -119,4 +122,114 @@ export function maskMessageTree(messages: AgentMessage[], maskText: TextMasker):
 				break;
 		}
 	}
+}
+
+async function maskSystemProseAsync(
+	message: SystemMessage,
+	maskText: AsyncTextMasker,
+): Promise<void> {
+	if (typeof message.content === "string") {
+		message.content = await maskText(message.content);
+	} else {
+		await maskTextPartsAsync(message.content, maskText);
+	}
+	if (message.sections !== undefined) {
+		for (const key of Object.keys(message.sections)) {
+			const section = message.sections[key];
+			if (typeof section === "string") {
+				message.sections[key] = await maskText(section);
+			}
+		}
+	}
+}
+
+async function maskTextPartsAsync(
+	parts: (TextContent | ImageContent)[],
+	maskText: AsyncTextMasker,
+): Promise<void> {
+	for (const part of parts) {
+		if (part.type === "text") {
+			part.text = await maskText(part.text);
+		}
+	}
+}
+
+async function maskJsonStringsAsync(value: unknown, maskText: AsyncTextMasker): Promise<void> {
+	if (Array.isArray(value)) {
+		for (let i = 0; i < value.length; i++) {
+			const item = value[i];
+			if (typeof item === "string") {
+				value[i] = await maskText(item);
+			} else {
+				await maskJsonStringsAsync(item, maskText);
+			}
+		}
+		return;
+	}
+	if (value && typeof value === "object") {
+		for (const key of Object.keys(value)) {
+			const item = (value as Record<string, unknown>)[key];
+			if (typeof item === "string") {
+				(value as Record<string, unknown>)[key] = await maskText(item);
+			} else {
+				await maskJsonStringsAsync(item, maskText);
+			}
+		}
+	}
+}
+
+/**
+ * maskMessageTree 的异步孪生：judge（LLM 判定检测器，ticket #7）等异步
+ * 掩码路径的出站遍历。覆盖范围与同步版逐角色一致（含 T6 摘要消息的
+ * summary 字段）；同步遍历保持 T2/T6 路径零开销，不因异步检测器行变。
+ * 按消息并发（消息级并发，对齐参考实现：LLM 调用另有会话级信号量限流）。
+ */
+export async function maskMessageTreeAsync(
+	messages: AgentMessage[],
+	maskText: AsyncTextMasker,
+): Promise<void> {
+	await Promise.all(
+		messages.map(async (message) => {
+			switch (message.role) {
+				case "user": {
+					if (typeof message.content === "string") {
+						message.content = await maskText(message.content);
+					} else {
+						await maskTextPartsAsync(message.content, maskText);
+					}
+					break;
+				}
+				case "system": {
+					await maskSystemProseAsync(message, maskText);
+					break;
+				}
+				case "toolResult": {
+					await maskTextPartsAsync(message.content, maskText);
+					break;
+				}
+				case "assistant": {
+					for (const block of message.content) {
+						if (block.type === "text") {
+							block.text = await maskText(block.text);
+						} else if (block.type === "thinking") {
+							block.thinking = await maskText(block.thinking);
+						} else if (block.type === "toolCall") {
+							await maskJsonStringsAsync(block.arguments, maskText);
+						}
+					}
+					break;
+				}
+				case "compactionSummary":
+				case "branchSummary": {
+					const holder = message as { summary?: unknown };
+					if (typeof holder.summary === "string") {
+						holder.summary = await maskText(holder.summary);
+					}
+					break;
+				}
+				default:
+					break;
+			}
+		}),
+	);
 }

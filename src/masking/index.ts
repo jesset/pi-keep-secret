@@ -24,4 +24,4 @@ export {
 	type PlaceholderRegistry,
 	type PlaceholderRegistryOptions,
 } from "./registry.ts";
-export { maskMessageTree, type TextMasker } from "./walk.ts";
+export { maskMessageTree, maskMessageTreeAsync, type TextMasker, type AsyncTextMasker } from "./walk.ts";
