@@ -1,0 +1,64 @@
+/**
+ * ticket #4 验收用例（接缝 1）：正式扩展（extension/index.ts）经
+ * extensionPaths 加载，断言只看外部行为——假供应商收到什么、本地
+ * transcript 收到什么。参考 GitHub issue jesset/pi-keep-secret#4 的
+ * Acceptance criteria 逐条落成用例。
+ */
+import { join } from "node:path";
+import { describe, expect, test } from "bun:test";
+import { createHarnessSession, requestText } from "../src/harness/fake-session.ts";
+
+/** 正式扩展入口（目录扩展 index.ts 工厂，内置默认检测器）。 */
+const EXTENSION_ENTRY = join(import.meta.dir, "..", "extension", "index.ts");
+
+/** 各默认检测器格式的真值样本（形状对齐内置默认检测器集）。 */
+const OPENAI_KEY = "sk-live-abcdefghijklmnopqrst";
+
+describe("T2 出站掩码：context_with_system 消息树遍历", () => {
+	test("user prompt 密钥出站只见伪值，transcript 保留真值", async () => {
+		const h = await createHarnessSession({ extensionPaths: [EXTENSION_ENTRY] });
+		try {
+			h.provider.setScript([{ text: "ack" }]);
+			await h.session.prompt(`deploy with ${OPENAI_KEY}`);
+
+			const [request] = h.provider.requests();
+			expect(requestText(request)).not.toContain(OPENAI_KEY);
+			const masked = requestText(request).match(/sk-[A-Z2-7]{12}/);
+			expect(masked).not.toBeNull(); // 格式保真伪值（sk-{hash}）
+
+			// 请求本地改写：本地 transcript 用户消息仍写真值
+			const lastUser = [...h.session.messages].reverse().find((m) => m.role === "user");
+			expect(JSON.stringify(lastUser?.content)).toContain(OPENAI_KEY);
+		} finally {
+			h.dispose();
+		}
+	});
+
+	test("同一 secret 跨两轮出站伪值一致（一致性哈希锚点）", async () => {
+		const h = await createHarnessSession({ extensionPaths: [EXTENSION_ENTRY] });
+		try {
+			h.provider.setScript([{ text: "ack" }, { text: "ok" }]);
+			await h.session.prompt(`first use ${OPENAI_KEY}`);
+			await h.session.prompt(`second use ${OPENAI_KEY}`);
+
+			const [req1, req2] = h.provider.requests();
+			const ph1 = requestText(req1).match(/sk-[A-Z2-7]{12}/)?.[0];
+			const ph2 = requestText(req2).match(/sk-[A-Z2-7]{12}/)?.[0];
+			expect(ph1).toBeDefined();
+			expect(ph2).toBe(ph1);
+			// 两轮出站都不含真值；本地 transcript 两轮用户消息都是真值
+			for (const request of h.provider.requests()) {
+				expect(requestText(request)).not.toContain(OPENAI_KEY);
+			}
+			const userTexts = h.session.messages
+				.filter((m) => m.role === "user")
+				.map((m) => JSON.stringify(m.content));
+			expect(userTexts).toHaveLength(2);
+			for (const text of userTexts) {
+				expect(text).toContain(OPENAI_KEY);
+			}
+		} finally {
+			h.dispose();
+		}
+	});
+});
