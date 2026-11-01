@@ -34,13 +34,13 @@ const ORDER = "1029384756";
 /** regex 层锚（内置默认检测器；降级用例证明 regex 照常工作）。 */
 const OPENAI_KEY = "sk-live-abcdefghijklmnopqrst";
 
-/** 进程内假 classifier 模型（typesafe-system-one 形态，仅测试）。 */
-function fakeClassifierModel(): ClassifierModel<ClassifierApi> {
+/** 进程内假 classifier 模型（仅测试；api 可指定两种线缆形态）。 */
+function fakeClassifierModel(api: string = "typesafe-system-one"): ClassifierModel<ClassifierApi> {
 	return {
 		type: "classifier",
 		id: "jev-fake",
 		name: "Fake Jev",
-		api: "typesafe-system-one",
+		api,
 		provider: "keep-secret-fake",
 		baseUrl: "http://127.0.0.1:1/fake",
 		input: ["text"],
@@ -424,5 +424,85 @@ describe("T8 judge 文本掩码器（createJudgeTextMasker）", () => {
 		expect(masked).not.toContain(OPENAI_KEY);
 		expect(masked).toMatch(/key-[A-Z2-7]{12}/);
 		expect(masked).toMatch(/sk-[A-Z2-7]{12}/);
+	});
+});
+
+describe("T14 judge 双协议（judge.api 与模型注册 api 一致性）", () => {
+	/** 无 UI 的最小 ctx（降级/故障告警在无 UI 模式仅计数与 lastResolutionError）。 */
+	const noUiCtx = { hasUI: false } as unknown as ExtensionContext;
+
+	test("api 匹配即装配判定：systemone/typesafe-system-one 与 decisions/openai-decisions 两协议各走通", async () => {
+		const pairs = [
+			["systemone", "typesafe-system-one"],
+			["decisions", "openai-decisions"],
+		] as const;
+		for (const [api, modelApi] of pairs) {
+			const pipeline = createMaskingPipeline();
+			const fake = scriptClassify({
+				gate: () => 0.98,
+				candidate: (value) => (value === PASSWORD ? 0.96 : 0.04),
+			});
+			const masker = createJudgeTextMasker({
+				modelRef: MODEL_REF,
+				pipeline,
+				api, // 配置提示与模型注册 api 一致 → 正常装配
+				resolveModel: () => fakeClassifierModel(modelApi),
+				classify: (_m, context) => fake.classify(context),
+			});
+			const masked = await masker.mask(`部署密码 ${PASSWORD}，订单 ${ORDER}`, noUiCtx);
+			expect(masked).not.toContain(PASSWORD); // judge 命中 → 伪值
+			expect(masked).toContain(ORDER); // 判非凭据：保留
+			expect(masker.status.judgedTexts).toBeGreaterThan(0);
+			expect(masker.status.degradedTexts).toBe(0);
+		}
+	});
+
+	test("缺省 api：跟随模型注册条目——两种协议假模型均装配并走通两阶段判定", async () => {
+		for (const modelApi of ["typesafe-system-one", "openai-decisions"] as const) {
+			const pipeline = createMaskingPipeline();
+			const fake = scriptClassify({
+				gate: () => 0.98,
+				candidate: (value) => (value === PASSWORD ? 0.96 : 0.04),
+			});
+			const masker = createJudgeTextMasker({
+				modelRef: MODEL_REF,
+				pipeline, // 不传 api：不校验，协议由模型注册条目的 api 字段决定
+				resolveModel: () => fakeClassifierModel(modelApi),
+				classify: (_m, context) => fake.classify(context),
+			});
+			const masked = await masker.mask(`部署密码 ${PASSWORD}，订单 ${ORDER}`, noUiCtx);
+			expect(masked).not.toContain(PASSWORD);
+			expect(masked).toContain(ORDER);
+			expect(masked).toMatch(/key-[A-Z2-7]{12}/);
+			// 两阶段形态：首轮仅 gate 问，命中后第二批才是候选问
+			expect(Object.keys(fake.calls[0]!.questions)).toEqual(["gate"]);
+			expect(Object.keys(fake.calls[1]!.questions).every((id) => id.startsWith("cand_"))).toBe(true);
+		}
+	});
+
+	test("api 不匹配：配置错误语义——不装配 judge（文本原样交 regex 层，不 fail_closed 兑底）、错误可见、墓碑", async () => {
+		const pipeline = createMaskingPipeline();
+		const status = emptyStatus();
+		const fake = scriptClassify({ gate: () => 0.98, candidate: () => 0.96 });
+		const masker = createJudgeTextMasker({
+			modelRef: MODEL_REF,
+			pipeline,
+			status,
+			api: "decisions", // 与模型注册的 typesafe-system-one 不一致
+			resolveModel: () => fakeClassifierModel("typesafe-system-one"),
+			classify: (_m, context) => fake.classify(context),
+		});
+		const text = `部署密码 ${PASSWORD}，订单 ${ORDER}`;
+		const masked = await masker.mask(text, noUiCtx);
+		expect(masked).toBe(text); // 配置错误 ≠ judge 故障：不走 fail_closed 兑底，文本原样交 regex 层
+		expect(status.judgedTexts).toBe(0);
+		expect(fake.calls.length).toBe(0); // 未发起任何判定调用
+		expect(status.degradedTexts).toBe(1); // 降级按文本叶计数，不静默
+		expect(status.lastResolutionError).toContain("decisions");
+		expect(status.lastResolutionError).toContain("typesafe-system-one");
+		expect(status.lastResolutionError).toContain("keep-secret-fake/jev-fake");
+		// 墓碑：regex 层零命中也不得把该文本写成干净（防配置修正后 judge 恢复被缓存短路）
+		pipeline.maskText(text);
+		expect(pipeline.cleanCache.isClean(text)).toBe(false);
 	});
 });

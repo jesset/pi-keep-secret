@@ -19,6 +19,11 @@
  *   ctx.ui.notify（有 UI 时）+ 状态栏标记 + JudgeStatus 每请求计数
  *   （无 UI 模式仅计数）。
  *
+ * T14（ticket #14）：`api` 选项（config.json 的 judge.api）是线缆协议
+ * 提示——缺省不校验（跟随模型注册条目的 api 字段，适配器协议无关）；
+ * 填写则模型解析后比对 MODEL_API_BY_JUDGE_API，不一致 → 配置错误语义
+ * （同 judge 段非法整体回退）：不装配 judge、仅 regex 层、错误可见。
+ *
  * fail_closed：judge verdict 中未验证候选已并入 spans 掩码（真值由注册表
  * 本地保留，可恢复）；classify 错误计入状态并（有 UI 时）告警。
  */
@@ -30,7 +35,7 @@ import type {
 	ClassifierResult,
 } from "@earendil-works/pi-ai";
 import { extractCandidates, type Span } from "../engine/index.ts";
-import type { JudgeOnMissing } from "../config/loader.ts";
+import type { JudgeApi, JudgeOnMissing } from "../config/loader.ts";
 import type { MaskingPipeline } from "../masking/index.ts";
 import { maskMessageTreeAsync, redactSpansWithRegistry } from "../masking/index.ts";
 import {
@@ -45,6 +50,19 @@ export const DEFAULT_JUDGE_TEMPLATE = "key-{hash}";
 
 /** 告警状态栏键（降级/fail_closed 发生后持续可见，由用户清除）。 */
 const STATUS_KEY = "keep-secret-judge";
+
+/**
+ * judge.api 配置值 ↔ pi-ai classifier 模型注册 api（T14）：两处分工——
+ * loader（config/loader.ts）只校验 judge.api 合法值
+ * （systemone|decisions），一致性比对在装配处（本掩码器模型解析后）：
+ * model.api 与映射不一致 → 配置错误（同 judge 段非法整体回退语义）。
+ * 适配器本身协议无关（走 modelRegistry.classify，传输协议由模型注册
+ * 条目的 api 字段决定），仅此提示键做防 typo 校验。
+ */
+export const MODEL_API_BY_JUDGE_API: Record<JudgeApi, string> = {
+	systemone: "typesafe-system-one",
+	decisions: "openai-decisions",
+};
 
 /** classifier 模型配置引用（provider/modelId；判定模型/端点是配置，规格 #1 故事 34）。 */
 export interface ClassifierModelRef {
@@ -67,9 +85,10 @@ export type ClassifyChannel = (
 /** judge 故障与降级状态（/keep-secret 状态面与测试断言用；不静默降级）。 */
 export interface JudgeStatus {
 	/** classifier 模型解析失败而降级放行的文本叶数（onMissing=regex_only 时
-	 *  递增；该类叶仅 regex 层工作）。 */
+	 *  递增；judge.api 与模型注册 api 不一致的配置错误降级同样递增——
+	 *  两部都是 judge 层不工作、文本交后置 regex 层）。 */
 	degradedTexts: number;
-	/** 最近一次模型解析失败原因（fail_closed / regex_only 两策略都记录）。 */
+	/** 最近一次模型解析/协议一致性失败原因（降级与 fail_closed 两路径都记录）。 */
 	lastResolutionError: string | undefined;
 	/** 已判定文本叶数（至少发起一次 gate）。 */
 	judgedTexts: number;
@@ -100,6 +119,11 @@ export interface JudgeEgressOptions extends Omit<SystemOneJudgeOptions, "classif
 	masker?: JudgeTextMasker;
 	/** classifier 模型缺失策略，默认 fail_closed（见 config/loader.ts JudgeOnMissing）。 */
 	onMissing?: JudgeOnMissing;
+	/** 期望线缆协议（config.json 的 judge.api；缺省 undefined 不校验——
+	 *  跟随模型注册条目的 api 字段。填写则模型解析后与
+	 *  MODEL_API_BY_JUDGE_API 比对，不一致按配置错误处理：不装配
+	 *  judge、仅 regex 层、错误可见）。 */
+	api?: JudgeApi;
 }
 
 const defaultResolveModel: ModelResolver = (ctx, ref) =>
@@ -148,6 +172,7 @@ export function createJudgeTextMasker(options: JudgeEgressOptions): JudgeTextMas
 
 	let judge: SystemOneJudge | undefined;
 	let notifiedModelMissing = false;
+	let notifiedApiMismatch = false;
 	let notifiedError: string | undefined;
 	let modelMissing = false;
 
@@ -211,6 +236,28 @@ export function createJudgeTextMasker(options: JudgeEgressOptions): JudgeTextMas
 				status.failClosed += 1;
 				pipeline.cleanCache.remember(text, { hasSecret: true }); // 墓碑同记
 				return maskUnverifiedLocally(text);
+			}
+			// judge.api 一致性比对（T14，装配处分工）：模型在位但注册 api 与
+			// 配置提示不一致 → 配置错误（同 judge 段非法整体回退语义）：不装配
+			// judge、文本原样交后置 regex 层（不走 fail_closed 兑底——配置错误非
+			// judge 故障）、错误可见（notify/状态栏 + lastResolutionError +
+			// degradedTexts）+ 墓碑（防配置修正后 judge 恢复被 clean cache 短路）
+			if (options.api !== undefined && model.api !== MODEL_API_BY_JUDGE_API[options.api]) {
+				status.lastResolutionError =
+					`judge.api "${options.api}" 与模型注册 api "${model.api}"（${modelRef.provider}/${modelRef.modelId}）不一致——配置错误，judge 未接入（仅 regex 检测层）`;
+				if (!notifiedApiMismatch) {
+					notifiedApiMismatch = true;
+					if (ctx.hasUI) {
+						ctx.ui.notify(
+							`pi-keep-secret: judge 配置错误——judge.api "${options.api}" 与模型 ${modelRef.provider}/${modelRef.modelId} 注册的 api "${model.api}" 不一致，judge 未接入（仅 regex 检测层）；请修正 config.json 的 judge.api 或模型注册条目`,
+							"error",
+						);
+						ctx.ui.setStatus(STATUS_KEY, "pi-keep-secret judge 未接入（judge.api 与模型注册 api 不一致）");
+					}
+				}
+				status.degradedTexts += 1;
+				pipeline.cleanCache.remember(text, { hasSecret: true });
+				return text;
 			}
 			// classify 通道绑定首次解析到的 modelRegistry 与模型（会话生命周期稳定）
 			modelMissing = false;
