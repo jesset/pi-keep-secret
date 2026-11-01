@@ -22,6 +22,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import { createConfiguredMaskingExtension, CONFIG_PATH_ENV } from "../src/config/index.ts";
 import type { MaskedCompactionStatus } from "../src/compaction/index.ts";
 import { createKeepSecretCommandsExtension } from "../src/commands/index.ts";
+import type { JudgeStatus, JudgeTextMasker } from "../src/judge/index.ts";
 import { createHarnessSession, requestText } from "../src/harness/fake-session.ts";
 
 const OPENAI_KEY = "sk-live-abcdefghijklmnopqrst";
@@ -136,6 +137,33 @@ async function runCommand(commands: (pi: ExtensionAPI) => void, args: string): P
 	return notifications.map((n) => n.message).join("\n");
 }
 
+/** 空状态计数（每用例独立实例）。 */
+function emptyJudgeStatus(): JudgeStatus {
+	return {
+		degradedTexts: 0,
+		lastResolutionError: undefined,
+		judgedTexts: 0,
+		failClosed: 0,
+		truncatedCandidates: 0,
+	};
+}
+
+/** 恒等掩码器的 judge 句柄（状态可注入；自测时假密码不被掩码）。 */
+function identityJudge(status: JudgeStatus = emptyJudgeStatus()): JudgeTextMasker {
+	return { status, mask: async (text) => text };
+}
+
+/** 自测假密码样本里的真值（judge 启用时期望被掩码的串）。 */
+const SELF_TEST_PASSWORD = "Xk9$mQzT7vLw2Pn4";
+
+/** 命中假密码的 judge 句柄（模拟可用 judge：仅掩密码样本真值）。 */
+function passwordJudgingJudge(status: JudgeStatus = emptyJudgeStatus()): JudgeTextMasker {
+	return {
+		status,
+		mask: async (text) => text.split(SELF_TEST_PASSWORD).join("key-JUDGEDFAKE1"),
+	};
+}
+
 describe("T7 /keep-secret 状态面板", () => {
 	const OTHER_KEY = "sk-live-zyxwvutsrqponmlkjih";
 
@@ -181,20 +209,26 @@ describe("T7 /keep-secret 状态面板", () => {
 		}
 	});
 
-	test("注入状态对象：压缩回退与 judge 预留位展示计数与原因", async () => {
+	test("注入状态对象：压缩回退与 judge 计数展示（已判定/截断/fail-closed/降级）", async () => {
 		const made = makeCommands();
 		made.compaction.fallbacks = 2;
 		made.compaction.lastFallbackError = "掩码压缩摘要: 摘要为空";
+		const judgeStatus = {
+			...emptyJudgeStatus(),
+			judgedTexts: 7,
+			failClosed: 1,
+			truncatedCandidates: 3,
+		};
 		const withJudge = createKeepSecretCommandsExtension({
 			loader: made.loader,
 			pipeline: made.pipeline,
 			compaction: made.compaction,
-			judge: { truncations: 3, fallbacks: 1 },
+			judge: identityJudge(judgeStatus),
 		});
 		const text = await runCommand(withJudge, "");
 		expect(text).toMatch(/掩码压缩回退：2 次/);
 		expect(text).toContain("掩码压缩摘要: 摘要为空");
-		expect(text).toMatch(/judge：截断 3 次，fail-closed 回退 1 次/);
+		expect(text).toMatch(/judge：已判定 7 叶，截断 3 次，fail-closed 1 次，降级 0 叶/);
 	});
 
 	test("非法配置：状态面报配置错误与回退标记（无 UI 模式的错误可见出口）", async () => {
@@ -221,11 +255,46 @@ describe("T7 /keep-secret test 合成样本自测", () => {
 		expect(text).toMatch(/sk- 假 key：已掩码（期望：掩码）✓ 通过/);
 		expect(text).toMatch(/URL 藏 key：已掩码（期望：掩码）✓ 通过/);
 		expect(text).toMatch(/干净订单号：未掩码（期望：未掩码）✓ 通过/);
-		expect(text).toMatch(/假密码：未掩码（期望：未掩码——regex 层不命中/);
+		expect(text).toMatch(/假密码：未掩码（期望：未掩码——低熵密码 regex 层不命中/);
 		expect(text).toMatch(/4\/4 通过/);
 
 		// 自测实际驱动会话管线：两个样本 key 名自册表新增 2 条伪值
 		expect(made.pipeline.registry.size).toBe(2);
+	});
+
+	describe("T8 自测假密码期望随 judge 启用动态化", () => {
+		test("judge 启用且可用：假密码经 judge 掩码，期望掩码，全部通过（info）", async () => {
+			const made = makeCommands();
+			const commands = createKeepSecretCommandsExtension({
+				loader: made.loader,
+				pipeline: made.pipeline,
+				compaction: made.compaction,
+				judge: passwordJudgingJudge(),
+			});
+			const text = await runCommand(commands, "test");
+			expect(text).toMatch(/假密码：已掩码（期望：掩码/);
+			expect(text).toMatch(/4\/4 通过/);
+			expect(text).not.toMatch(/✗/);
+		});
+
+		test("judge 启用但降级（模型不可用）：假密码未被掩码，如实报未通过（warning，降级可见）", async () => {
+			const made = makeCommands();
+			const degraded = { ...emptyJudgeStatus(), degradedTexts: 2 };
+			const commands = createKeepSecretCommandsExtension({
+				loader: made.loader,
+				pipeline: made.pipeline,
+				compaction: made.compaction,
+				judge: identityJudge(degraded),
+			});
+			const { commandHandler } = registerExtension(commands);
+			const { ctx, notifications } = recordingContext();
+			await commandHandler!("test", ctx);
+			expect(notifications[0].type).toBe("warning");
+			const text = notifications[0].message;
+			expect(text).toMatch(/假密码：未掩码（期望：掩码/);
+			expect(text).toMatch(/3\/4 通过/);
+			expect(text).toContain("judge 已降级");
+		});
 	});
 
 	test("当前检测器集未覆盖 sk- 时如实报告未通过（warning）", async () => {

@@ -1,5 +1,1 @@
-export {
-	createKeepSecretCommandsExtension,
-	type JudgeStats,
-	type KeepSecretCommandsOptions,
-} from "./extension.ts";
+export { createKeepSecretCommandsExtension, type KeepSecretCommandsOptions } from "./extension.ts";
