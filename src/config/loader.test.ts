@@ -248,6 +248,41 @@ describe("配置加载与校验", () => {
 	});
 });
 
+describe("detectorsMode 策略开关（ticket #13 / T13）", () => {
+	test("merge：同名用户项覆盖内置（保持内置序在前），非同名追加在内置之后", () => {
+		const loader = createConfigLoader({
+			path: writeTempConfig(
+				JSON.stringify({
+					detectorsMode: "merge",
+					detectors: [
+						{
+							name: "openai-key",
+							pattern: "sk-live-[A-Za-z0-9_-]{20,}",
+							redactTemplate: "sk-live-{hash}",
+						},
+						{
+							name: "corp-api-key",
+							pattern: "corp-[A-Za-z0-9]{20,}",
+							redactTemplate: "corp-{hash}",
+						},
+					],
+				}),
+			),
+		});
+		const config = loader.get();
+		expect(config.errors).toEqual([]);
+		expect(config.detectorsMode).toBe("merge");
+		// openai-key 在内置位置被用户项覆盖（pattern/redactTemplate 均为用户值），
+		// 其余内置保持原序，corp-api-key 追加在末尾（共 8 个）
+		expect(config.detectors).toEqual([
+			{ name: "openai-key", pattern: "sk-live-[A-Za-z0-9_-]{20,}", template: "sk-live-{hash}" },
+			...DEFAULT_DETECTOR_SPECS.slice(1),
+			{ name: "corp-api-key", pattern: "corp-[A-Za-z0-9]{20,}", template: "corp-{hash}" },
+		]);
+		expect(config.detectors).toHaveLength(8);
+	});
+});
+
 describe("配置热重载（load/reload/订阅变更）", () => {
 	let savedEnv: string | undefined;
 	beforeEach(() => {

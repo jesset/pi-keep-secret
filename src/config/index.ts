@@ -20,6 +20,7 @@ export {
 	type CleanCacheConfig,
 	type ConfigLoader,
 	type ConfigLoaderOptions,
+	type DetectorsMode,
 	type JudgeConfig,
 	type JudgeOnMissing,
 	type ResolvedConfig,
