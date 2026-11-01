@@ -138,8 +138,8 @@ describe("配置加载与校验", () => {
 			path: writeTempConfig(
 				JSON.stringify({
 					detectors: [{ name: "corp-api-key", pattern: "corp-[A-Za-z0-9]{20,}" }],
-					hashLength: 20,
-					cleanCache: { limit: 100, ttlMs: 3600_000 },
+				hashLength: 20,
+				cleanCache: { limit: 100, ttlMs: 3600_000 },
 				}),
 			),
 		});
@@ -147,6 +147,66 @@ describe("配置加载与校验", () => {
 		expect(config.errors).toEqual([]);
 		expect(config.hashLength).toBe(20);
 		expect(config.cleanCache).toEqual({ limit: 100, ttlMs: 3600_000 });
+	});
+
+	test("未配置 judge 段：judge 为 undefined（仅 regex 检测层）", () => {
+		const loader = createConfigLoader({ path: writeTempConfig(CORP_CONFIG) });
+		expect(loader.get().judge).toBeUndefined();
+	});
+
+	test("judge 段解析：provider/modelId 必填，阈值调参透出（未配项 undefined）", () => {
+		const loader = createConfigLoader({
+			path: writeTempConfig(
+				JSON.stringify({
+					judge: {
+					provider: "litellm",
+					modelId: "typesafe/jev-latest",
+					gateThreshold: 0.4,
+					candidateThreshold: 0.8,
+					redactTemplate: "secret-{hash}",
+					},
+				}),
+			),
+		});
+		const config = loader.get();
+		expect(config.errors).toEqual([]);
+		expect(config.judge).toEqual({
+			provider: "litellm",
+			modelId: "typesafe/jev-latest",
+			gateThreshold: 0.4,
+			candidateThreshold: 0.8,
+			batchSize: undefined,
+			maxBatches: undefined,
+			maxChars: undefined,
+			minCandidateLength: undefined,
+			concurrency: undefined,
+			redactTemplate: "secret-{hash}",
+		});
+	});
+
+	test("judge 段非法：错误可见、judge 不生效（整体回退语义）", () => {
+		const cases: Array<{ json: unknown; fragment: string }> = [
+			{ json: { judge: { modelId: "jev" } }, fragment: "provider" },
+			{ json: { judge: { provider: "litellm" } }, fragment: "modelId" },
+			{ json: { judge: { provider: "", modelId: "jev" } }, fragment: "provider" },
+			{ json: { judge: { provider: "litellm", modelId: "jev", gateThreshold: 2 } }, fragment: "gateThreshold" },
+			{ json: { judge: { provider: "litellm", modelId: "jev", candidateThreshold: "0.7" } }, fragment: "candidateThreshold" },
+			{ json: { judge: { provider: "litellm", modelId: "jev", batchSize: 0 } }, fragment: "batchSize" },
+			{ json: { judge: { provider: "litellm", modelId: "jev", maxBatches: 1.5 } }, fragment: "maxBatches" },
+			{ json: { judge: { provider: "litellm", modelId: "jev", maxChars: 0 } }, fragment: "maxChars" },
+			{ json: { judge: { provider: "litellm", modelId: "jev", minCandidateLength: 0 } }, fragment: "minCandidateLength" },
+			{ json: { judge: { provider: "litellm", modelId: "jev", concurrency: 0 } }, fragment: "concurrency" },
+			{ json: { judge: { provider: "litellm", modelId: "jev", redactTemplate: "" } }, fragment: "redactTemplate" },
+			{ json: { judge: { provider: "litellm", modelId: "jev", gate: 0.5 } }, fragment: "judge" }, // 键名 typo 不被静默忽略
+			{ json: { judge: "litellm" }, fragment: "judge" },
+		];
+		for (const { json, fragment } of cases) {
+			const loader = createConfigLoader({ path: writeTempConfig(JSON.stringify(json)) });
+			const config = loader.get();
+			expect(config.errors.join("\n")).toContain(fragment);
+			expect(config.judge).toBeUndefined(); // 任一非法：judge 段不生效（不部分采纳）
+			expect(config.detectors).toEqual(DEFAULT_DETECTOR_SPECS);
+		}
 	});
 
 	test("路径解析优先级：显式参数 > 环境变量 > 未设时的默认路径", () => {

@@ -6,28 +6,23 @@
  *   以当前配置检测器集为准），命中即非阻塞 notify（不改写、不阻断；
  *   无 UI 模式 notify 为 no-op，静默）。
  * - `/keep-secret`：状态面板（检测器配置摘要/注册表/clean cache/各检测
- *   器命中/judge 预留位/压缩回退计数）。
- * - `/keep-secret test`：合成样本内联自测。
+ *   器命中/judge 计数（T8 接入：配置 judge 段后展示已判定/截断/fail-
+ *   closed/降级计数）/压缩回退计数）。
+ * - `/keep-secret test`：合成样本内联自测（judge 启用时经 judge→regex
+ *   全链评估，假密码项期望掩码；降级时如实报未通过）。
  * - `/keep-secret reload`：配置热重载（loader.reload → applyDetectors）。
  *
  * 三模式安全降级：输出一律经 ctx.ui.notify（TUI 直接可见、RPC 经
  * extension_ui_request 转发、print/json no-op 静默），无任何交互原语
  * （select/confirm/custom），无 UI 也不影响命令动作本身执行。
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { compileRegexDetector, detectRegexSpans, type CompiledRegexDetector } from "../engine/index.ts";
 import { DEFAULT_DETECTOR_SPECS } from "../masking/detectors.ts";
 import type { MaskingPipeline } from "../masking/index.ts";
 import type { ConfigLoader } from "../config/index.ts";
 import type { MaskedCompactionStatus } from "../compaction/index.ts";
-
-/** T5 judge 计数预留位（judge 未合入时缺省 → 状态面显示「未接入」）。 */
-export interface JudgeStats {
-	/** 候选分批超上限被截断的次数。 */
-	truncations: number;
-	/** judge 失败触发 fail-closed 掩码的次数。 */
-	fallbacks: number;
-}
+import type { JudgeTextMasker } from "../judge/index.ts";
 
 export interface KeepSecretCommandsOptions {
 	/** 配置 loader（状态面的配置摘要来源；reload 动作消费）。 */
@@ -36,8 +31,13 @@ export interface KeepSecretCommandsOptions {
 	pipeline: MaskingPipeline;
 	/** 掩码压缩故障状态（状态面的回退计数来源）。 */
 	compaction: MaskedCompactionStatus;
-	/** T5 judge 计数（预留位；缺省显示「未接入」）。 */
-	judge?: JudgeStats;
+	/**
+	 * judge 文本掩码器（T8 正式接线：配置 judge 段时由组合根传入同一实例）。
+	 * 缺省（未配置 judge 段）状态面显示「未接入」，自测假密码项期望未掩码；
+	 * 传入时状态面展示 JudgeStatus 计数，自测经 judge→regex 全链评估，
+	 * 假密码项期望掩码（降级时如实报未通过——降级可见信号）。
+	 */
+	judge?: JudgeTextMasker;
 }
 
 /** 预检快扫检测器集（内置默认集编译态；与配置无关的固定提示层）。 */
@@ -93,8 +93,8 @@ function buildStatusReport(options: KeepSecretCommandsOptions): string {
 	);
 	lines.push(
 		options.judge === undefined
-			? "judge：未接入（T5 未合入）"
-			: `judge：截断 ${options.judge.truncations} 次，fail-closed 回退 ${options.judge.fallbacks} 次`,
+			? "judge：未接入（未配置 judge 段，仅 regex 检测层）"
+			: `judge：已判定 ${options.judge.status.judgedTexts} 叶，截断 ${options.judge.status.truncatedCandidates} 次，fail-closed ${options.judge.status.failClosed} 次，降级 ${options.judge.status.degradedTexts} 叶`,
 	);
 	lines.push(
 		`掩码压缩回退：${options.compaction.fallbacks} 次` +
@@ -105,12 +105,15 @@ function buildStatusReport(options: KeepSecretCommandsOptions): string {
 	return lines.join("\n");
 }
 
-/** 自测合成样本（固定常量；期望针对 regex 掩码层）。 */
+/** 自测合成样本（固定常量；假密码项的期望随 judge 是否启用动态化）。 */
 interface SelfTestSample {
 	label: string;
 	text: string;
+	/** judge 未启用时的期望（regex 层口径）。 */
 	expectMasked: boolean;
-	/** 期望说明（如假密码的 regex 层/judge 职责边界）。 */
+	/** judge 启用时的期望（覆盖 expectMasked：低熵密码归 judge 层）。 */
+	expectMaskedWithJudge?: boolean;
+	/** 期望说明。 */
 	note?: string;
 }
 
@@ -129,7 +132,8 @@ const SELF_TEST_SAMPLES: SelfTestSample[] = [
 		label: "假密码",
 		text: "密码不是 hunter2secret，是 Xk9$mQzT7vLw2Pn4",
 		expectMasked: false,
-		note: "regex 层不命中；低熵密码归 judge（T5 合入后改判）",
+		expectMaskedWithJudge: true,
+		note: "低熵密码 regex 层不命中，归 judge 层（配置 judge 段启用后本项期望掩码）",
 	},
 	{
 		label: "干净订单号",
@@ -138,18 +142,30 @@ const SELF_TEST_SAMPLES: SelfTestSample[] = [
 	},
 ];
 
-/** /keep-secret test：合成样本逐项过会话管线，报告掩码结果与期望是否一致。 */
-function buildSelfTestReport(pipeline: MaskingPipeline): { text: string; allPassed: boolean } {
+/** /keep-secret test：合成样本逐项过会话链路（judge→regex 同出站序），报告掩码结果与期望是否一致。 */
+async function buildSelfTestReport(
+	options: KeepSecretCommandsOptions,
+	ctx: ExtensionCommandContext,
+): Promise<{ text: string; allPassed: boolean }> {
+	const judgeEnabled = options.judge !== undefined;
 	const lines = ["pi-keep-secret 自测（合成样本，当前生效检测器集）"];
 	let passed = 0;
 	for (const sample of SELF_TEST_SAMPLES) {
-		const masked = pipeline.maskText(sample.text) !== sample.text;
-		const ok = masked === sample.expectMasked;
+		// 与出站链同序：judge 先判原文，regex 后兑底（伪值幂等跳过）；
+		// judge 降级时 mask 原样返回，仅 regex 层结果——假密码项如实报未通过
+		let current = sample.text;
+		if (options.judge !== undefined) {
+			current = await options.judge.mask(current, ctx);
+		}
+		current = options.pipeline.maskText(current);
+		const masked = current !== sample.text;
+		const expectMasked = judgeEnabled ? (sample.expectMaskedWithJudge ?? sample.expectMasked) : sample.expectMasked;
+		const ok = masked === expectMasked;
 		if (ok) {
 			passed += 1;
 		}
 		lines.push(
-			`${sample.label}：${masked ? "已掩码" : "未掩码"}（期望：${sample.expectMasked ? "掩码" : "未掩码"}${
+			`${sample.label}：${masked ? "已掩码" : "未掩码"}（期望：${expectMasked ? "掩码" : "未掩码"}${
 				sample.note === undefined ? "" : `——${sample.note}`
 			}）${ok ? "✓ 通过" : "✗ 未通过"}`,
 		);
@@ -158,6 +174,14 @@ function buildSelfTestReport(pipeline: MaskingPipeline): { text: string; allPass
 	lines.push(
 		`${passed}/${SELF_TEST_SAMPLES.length} 通过${allPassed ? "" : "（有未通过项——请检查当前检测器配置）"}`,
 	);
+	if (
+		judgeEnabled &&
+		options.judge !== undefined &&
+		options.judge.status.degradedTexts > 0 &&
+		!allPassed
+	) {
+		lines.push("注意：judge 已降级（classifier 模型不可用，仅 regex 检测层工作）——假密码项未通过即降级信号");
+	}
 	return { text: lines.join("\n"), allPassed };
 }
 
@@ -184,7 +208,7 @@ export function createKeepSecretCommandsExtension(options: KeepSecretCommandsOpt
 					break;
 				}
 				case "test": {
-					const report = buildSelfTestReport(options.pipeline);
+					const report = await buildSelfTestReport(options, ctx);
 					ctx.ui.notify(report.text, report.allPassed ? "info" : "warning");
 					break;
 				}

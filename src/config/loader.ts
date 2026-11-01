@@ -9,12 +9,18 @@
  *       "redactTemplate": "corp-{hash}" }
  *   ],
  *   "hashLength": 20,
- *   "cleanCache": { "limit": 20000, "ttlMs": 86400000 }
+ *   "cleanCache": { "limit": 20000, "ttlMs": 86400000 },
+ *   "judge": { "provider": "litellm", "modelId": "typesafe/jev-latest" }
  * }
  * ```
  * - `detectors` **整体替换**内置默认集（对齐参考实现 secret_detectors
  *   语义，用户故事 30「tune detectors」）；`redactTemplate` 映射为引擎
  *   RegexDetectorSpec.template，产物可直接喂 createEgressMaskingExtension。
+ * - `judge`（T8 正式接线）：System One 判定检测器配置——provider/modelId
+ *   必填 + 阈值/批参/并发/伪值模板可调；未配置即不接入 judge（仅 regex
+ *   检测层）；模型解析失败时扩展显式降级（见 src/judge/extension.ts）。
+ *   judge 段变更与 hashLength/cleanCache 同语义：仅新会话生效（会话内
+ *   的 judge 装配在工厂创建时定格）。
  * - 路径解析优先级：显式参数 > 环境变量 PI_KEEP_SECRET_CONFIG > 默认
  *   ~/.pi/agent/extensions/pi-keep-secret/config.json。
  * - 文件不存在 → 内置默认集、无错误（默认安装无配置文件）。
@@ -46,6 +52,34 @@ export interface CleanCacheConfig {
 	ttlMs?: number;
 }
 
+/**
+ * judge（T5 System One 判定检测器）配置段（T8 正式接线）：未配置即
+ * 不接入 judge（仅 regex 检测层）；配置后 provider/modelId 必填，
+ * 模型解析失败时扩展显式降级（见 src/judge/extension.ts）。
+ */
+export interface JudgeConfig {
+	/** classifier 供应商名（models.json/registerProvider 注册名）。 */
+	provider: string;
+	/** classifier 模型 id。 */
+	modelId: string;
+	/** gate 阈值（0..1，默认 0.5）。 */
+	gateThreshold?: number;
+	/** 候选阈值（0..1，默认 0.7）。 */
+	candidateThreshold?: number;
+	/** 每次批量判定的问题数上限（正整数，默认 128）。 */
+	batchSize?: number;
+	/** 批数上限（正整数，默认 8）。 */
+	maxBatches?: number;
+	/** 超长消息分块上限（正整数，默认 24000）。 */
+	maxChars?: number;
+	/** 候选最小长度（正整数，默认 6）。 */
+	minCandidateLength?: number;
+	/** classify 调用并发上限（正整数，默认 8）。 */
+	concurrency?: number;
+	/** judge 命中伪值模板（默认 "key-{hash}"）。 */
+	redactTemplate?: string;
+}
+
 /** 一次加载的解析结果（错误非空时 detectors 为内置默认集回退）。 */
 export interface ResolvedConfig {
 	/** 解析来源路径。 */
@@ -58,6 +92,8 @@ export interface ResolvedConfig {
 	hashLength?: number;
 	/** clean cache 调参；未配置为 undefined（默认 20000/24h）。 */
 	cleanCache?: CleanCacheConfig;
+	/** judge 配置段；未配置为 undefined（仅 regex 检测层）。 */
+	judge?: JudgeConfig;
 	/** 加载/校验错误（空 = 配置有效或文件不存在）。 */
 	errors: string[];
 }
@@ -67,9 +103,21 @@ function defaultDetectors(): RegexDetectorSpec[] {
 	return DEFAULT_DETECTOR_SPECS.map((spec) => ({ ...spec }));
 }
 
-const ROOT_KEYS = new Set(["detectors", "hashLength", "cleanCache"]);
+const ROOT_KEYS = new Set(["detectors", "hashLength", "cleanCache", "judge"]);
 const DETECTOR_KEYS = new Set(["name", "pattern", "redactTemplate"]);
 const CLEAN_CACHE_KEYS = new Set(["limit", "ttlMs"]);
+const JUDGE_KEYS = new Set([
+	"provider",
+	"modelId",
+	"gateThreshold",
+	"candidateThreshold",
+	"batchSize",
+	"maxBatches",
+	"maxChars",
+	"minCandidateLength",
+	"concurrency",
+	"redactTemplate",
+]);
 /** base32(sha256) 无 padding 共 52 字符，哈希段长度上限由此决定。 */
 const MAX_HASH_LENGTH = 52;
 
@@ -82,6 +130,11 @@ function isPositiveInteger(value: unknown): value is number {
 	return typeof value === "number" && Number.isInteger(value) && value >= 1;
 }
 
+/** 概率阈值校验（0..1 含端点的数值）。 */
+function isProbability(value: unknown): value is number {
+	return typeof value === "number" && value >= 0 && value <= 1;
+}
+
 /**
  * 校验已解析的 JSON 值。返回合法字段，或错误列表（任一错误即整体回退）。
  */
@@ -89,6 +142,7 @@ function validateConfig(json: unknown): {
 	detectors?: RegexDetectorSpec[];
 	hashLength?: number;
 	cleanCache?: CleanCacheConfig;
+	judge?: JudgeConfig;
 	errors: string[];
 } {
 	const errors: string[] = [];
@@ -206,9 +260,70 @@ function validateConfig(json: unknown): {
 		}
 	}
 
+	let judge: JudgeConfig | undefined;
+	if (json.judge !== undefined) {
+		if (!isPlainObject(json.judge)) {
+			errors.push("judge must be an object");
+		} else {
+			const section = json.judge;
+			let valid = true;
+			for (const key of Object.keys(section)) {
+				if (!JUDGE_KEYS.has(key)) {
+					errors.push(`judge: unknown key "${key}"`);
+					valid = false;
+				}
+			}
+			for (const key of ["provider", "modelId"] as const) {
+				if (typeof section[key] !== "string" || (section[key] as string).length === 0) {
+					errors.push(`judge.${key} must be a non-empty string`);
+					valid = false;
+				}
+			}
+			if (section.gateThreshold !== undefined && !isProbability(section.gateThreshold)) {
+				errors.push("judge.gateThreshold must be a number between 0 and 1");
+				valid = false;
+			}
+			if (section.candidateThreshold !== undefined && !isProbability(section.candidateThreshold)) {
+				errors.push("judge.candidateThreshold must be a number between 0 and 1");
+				valid = false;
+			}
+			const intKeys = [
+				"batchSize",
+				"maxBatches",
+				"maxChars",
+				"minCandidateLength",
+				"concurrency",
+			] as const;
+			for (const key of intKeys) {
+				if (section[key] !== undefined && !isPositiveInteger(section[key])) {
+					errors.push(`judge.${key} must be a positive integer`);
+					valid = false;
+				}
+			}
+			if (section.redactTemplate !== undefined && (typeof section.redactTemplate !== "string" || section.redactTemplate.length === 0)) {
+				errors.push("judge.redactTemplate must be a non-empty string");
+				valid = false;
+			}
+			if (valid) {
+				judge = {
+					provider: section.provider as string,
+					modelId: section.modelId as string,
+					gateThreshold: section.gateThreshold as number | undefined,
+					candidateThreshold: section.candidateThreshold as number | undefined,
+					batchSize: section.batchSize as number | undefined,
+					maxBatches: section.maxBatches as number | undefined,
+					maxChars: section.maxChars as number | undefined,
+					minCandidateLength: section.minCandidateLength as number | undefined,
+					concurrency: section.concurrency as number | undefined,
+					redactTemplate: section.redactTemplate as string | undefined,
+				};
+			}
+		}
+	}
+
 	return errors.length > 0
 		? { errors }
-		: { detectors, hashLength, cleanCache, errors };
+		: { detectors, hashLength, cleanCache, judge, errors };
 }
 
 /** 从磁盘读取并解析一次配置（错误都落 errors，绝不抛出）。 */
@@ -251,13 +366,21 @@ function loadFromDisk(path: string): ResolvedConfig {
 		detectors: validated.detectors ?? defaultDetectors(),
 		hashLength: validated.hashLength,
 		cleanCache: validated.cleanCache,
+		judge: validated.judge,
 		errors: [],
 	};
 }
 
 /** 配置内容指纹（reload 变更判定与订阅通知依据）。 */
 function fingerprint(config: ResolvedConfig): string {
-	return JSON.stringify([config.exists, config.detectors, config.hashLength, config.cleanCache, config.errors]);
+	return JSON.stringify([
+		config.exists,
+		config.detectors,
+		config.hashLength,
+		config.cleanCache,
+		config.judge,
+		config.errors,
+	]);
 }
 
 export interface ConfigLoaderOptions {
