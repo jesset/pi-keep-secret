@@ -42,9 +42,9 @@ try {
 
 harness 特性：
 
-- 会话运行在临时目录（cwd/agentDir）、内存 settings、内存 session 中，不触网、不落盘。
+- 会话运行在临时目录（cwd/agentDir）、内存 settings、内存 session 中，不触网、不落盘；`settings` 选项可注入内存 settings 初始值（如调低 `compaction.keepRecentTokens` 驱动手动/阈值压缩用例）。
 - 假供应商记录的 `messages` 即「供应商视角」：`context_with_system` 钩子与 `convertToLlm` 之后的消息（LLM 格式）。
-- 脚本化响应按请求顺序逐次消耗；脚本耗尽后再被请求会得到错误消息（`No more faux responses queued`），欠脚本的测试显式失败。
+- 脚本化响应按请求顺序逐次消耗；`{ error }` 变体返回 stopReason=error 应答（故障回退用例）；脚本耗尽后再被请求会得到错误消息（`No more faux responses queued`），欠脚本的测试显式失败。
 
 ### 主路径与回退决策
 
@@ -112,6 +112,38 @@ const compose = (pi: ExtensionAPI): void => {
 - 工具执行参数与 transcript 的 toolCall.arguments 是同一对象（`validateToolArguments` 原位 coercion）：tool_call 钩子的原位还原会同时体现于两者。
 - 扩展加载顺序：`extensionPaths` 先于 `extensionFactories`（inline）注册，同一事件的处理器按此顺序链式传递（message_end 的替换消息会传给后续处理器）。
 - faux 供应商会别掉助手文本的行首空格（测试脚本避免行首空格这种无关变量）。
+
+## 掩码压缩（T6，issue #8）
+
+代码：`src/compaction/`（extension/prompts）；验收用例：`test/compaction.test.ts`（接缝 1）。
+
+- `session_before_compact` 处理器返回完整 `CompactionResult`，整体替换 pi 自带压缩（manual `/compact`、阈值、overflow 三路径都走此钩子）：preparation 的 messagesToSummarize + turnPrefixMessages → `convertToLlm`（含 branchSummary/compactionSummary 投影）→ 与出站同一掩码管线掩码文本叶 → `serializeConversation` 入摘要提示词 → `ctx.modelRegistry.complete`（当前会话模型）摘要 → 摘要文本按注册表还原 → `{ compaction: { summary, firstKeptEntryId, tokensBefore, usage } }`。
+- 摘要提示词对齐 pi 默认（pi 1.4.0 未公开导出提示词常量，按原文复制于 `src/compaction/prompts.ts`，升级时需同步校对）；previousSummary / customInstructions 掩码后入摘要上下文，结果还原。
+- `session_before_tree` 同模式返回 `{ summary: { summary: 还原后文本, usage } }`（entriesToSummarize 经 `prepareBranchEntries` 投影）。
+- 故障策略（ticket 锁定）：摘要调用不可恢复错误（error/length/工具调用/空文本/抛错）→ 返回 undefined 显式回退 pi 默认压缩 + `ctx.ui.notify` 告警 + 状态栏标记 + `MaskedCompactionStatus` 计数（无 UI 模式仅计数）；绝不能静默回退——默认压缩不掩码，摘要模型会看到真值。用户中止（abort）不算回退，返回 `{ cancel: true }`。
+- 出站兑底：压缩/分支摘要消息（`compactionSummary`/`branchSummary` 自定义 AgentMessage，携带还原真值）的 `summary` 字段由遍历器掩码（T6 起进入出站覆盖）。
+
+```ts
+// 组合接线（extension/index.ts）：出站掩码、回程还原、掩码压缩共享同一管线
+import { createMaskedCompactionExtension } from "./src/compaction/index.ts";
+import { createIngressRestorationExtension } from "./src/ingress/index.ts";
+import { createEgressMaskingExtension, createMaskingPipeline } from "./src/masking/index.ts";
+
+const pipeline = createMaskingPipeline();
+const compose = (pi: ExtensionAPI): void => {
+	createEgressMaskingExtension({ pipeline })(pi);
+	createIngressRestorationExtension({ registry: pipeline.registry })(pi);
+	createMaskedCompactionExtension({ pipeline })(pi);
+};
+```
+
+### T6 事实发现（后续 ticket 注意）
+
+- 扩展侧 `ctx.modelRegistry` 是同步兼容门面（`ModelRegistry`）：有 `complete`/`streamSimple`，**无** `completeSimple`（那是 `ModelRuntime` 的方法）；掩码摘要走 `ctx.modelRegistry.complete`（请求时认证）。
+- pi 默认压缩自带重试（`retryAssistantCall`）；掩码压缩的单次 `complete` 无重试，瞬时故障即回退（回退可见性弥补）。若需对齐重试语义，后续可在 `requestSummary` 外套重试。
+- 压缩后 `firstKeptEntryId` 之前的历史由 compaction 条目替换，投影生成 `compactionSummary` 角色消息（`summary` 字段携带真值），`convertToLlm` 展开为 user 文本——若遍历器不覆盖该角色，压缩后每一轮出站都会泄漏真值（T6 已补，用例锚定）。
+- `SettingsManager.inMemory(partial)` 可注入 `compaction.keepRecentTokens`/`reserveTokens`，harness 以此驱动手动/阈值压缩；keepRecentTokens 必须小于会话尾部 token 量，否则 `prepareCompaction` 返回 undefined（"Nothing to compact"）。
+- `bashExecution`/`custom` 自定义消息（`!命令` 等）尚未在出站遍历器覆盖（T2 既有缺口，与压缩无关；待后续 ticket 处理）。
 
 ## 约定
 
