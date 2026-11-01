@@ -23,7 +23,9 @@ function base32Encode(bytes: Uint8Array): string {
 }
 
 /**
- * 伪值生成:template.replace("{hash}", base32(sha256(secret)).slice(0, hashLength))。
+ * 伪值生成:template.replaceAll("{hash}", base32(sha256(secret)).slice(0, hashLength))。
+ * {hash} 可多次出现(如 JWT 三段模板 "eyJ{hash}.{hash}.{hash}"),各处均替换
+ * 为同一哈希段(参考实现 redact_template "可多次出现保持形状" 语义)。
  *
  * 一致性哈希——伪值只由 (secret, template, hashLength) 决定,同一 secret 跨轮、
  * 跨消息恒得同一伪值:provider 每轮重收相同掩码文本,prompt-cache 前缀与
@@ -32,5 +34,5 @@ function base32Encode(bytes: Uint8Array): string {
  */
 export function makePlaceholder(secret: string, template = "{hash}", hashLength = 12): string {
 	const digest = createHash("sha256").update(secret, "utf8").digest();
-	return template.replace("{hash}", base32Encode(digest).slice(0, hashLength));
+	return template.replaceAll("{hash}", base32Encode(digest).slice(0, hashLength));
 }
