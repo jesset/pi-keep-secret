@@ -179,7 +179,7 @@ export function createKeepSecretCommandsExtension(options: KeepSecretCommandsOpt
 			description: "掩码扩展状态 / 自测 / 配置热重载（status | test | reload）",
 			handler: async (args, ctx) => {
 				switch (args.trim()) {
-					case "": {
+				case "": {
 					ctx.ui.notify(buildStatusReport(options), "info");
 					break;
 				}
