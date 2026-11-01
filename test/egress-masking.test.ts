@@ -6,6 +6,8 @@
  */
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Type } from "@earendil-works/pi-ai";
 import { createHarnessSession, requestText } from "../src/harness/fake-session.ts";
 
 /** 正式扩展入口（目录扩展 index.ts 工厂，内置默认检测器）。 */
@@ -57,6 +59,43 @@ describe("T2 出站掩码：context_with_system 消息树遍历", () => {
 			for (const text of userTexts) {
 				expect(text).toContain(OPENAI_KEY);
 			}
+		} finally {
+			h.dispose();
+		}
+	});
+
+	test("toolResult 文本掩码：工具结果真值进下一轮出站只见伪值，transcript 保留真值", async () => {
+		const envParams = Type.Object({});
+		const readEnv: ToolDefinition<typeof envParams> = {
+			name: "read_env",
+			label: "Read Env",
+			description: "Returns the .env file contents (contains a key-shaped string).",
+			parameters: envParams,
+			execute: async () => ({
+				content: [{ type: "text", text: `OPENAI_KEY=${OPENAI_KEY}` }],
+				details: {},
+			}),
+		};
+		const h = await createHarnessSession({
+			extensionPaths: [EXTENSION_ENTRY],
+			customTools: [readEnv],
+		});
+		try {
+			h.provider.setScript([
+				{ toolCall: { name: "read_env", arguments: {} } },
+			{ text: "done" },
+			]);
+			await h.session.prompt("read the env file");
+
+			// 第二轮出站（含工具结果）：供应商只见伪值
+			expect(h.provider.requests()).toHaveLength(2);
+			const second = h.provider.requests()[1];
+			expect(requestText(second)).not.toContain(OPENAI_KEY);
+			expect(requestText(second)).toMatch(/sk-[A-Z2-7]{12}/);
+
+			// 本地 transcript 的工具结果写真值
+			const toolResult = h.session.messages.find((m) => m.role === "toolResult");
+			expect(JSON.stringify(toolResult?.content)).toContain(OPENAI_KEY);
 		} finally {
 			h.dispose();
 		}

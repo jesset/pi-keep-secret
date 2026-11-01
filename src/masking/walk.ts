@@ -3,6 +3,10 @@
  * 研究笔记 §2 规则（规格 #1 Implementation Decisions「Message walk」）。
  * 按消息种类逐步覆盖（user → toolResult → assistant → system）。
  *
+ * 豁免（结构字段，永不改写）：ImageContent.data、*Signature、id/name/
+ * role/type/mimeType 类键、toolsAdded/toolsRemoved（工具 schema）、
+ * nestedCalls（不发模型）、argumentsError、toolResult.details（工具私有）。
+ *
  * 原位修改（事件 messages 即请求本地副本，链式转换的既定模式），
  * 会话 transcript 不受影响。
  */
@@ -12,8 +16,8 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 export type TextMasker = (text: string) => string;
 
 /**
- * 对消息树的文本叶原位掩码（本遍历器当前覆盖 UserMessage 的
- * string/text 块两种形态；ImageContent.data 等非文本叶不动）。
+ * 对消息树的文本叶原位掩码。当前覆盖：UserMessage（string/text 块）与
+ * ToolResultMessage 的 text 块（ImageContent.data 豁免）。
  */
 export function maskMessageTree(messages: AgentMessage[], maskText: TextMasker): void {
 	for (const message of messages) {
@@ -26,6 +30,14 @@ export function maskMessageTree(messages: AgentMessage[], maskText: TextMasker):
 						if (part.type === "text") {
 							part.text = maskText(part.text);
 						}
+					}
+				}
+				break;
+			}
+			case "toolResult": {
+				for (const part of message.content) {
+					if (part.type === "text") {
+						part.text = maskText(part.text);
 					}
 				}
 				break;
