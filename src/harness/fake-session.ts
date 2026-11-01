@@ -14,10 +14,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	createAgentSession,
+	DefaultResourceLoader,
 	ModelRuntime,
 	SessionManager,
 	SettingsManager,
 	type AgentSession,
+	type InlineExtension,
 } from "@earendil-works/pi-coding-agent";
 import {
 	fauxAssistantMessage,
@@ -53,6 +55,28 @@ export interface HarnessSession {
 	dispose(): void;
 }
 
+/** harness 创建选项。 */
+export interface HarnessOptions {
+	/** 内联扩展工厂（随会话加载，如冒烟用的哨兵掩码扩展）。 */
+	extensionFactories?: InlineExtension[];
+}
+
+/** 把一次供应商请求的全部文本叶（含 toolCall 参数深字符串值）拼成可检索文本。 */
+export function requestText(request: ProviderRequest): string {
+	const parts: string[] = [];
+	const walk = (value: unknown): void => {
+		if (typeof value === "string") {
+			parts.push(value);
+		} else if (Array.isArray(value)) {
+			value.forEach(walk);
+		} else if (value && typeof value === "object") {
+			Object.values(value).forEach(walk);
+		}
+	};
+	request.messages.forEach(walk);
+	return parts.join("\n");
+}
+
 /** 把脚本化响应包装成 faux 响应步骤：先记录供应商视角，再返回脚本消息。 */
 function toRecordedStep(
 	scripted: ScriptedResponse,
@@ -74,7 +98,9 @@ function toRecordedStep(
 }
 
 /** 创建测试接缝 1 的 harness：进程内会话 + 脚本化假供应商。 */
-export async function createHarnessSession(): Promise<HarnessSession> {
+export async function createHarnessSession(
+	options: HarnessOptions = {},
+): Promise<HarnessSession> {
 	const agentDir = mkdtempSync(join(tmpdir(), "pi-keep-secret-harness-"));
 	const cwd = mkdtempSync(join(tmpdir(), "pi-keep-secret-cwd-"));
 	const requests: ProviderRequest[] = [];
@@ -92,13 +118,24 @@ export async function createHarnessSession(): Promise<HarnessSession> {
 	});
 	modelRuntime.registerNativeProvider(faux.provider);
 
+	const settingsManager = SettingsManager.inMemory();
+
+	const resourceLoader = new DefaultResourceLoader({
+		cwd,
+		agentDir,
+		settingsManager,
+		extensionFactories: options.extensionFactories,
+	});
+	await resourceLoader.reload();
+
 	const { session } = await createAgentSession({
 		cwd,
 		agentDir,
 		model: faux.getModel(),
 		modelRuntime,
-		settingsManager: SettingsManager.inMemory(),
+		settingsManager,
 		sessionManager: SessionManager.inMemory(),
+		resourceLoader,
 		// 假供应商按脚本显式发起工具调用，harness 不启用内置 read/bash/edit/write。
 		noTools: "builtin",
 	});
