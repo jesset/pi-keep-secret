@@ -21,6 +21,10 @@ interface FakeScript {
 	gate?: (text: string) => number;
 	candidate?: (value: string, text: string) => number;
 	error?: (call: RecordedCall) => string | undefined;
+	/** 对 true 的候选不返回应答（模拟 stop 结果缺项：未验证）。 */
+	dropAnswer?: (value: string) => boolean;
+	/** 应答前挂起（并发观测）；缺省即时返回。 */
+	stall?: (call: RecordedCall) => Promise<void> | undefined;
 }
 
 /** 进程内假 classify：按问题 id 应答（gate / cand_i），记录全部调用。 */
@@ -32,6 +36,7 @@ function fakeClassify(script: FakeScript) {
 			questions: Object.entries(context.questions) as RecordedCall["questions"],
 		};
 		calls.push(call);
+		await script.stall?.(call);
 		const error = script.error?.(call);
 		if (error !== undefined) {
 			return errorResult(error);
@@ -45,6 +50,9 @@ function fakeClassify(script: FakeScript) {
 				const index = id.slice("cand_".length);
 				const candidates = call.state.candidates as Record<string, unknown> | undefined;
 				const value = typeof candidates?.[index] === "string" ? candidates[index] : "";
+				if (script.dropAnswer?.(value)) {
+					continue; // 无应答（未验证）
+				}
 				answers[id] = bool(script.candidate?.(value, text) ?? 0.02);
 			}
 		}
@@ -223,6 +231,80 @@ describe("SystemOneJudge 两阶段判定", () => {
 			expect(masked).toContain(LONG);
 			expect(masked).not.toContain("t01300");
 			expect(verdict.spans).toHaveLength(1024);
+		});
+	});
+
+	describe("fail_closed：classify 故障时未验证候选一律掩码", () => {
+		test("gate 调用错误 → 该块候选全部掩码，不再追加候选调用", async () => {
+			const PASSWORD = "N0tw0rkDown-K3y";
+			const ORDER = "1029384756";
+			const text = `密码 ${PASSWORD} 与订单 ${ORDER} 一起出站`;
+			const fake = fakeClassify({
+				gate: () => 0.98,
+				candidate: () => 0.96,
+				error: (call) => (call.state.candidates === undefined ? "judge unreachable" : undefined),
+			});
+			const judge = createSystemOneJudge({ classify: fake.classify });
+
+			const verdict = await judge.judgeText(text);
+
+			// 故障时零未验证出站：两个候选全部掩码（真值由注册表本地可恢复）
+			expect(verdict.spans.map((span) => text.slice(span.start, span.end))).toEqual(
+				expect.arrayContaining([PASSWORD, ORDER]),
+			);
+			expect(verdict.spans).toHaveLength(2);
+			expect(verdict.failClosed).toBe(true);
+			expect(verdict.error).toBe("judge unreachable");
+			expect(verdict.clean).toBe(false); // 故障文本不可缓存 clean（T4 接口预留）
+			expect(verdict.calls).toBe(1); // judge 已死：不追加注定失败的候选批
+		});
+
+		test("候选批错误 → 该批候选全掩码，其余批判定结论不受影响", async () => {
+			// 200 候选 → 128 + 72 两批；第二批（72 问）故障：其候选全掩，
+			// 第一批正常判 0.02 丢弃（判定非凭据 ≠ 未验证，不掩）
+			const tokens = Array.from({ length: 200 }, (_, i) => `t${String(i + 1).padStart(5, "0")}`);
+			const text = tokens.join(" ");
+			const fake = fakeClassify({
+				gate: () => 0.98,
+				candidate: () => 0.02,
+				error: (call) =>
+					call.state.candidates !== undefined && call.questions.length < 100
+						? "batch 2 exploded"
+						: undefined,
+			});
+			const judge = createSystemOneJudge({ classify: fake.classify });
+
+			const verdict = await judge.judgeText(text);
+
+			expect(verdict.failClosed).toBe(true);
+			expect(verdict.error).toBe("batch 2 exploded");
+			// token k（0 基）起点 = 7k（等长 6 字符、单空格分隔）——故障批 = t00129..t00200
+			const expected = tokens.slice(128).map((token, i) => ({
+				start: 7 * (128 + i),
+				end: 7 * (128 + i) + 6,
+				detector: "systemone-judge",
+			}));
+			expect(verdict.spans).toEqual(expected);
+			expect(verdict.spans).toHaveLength(72);
+		});
+
+		test("stop 结果中缺失应答的候选视为未验证一并掩码", async () => {
+			const PASSWORD = "An5wered-K3y";
+			const ORDER = "1029384756";
+			const text = `密码 ${PASSWORD}，订单 ${ORDER}`;
+			const fake = fakeClassify({
+				gate: () => 0.98,
+				candidate: () => 0.02,
+				dropAnswer: (value) => value === ORDER, // ORDER 无应答：未验证 → 掩
+			});
+			const judge = createSystemOneJudge({ classify: fake.classify });
+
+			const verdict = await judge.judgeText(text);
+
+			// PASSWORD 判非凭据（0.02）不掩；ORDER 未获判定结论 → fail_closed 掩码
+			expect(verdict.spans.map((span) => text.slice(span.start, span.end))).toEqual([ORDER]);
+			expect(verdict.failClosed).toBe(true);
+			expect(verdict.clean).toBe(false);
 		});
 	});
 });

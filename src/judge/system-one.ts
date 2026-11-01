@@ -64,12 +64,13 @@ export interface JudgeVerdict {
 	spans: Span[];
 	/** 任一块 gate 达到阈值。 */
 	gateHit: boolean;
-	/** 干净结论：零命中、零 gate 命中、零错误（T4 clean cache 的缓存依据：
-	 *  命中或 gate 命中的文本不可缓存 clean）。 */
+	/** 干净结论：零命中、零 gate 命中、零 fail_closed（T4 clean cache 的缓存
+	 *  依据：命中、gate 命中或故障的文本均不可缓存 clean）。 */
 	clean: boolean;
-	/** fail_closed 已生效：存在 judge 错误，未验证候选已并入 spans。 */
+	/** fail_closed 已生效：存在未验证候选被一律掩码（classify 错误，或
+	 *  stop 结果应答缺失——未获判定结论 ≠ 判定非凭据）。 */
 	failClosed: boolean;
-	/** 首个错误信息（classify stopReason==="error"；扩展层上报扩展错误）。 */
+	/** 首个 classify 错误信息（stopReason!=="stop"；扩展层上报扩展错误）。 */
 	error?: string;
 	/** 被 maxBatches 截断丢弃的候选数（状态显示）。 */
 	truncatedCandidates: number;
@@ -98,10 +99,28 @@ export function createSystemOneJudge(options: SystemOneJudgeOptions): SystemOneJ
 
 	return {
 		detectorName,
-			async judgeText(text) {
+		async judgeText(text) {
 			let calls = 0;
 			const spans: Span[] = [];
 			let gateHit = false;
+			let failClosed = false;
+			let error: string | undefined;
+			const noteJudgeError = (result: ClassifierResult): void => {
+				if (error === undefined) {
+					error = result.errorMessage ?? `judge stopReason=${result.stopReason}`;
+				}
+				failClosed = true;
+			};
+			/** fail_closed 兑底：候选未获判定结论 → 一律掩码（真值由注册表本地可恢复）。 */
+			const maskUnverified = (candidates: readonly Candidate[], offset: number): void => {
+				for (const candidate of candidates) {
+					spans.push({
+						start: offset + candidate.start,
+						end: offset + candidate.end,
+						detector: detectorName,
+					});
+				}
+			};
 			let truncatedCandidates = 0;
 			for (const chunk of chunkText(text, maxChars)) {
 				calls++;
@@ -109,6 +128,13 @@ export function createSystemOneJudge(options: SystemOneJudgeOptions): SystemOneJ
 					state: { text: chunk.text },
 					questions: { [GATE_QUESTION_NAME]: gateQuestion() },
 				});
+				// classify never-rejects：错误在 stopReason。gate 即失败则该块候选
+				// 全部未验证 → 全掩，且不追加注定失败的候选批（不锤已死的 judge）
+				if (gateResult.stopReason !== "stop") {
+					noteJudgeError(gateResult);
+					maskUnverified(extractCandidates(chunk.text, minCandidateLength), chunk.offset);
+					continue;
+				}
 				const gateAnswer = gateResult.answers[GATE_QUESTION_NAME];
 				const probability =
 					gateAnswer !== undefined && gateAnswer.type === "bool" ? gateAnswer.probability : 0;
@@ -152,11 +178,20 @@ export function createSystemOneJudge(options: SystemOneJudgeOptions): SystemOneJ
 				);
 				for (const [b, batch] of batches.entries()) {
 					const result = responses[b];
+					// 整批故障：该批候选全部未验证 → 全掩；其余批的判定结论照常采纳
+					if (result.stopReason !== "stop") {
+						noteJudgeError(result);
+						maskUnverified(batch, chunk.offset);
+						continue;
+					}
 					for (const [i, candidate] of batch.entries()) {
 						const answer = result.answers[`cand_${i}`];
 						if (answer === undefined || answer.type !== "bool") {
+							// stop 结果缺应答：该候选未验证 → 掩码（非「判定非凭据」的丢弃）
+							failClosed = true;
+							maskUnverified([candidate], chunk.offset);
 							continue;
-					}
+						}
 						if (answer.probability < candidateThreshold) {
 							continue; // 判定非凭据：丢弃
 						}
@@ -171,8 +206,9 @@ export function createSystemOneJudge(options: SystemOneJudgeOptions): SystemOneJ
 			return {
 				spans: mergeSpans(spans),
 				gateHit,
-				clean: spans.length === 0 && !gateHit,
-				failClosed: false,
+				clean: spans.length === 0 && !gateHit && !failClosed,
+				failClosed,
+				error,
 				truncatedCandidates,
 				calls,
 			};
