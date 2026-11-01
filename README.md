@@ -218,7 +218,7 @@ const compose = (pi: ExtensionAPI): void => {
 
 ### /keep-secret 命令面（三子命令）
 
-- `/keep-secret`（状态）：检测器配置摘要（来源/模式（replace|merge，T13）/条数/名列表，含非法配置的错误行与回退标记）、伪值注册表条数、clean cache 条数与命中率（命中 x / 检测 y）、各检测器命中计数（`name=N`）、judge 计数（T8 已接入：配置 judge 段后展示已判定/截断/fail-closed/降级计数与生效的模型缺失策略，未配置显示「未接入」）、掩码压缩取消计数与最近原因。
+- `/keep-secret`（状态）：检测器配置摘要（来源/模式（replace|merge，T13）/条数/名列表，含非法配置的错误行与回退标记）、伪值注册表条数、clean cache 条数与命中率（命中 x / 检测 y）、各检测器命中计数（`name=N`）、judge 计数（T8 已接入：配置 judge 段后展示已判定/截断/fail-closed/降级计数与生效的模型缺失策略，未配置显示「未接入」；T16 起模型解析后附线缆段：跟随注册 / 覆盖 systemone|decisions / 插件自定义名（judge.api 偏好未生效标记））、掩码压缩取消计数与最近原因。
 - `/keep-secret test`：合成样本（sk- 假 key、URL 藏 key、假密码、干净订单号）逐项过会话链路（T8 起 judge 启用时经 judge→regex 全链评估，与出站链同序），报告已掩码/未掩码与期望比对；与期望一致为通过，全部通过 info、有未通过 warning。假密码项期望随 judge 是否启用动态化：启用→期望掩码（regex_only 降级时如实报未通过——降级可见信号）；未启用→期望未掩码（regex 层不命中属预期）。当前配置未覆盖某样本时如实报告未通过。模型缺失 + fail_closed（默认）生效时全部样本期望掩码（未验证候选一律兑底掩码，含干净订单号）并附说明行。
 - `/keep-secret reload`：调 `loader.reload()`（变更时同步热应用：applyDetectors + 清空缓存）；变更判定与 loader 同口径（`configFingerprint`），结果经 notify 报告（检测器集变更→已热应用 / 检测器集未变但其他段变更（judge/hashLength/cleanCache）→ 已重读且仅新会话生效 / 无变更 / 配置错误回退）。
 - 未知子命令 → 用法提示。
@@ -319,7 +319,7 @@ rm -rf ~/.pi/agent/extensions/pi-keep-secret
 
 - `detectors`：装配语义由 `detectorsMode`（T13）决定——`replace`（默认）整体替换内置默认集（openai-key/github-pat/aws-access-key-id/google-api-key/slack-bot-token/pem-private-key/jwt）；`merge` 内置集与用户项合并（同名用户项原位覆盖内置，非同名追加在内置之后）；空列表非法。
 - `detectorsMode`：`replace` | `merge`（默认 replace，现行为不变）；非法值整体回退默认集 + 错误可见；生效集含模式变更可经 `/keep-secret reload` 热应用（状态面展示模式与生效检测器数）。
-- `judge`（T8/T14）：System One 判定检测器。`provider`/`modelId` 必填——指向一个 **classifier 类型**的模型（models.json 注册或扩展 `pi.registerProvider`；端点须兼容 System One 协议，如 LiteLLM 网关 `/v1/systemone` 或 `/v1/decisions`）。`api`（T14 可选线缆协议提示：`systemone` / `decisions`，缺省跟随模型注册条目的 `api` 字段；填写则装配时与模型注册 api 比对，不一致按配置错误处理——不装配 judge、仅 regex 层、错误可见，见 T14 节）。阈值（`gateThreshold` 默认 0.5 / `candidateThreshold` 默认 0.7）、批参（`batchSize` 128 / `maxBatches` 8 / `maxChars` 24000 / `minCandidateLength` 6）、`concurrency`（8）、`redactTemplate`（`key-{hash}`）、`onMissing`（模型缺失策略：`fail_closed` 默认 / `regex_only` 显式知情降级，见 T5/T8 节）可调；未知键报错。未配置该段即不接入 judge（仅 regex 层）。
+- `judge`（T8/T14/T16）：System One 判定检测器。`provider`/`modelId` 必填——指向一个 **classifier 类型**的模型（models.json 注册或扩展 `pi.registerProvider`；端点须兼容 System One 协议，如 LiteLLM 网关 `/v1/systemone` 或 `/v1/decisions`，插件自定义 api 亦可——线缆由该实现决定）。`api`（可选**线缆偏好**：`systemone` / `decisions`，非法值 judge 段整体回退；缺省跟随模型注册条目的 `api` 字段；填写后三分支应用（T16）：模型注册为 pi-ai 内置 classifier api → 覆盖分发线缆（classify 收到仅改 api 字段的浅拷贝模型）；插件自定义 api（如 `litellm-decisions`）→ 尊重插件实现、正常装配，偏好未生效（一次性 info 通知 + 状态面标记）。不存在「不一致 → 不装配」的硬校验，见 T14/T16 节）。阈值（`gateThreshold` 默认 0.5 / `candidateThreshold` 默认 0.7）、批参（`batchSize` 128 / `maxBatches` 8 / `maxChars` 24000 / `minCandidateLength` 6）、`concurrency`（8）、`redactTemplate`（`key-{hash}`）、`onMissing`（模型缺失策略：`fail_closed` 默认 / `regex_only` 显式知情降级，见 T5/T8 节）可调；未知键报错。未配置该段即不接入 judge（仅 regex 层）。
 - judge 段变更与 `hashLength`/`cleanCache` 同语义：仅新会话生效（会话内装配在工厂创建时定格）；`detectors` 变更可经 `/keep-secret reload` 热应用。
 
 ## 已知限制汇总（0.1.0）
@@ -364,8 +364,8 @@ rm -rf ~/.pi/agent/extensions/pi-keep-secret
 
 LiteLLM 网关的 `/v1/systemone` 与 `/v1/decisions` 是同一后端路由的两种线缆协议：前者对应 pi-ai `typesafe-system-one` 传输（POST `<baseUrl>/systemone`，bool 问题映射为线缆级 noul），后者对应 `openai-decisions` 传输（POST `<baseUrl>/decisions`，`{model,input,questions}`、bool→predicate、criteria 折进 instructions、state 作 JSON 文本放 input）。两种协议的 baseUrl 都配 `https://<host>/v1`（线缆路径由传输层拼接）。
 
-- **适配器零改动**：judge 适配器走 `modelRegistry.classify()`，传输协议由模型注册条目的 `api` 字段决定——config.json 的 `judge.api` 键只是校验提示（防配错线缆），不改变请求路径。
-- **两处分工**：loader（`src/config/loader.ts`）校验 `judge.api` 合法值（`systemone`|`decisions`，非法 → judge 段整体回退）；装配处（`src/judge/extension.ts` 的 `MODEL_API_BY_JUDGE_API`）在模型解析后比对 `model.api`（`typesafe-system-one`↔`systemone`、`openai-decisions`↔`decisions`），不一致 → 配置错误语义（同 judge 段非法整体回退）：不装配 judge、仅 regex 检测层、错误可见（notify/状态栏 + `/keep-secret` 降级计数；不走 fail_closed 兑底——配置错误非 judge 故障）。
+- **适配器零改动**：judge 适配器走 `modelRegistry.classify()`，传输协议由模型注册条目的 `api` 字段决定——config.json 的 `judge.api` 键是线缆偏好（T16 语义），不改变请求路径的合法性。
+- **两处分工**：loader（`src/config/loader.ts`）校验 `judge.api` 合法值（`systemone`|`decisions`，非法 → judge 段整体回退）；装配处（`src/judge/extension.ts`）在模型解析后应用偏好。T14 原始语义为「与模型注册 api 不一致 → 配置错误不装配」；**T16 已改为线缆偏好三分支**（见下节）——硬校验会误杀插件注册的自定义 api 模型（`modelRegistry.classify` 本身按 model.api 正确分发，名称检查只带来误杀）。
 - **网关验证脚本**（`research/systemone-gateway.test.ts`）：默认跳过；三变量齐备启用，可选 `PI_KEEP_SECRET_JUDGE_API=decisions` 切 OpenAI 线缆（缺省 systemone）跑同一组校准区间断言（decisions 协议概率可能与 systemone 略有差异，断言用区间）。
 
 ### models.json 双协议注册样例
@@ -404,7 +404,7 @@ LiteLLM 网关的 `/v1/systemone` 与 `/v1/decisions` 是同一后端路由的�
 
 ### config.json 双协议样例
 
-`api` 与注册条目对应（缺省 `api` 则跟随注册条目，不校验）：
+`api` 为线缆偏好（缺省 `api` 则跟随注册条目；插件自定义 api 模型正常装配，偏好未生效可见）：
 
 ```json
 {
@@ -418,7 +418,21 @@ LiteLLM 网关的 `/v1/systemone` 与 `/v1/decisions` 是同一后端路由的�
 }
 ```
 
-代码：`src/config/loader.ts`（judge.api 合法值）、`src/judge/extension.ts`（MODEL_API_BY_JUDGE_API 比对与降级）、`src/config/extension.ts`（透传）、`research/systemone-gateway.test.ts`（双线缆网关实测）；验收用例：`src/config/loader.test.ts`、`test/judge-egress.test.ts`（T14 describe）、`test/e2e-convergence.test.ts`（T14 describe）。
+代码：`src/config/loader.ts`（judge.api 合法值）、`src/judge/extension.ts`（MODEL_API_BY_JUDGE_API 偏好映射）、`src/config/extension.ts`（透传）、`research/systemone-gateway.test.ts`（双线缆网关实测）；验收用例：`src/config/loader.test.ts`、`test/judge-egress.test.ts`、`test/e2e-convergence.test.ts`（T16 describe）。
+
+## T16：judge.api 线缆偏好（issue #16）
+
+T14 的名称硬校验在插件注册的 classifier 模型上误杀：用户 provider 由 pi-provider-litellm-oidc 插件提供，模型 api 为自定义名 `litellm-decisions`（实现是 System One 线缆，调 `/systemone`），映射表只认 pi-ai 内置名 → 误报不一致 → 拒绝装配 judge。`modelRegistry.classify()` 本身按 model.api 正确分发（内置 api → pi-ai 传输；自定义 api → 插件 ProviderClassifier），扩展无需知道线缆细节；LiteLLM 对 `/v1/systemone` 与 `/v1/decisions` 双向翻译，线缆选择不影响可用性。
+
+- **三分支装配**（彻底移除「不一致 → 不装配」硬校验）：
+  1. `judge.api` 未设置 → 跟随模型注册条目的 api（现状默认）；
+  2. 设置 + 模型 api 是 pi-ai 已知 classifier api（`typesafe-system-one`/`openai-decisions`）→ 分发覆盖：classify 调用传 `{...model, api: MODEL_API_BY_JUDGE_API[options.api]}`（浅拷贝仅改 api 字段；baseUrl/provider/headers 不变，认证按 provider 解析不受影响）——配置选择线缆生效；
+  3. 设置 + 模型 api 是插件自定义名（如 `litellm-decisions`）→ 尊重插件实现（插件作者已选定线缆），正常装配；偏好记为未生效 + 一次性 info 通知（非错误、非降级：不减分、不占状态栏）+ 状态面标记。
+- **状态面**（`/keep-secret`）：judge 行在模型解析后附线缆段——跟随注册（<注册 api>）/ 覆盖 systemone|decisions（<生效 api>）/ 插件自定义 <api>（judge.api 偏好 <值> 未生效）；解析前不展示。
+- **运行期 classify 异常语义不动**：fail_closed + 可见计数（强于 warn，spec 故事 19）。
+- loader 合法值校验保留（`systemone`|`decisions`，非法仍 judge 段整体回退）——键语义改为线缆偏好。
+
+代码：`src/judge/extension.ts`（三分支装配与 `JudgeWire`）、`src/commands/extension.ts`（线缆展示）、`src/config/loader.ts`（注释语义）；验收用例：`test/judge-egress.test.ts`（T16 三分支）、`test/commands.test.ts`（线缆展示）、`test/e2e-convergence.test.ts`（T16 用户现场场景）。
 
 ## 约定
 
