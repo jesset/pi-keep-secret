@@ -22,6 +22,7 @@
 - `detectorsMode` 策略开关（`replace` 默认 / `merge`）：merge 下内置默认集与用户 `detectors` 合并——同名用户项原位覆盖内置（可微调 pattern/redactTemplate，如收紧 sk- 排除规则），非同名项追加在内置之后；`detectors` 未配置时两模式等价纯内置集；非法值整体回退默认集 + 错误可见；模式与生效集纳入配置指纹（reload 热应用），`/keep-secret` 状态面展示模式与生效检测器数（T13，#13）。
 - judge 双协议（T14，#14）：config.json 的 judge 段新增可选键 `api`（`systemone` / `decisions`，非法值在 loader 整体回退）——缺省跟随模型注册条目的 `api` 字段（适配器协议无关，走 modelRegistry.classify）；`MODEL_API_BY_JUDGE_API` 映射 typesafe-system-one↔systemone、openai-decisions↔decisions（T16 起用作偏好覆盖映射，见 Changed）。网关验证脚本支持 `PI_KEEP_SECRET_JUDGE_API=decisions` 切 OpenAI Decisions 线缆；README 双协议 models.json/config 样例。
 - CI 与发布流水线：`.github/workflows/ci.yml`（push/PR：`bun install --frozen-lockfile` → typecheck → `bun test`）；`.github/workflows/publish.yml`（GitHub Release `v*` 发布触发，tag 与 package.json 版本双验证，npm OIDC trusted publishing 免令牌发布 `--provenance --access public`，参照 pi-verdict/czottmann(pi-automode) 模式）。配套：`typecheck` 脚本与 `typescript` devDependency、tsconfig 覆盖 `extension/`、package.json 发布字段（`files` 白名单（extension/src/文档，排除 `*.test.ts`）、`peerDependencies`（pi-coding-agent ≥1.4.0，optional）、repository/keywords/author/license，移除 `private`）与 README badge/npm 安装方式。
+- Compaction summary input covered by the judge layer (ticket #12): `createMaskedCompactionExtension` accepts the egress chain's judge masker (the formal composition in `extension/index.ts` passes the same instance), and the summary input — conversation messages, `previousSummary`, `customInstructions`, on both `session_before_compact` and `session_before_tree` — runs judge-first then regex, mirroring the egress chain (judge needs the original text; regex idempotently skips issued placeholders; placeholder forms stay unified by first-issuer-wins through the shared registry/clean cache, and clean leaves are short-circuited by the shared clean cache). Judge classify failures fail closed with unverified candidates masked while compaction continues; the summary retry/cancel semantics are unchanged and still reserved for the summarization call itself. A missing classifier model follows the egress `onMissing` policy (default fail_closed; `regex_only` degrades the summary input to the regex layer — residual gap documented in README known limitations). Without a judge config, compaction stays regex-only. Acceptance cases: `test/compaction-judge.test.ts`.
 
 ### Changed
 
@@ -38,6 +39,6 @@
 
 ### Security
 
-- 出站模型请求不再包含凭据：全部出站路径（请求上下文、压缩/分支摘要输入）恒伪值；例外仅剩显式知情选择 `judge.onMissing="regex_only"` 的降级期间 regex 不可见的 secret（可见降级状态，见 README 已知限制）。
+- Outbound model requests no longer contain credentials: every egress surface — request context and compaction/branch-summary input (the latter double-covered judge+regex since ticket #12) — consistently carries placeholders; the only remaining exception is regex-invisible secrets during an explicit, informed `judge.onMissing="regex_only"` degradation (visible degraded state, see README known limitations).
 - 判定通道故障绝不静默放行：未验证候选一律掩码（fail_closed）——覆盖 classify 出错/缺应答、（默认配置下的）模型缺失与 maxBatches 截断丢弃。
 - 压缩/分支摘要故障绝不回退不掩码的默认压缩：重试后取消本次压缩（会话继续不压缩），零真值出站。
