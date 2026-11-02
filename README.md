@@ -1,5 +1,9 @@
 # pi-keep-secret
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![npm](https://img.shields.io/npm/v/pi-keep-secret)](https://www.npmjs.com/package/pi-keep-secret)
+[![CI](https://github.com/jesset/pi-keep-secret/actions/workflows/ci.yml/badge.svg)](https://github.com/jesset/pi-keep-secret/actions/workflows/ci.yml)
+
 pi 会话的透明出站密钥掩码扩展（LiteLLM `secret-mask` guardrail 移植）：出站请求里的凭据被替换为格式保持的确定性伪值，回程响应再还原，本地 transcript 与工具执行始终拿真值。规格见 GitHub issue jesset/pi-keep-secret#1。
 
 ## 脚手架决策（T0，issue #2）
@@ -8,7 +12,7 @@ pi 会话的透明出站密钥掩码扩展（LiteLLM `secret-mask` guardrail 移
 - **devDependencies**：
   - `@earendil-works/pi-coding-agent@1.4.0` — pi SDK（`createAgentSession`、`DefaultResourceLoader`、扩展 API 类型等）。
   - `@earendil-works/pi-ai@1.4.0`、`@earendil-works/pi-agent-core@1.4.0` — harness 直接引用其类型（`Message`、`JsonObject` 等）与 faux 供应商工具，显式声明为直接依赖以避免传递依赖漂移。
-- **命令**：`bun test`（测试）、`bunx tsc --noEmit`（类型检查）。版本与全局安装的 pi 1.4.0 一致。
+- **命令**：`bun test`（测试）、`bun run typecheck`（类型检查，`tsc --noEmit -p tsconfig.json`，CI 同一命令）。版本与全局安装的 pi 1.4.0 一致。
 
 ## 测试接缝 1：进程内会话 + 脚本化假供应商 harness
 
@@ -254,7 +258,13 @@ const compose = (pi: ExtensionAPI): void => {
 
 ## 安装（用户级扩展目录）
 
-用户级安装覆盖当前用户全部 pi 会话（含子代理子进程——子会话在自己的进程里加载同一用户级扩展目录，规格 #1 用户故事 32）。
+npm 包安装（首选，发布后可用；CI 见 [ci.yml](.github/workflows/ci.yml)，发布流水线 [publish.yml](.github/workflows/publish.yml)——GitHub Release `v*` 触发、npm OIDC trusted publishing 免令牌发布）：
+
+```bash
+pi install npm:pi-keep-secret
+```
+
+手动拷贝（未发布/离线环境的替代方式，效果等同）——用户级安装覆盖当前用户全部 pi 会话（含子代理子进程——子会话在自己的进程里加载同一用户级扩展目录，规格 #1 用户故事 32）。
 
 ```bash
 # 1) 建安装目录（用户级扩展目录的固定命名位）

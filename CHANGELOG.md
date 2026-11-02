@@ -21,6 +21,7 @@
 - 目录扩展打包：`package.json` 的 `pi.extensions` 清单（`--extension <repo>` 与用户级目录发现共用）；README 安装/配置/卸载步骤与已知限制汇总（T8，#10）。
 - `detectorsMode` 策略开关（`replace` 默认 / `merge`）：merge 下内置默认集与用户 `detectors` 合并——同名用户项原位覆盖内置（可微调 pattern/redactTemplate，如收紧 sk- 排除规则），非同名项追加在内置之后；`detectors` 未配置时两模式等价纯内置集；非法值整体回退默认集 + 错误可见；模式与生效集纳入配置指纹（reload 热应用），`/keep-secret` 状态面展示模式与生效检测器数（T13，#13）。
 - judge 双协议（T14，#14）：config.json 的 judge 段新增可选键 `api`（`systemone` / `decisions`，非法值在 loader 整体回退）——缺省跟随模型注册条目的 `api` 字段（适配器协议无关，走 modelRegistry.classify）；`MODEL_API_BY_JUDGE_API` 映射 typesafe-system-one↔systemone、openai-decisions↔decisions（T16 起用作偏好覆盖映射，见 Changed）。网关验证脚本支持 `PI_KEEP_SECRET_JUDGE_API=decisions` 切 OpenAI Decisions 线缆；README 双协议 models.json/config 样例。
+- CI 与发布流水线：`.github/workflows/ci.yml`（push/PR：`bun install --frozen-lockfile` → typecheck → `bun test`）；`.github/workflows/publish.yml`（GitHub Release `v*` 发布触发，tag 与 package.json 版本双验证，npm OIDC trusted publishing 免令牌发布 `--provenance --access public`，参照 pi-verdict/czottmann(pi-automode) 模式）。配套：`typecheck` 脚本与 `typescript` devDependency、tsconfig 覆盖 `extension/`、package.json 发布字段（`files` 白名单（extension/src/文档，排除 `*.test.ts`）、`peerDependencies`（pi-coding-agent ≥1.4.0，optional）、repository/keywords/author/license，移除 `private`）与 README badge/npm 安装方式。
 
 ### Changed
 
