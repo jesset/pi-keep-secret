@@ -25,6 +25,7 @@
 
 ### Changed
 
+- Placeholder form unification, first-issuer-wins (T20, #21): the placeholder registry now keeps a secret→placeholder reverse index — the same secret always leaves the session in one placeholder form regardless of which detection path issues it (judge leaf or regex leaf); the first issuance pins the form, later detector templates are downgraded to suggestions, and LRU eviction cleans both indexes so post-eviction re-issuance deterministically follows the current suggestion. Deliberate divergence from the LiteLLM reference implementation (per-detector template heterogeneity), accepted to avoid the model seeing one key as two values in a single request. README gains a "Behavioral notes" section (form unification, model awareness, restoration illusion, ecosystem layering).
 - judge.api 语义从名称硬校验改为线缆偏好（T16，#16，修复插件注册 classifier 模型被误杀）：设置后按三分支应用——模型注册为 pi-ai 内置 classifier api 时覆盖分发线缆（classify 调用传浅拷贝仅改 api 字段的模型）；插件自定义 api（如 `litellm-decisions`）时尊重插件实现、正常装配，偏好未生效（一次性 info 通知 + `/keep-secret` 状态面线缆段与未生效标记）；彻底移除「不一致 → 不装配 judge」硬校验路径与错误文案。loader 合法值校验保留；运行期 classify 异常 fail_closed 语义不变。
 - 掩码压缩故障语义（spec 故事 24，零泄漏）：摘要调用带重试（2 次重试、短退避，中止感知）；重试仍失败 → 返回 `{ cancel: true }` 取消本次压缩（会话继续不压缩）+ notify 说明与重试建议 + 取消计数；**彻底移除「回退 pi 默认压缩」路径**（默认压缩不掩码，回退即泄漏）。用户中止语义不变（不计失败）。
 - judge 模型缺失默认 fail_closed（spec 故事 19「down judge never means an unmasked request」）：新增配置项 `judge.onMissing`（`fail_closed` 默认 / `regex_only` 显式知情降级）；fail_closed 下模型缺失与 classify 故障同路径——该消息未验证候选一律掩码（真值注册表本地保留）/ 命令面状态行展示生效策略 / 自测在模型缺失时全部样本期望掩码并附说明。
