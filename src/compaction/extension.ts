@@ -1,24 +1,45 @@
 /**
- * 掩码压缩扩展工厂：以 `session_before_compact` 返回完整 `CompactionResult`
- * 整体替换 pi 自带压缩（manual /compact、阈值、overflow 三路径都走此钩子），
- * `session_before_tree` 分支摘要同模式——关闭「压缩链路绕过钩子」的泄漏缺口。
+ * Masked compaction extension factory: returns a full `CompactionResult` from
+ * `session_before_compact` to replace pi's built-in compaction entirely
+ * (manual /compact, threshold and overflow all go through this hook);
+ * `session_before_tree` handles branch summaries the same way — closing the
+ * "compaction path bypasses hooks" leak surface.
  *
- * 为什么必须自己掩码：pi 的压缩调用自带 options，不经过 Agent 层
- * context/payload 钩子（研究笔记 §1）；因此这里手动把 preparation 的
- * messagesToSummarize + turnPrefixMessages（分支为 entriesToSummarize 投影）
- * 走与出站相同的掩码管线，摘要结果再按注册表还原——落盘 summary 含真值，
- * 保留区本地不动（出站照常由 context 钩子掩码）。
+ * Why we must mask here ourselves: pi's compaction call carries its own
+ * options and never passes through the Agent-level context/payload hooks
+ * (research notes §1); so the preparation's messagesToSummarize +
+ * turnPrefixMessages (branch hook: entriesToSummarize projection) are run
+ * through the same masking chain as egress, and the summary text is restored
+ * via the registry — the stored summary holds real values, the retained
+ * region stays local (egress masking keeps covering it on later requests).
  *
- * 摘要调用 `ctx.modelRegistry.complete`（当前会话模型，扩展侧门面），提示词对齐
- * pi 默认（见 prompts.ts）；previousSummary / customInstructions 掩码后入
- * 摘要上下文。
+ * Masking chain (ticket #12): summary input leaves (conversation messages,
+ * previousSummary, customInstructions) run judge-first then regex — the same
+ * order and the same instances as the egress chain (judge needs the original
+ * text; the regex layer idempotently skips already-issued placeholders, and
+ * placeholder forms stay unified via first-issuer-wins). Without a judge
+ * masker the chain degrades to regex only, i.e. the pre-#12 behavior for
+ * sessions without a judge config. Judge failures never disturb compaction:
+ * classify errors fail closed inside the masker (unverified candidates
+ * masked) and compaction continues; a missing classifier model follows the
+ * egress onMissing policy (default fail_closed, regex_only = explicit
+ * informed degradation to the regex layer for the summary input as well).
+ * The retry/cancel path below is reserved for the summarization call itself.
  *
- * 故障策略（spec 故事 24：零泄漏）：摘要调用带重试（SUMMARY_RETRIES 次、
- * 短退避；用户中止不重试不算失败）；重试仍失败 → 返回 `{ cancel: true }`
- * 取消本次压缩（会话继续不压缩）+ ctx.ui.notify 告警与重试建议 + 状态栏
- * 标记 + 计数（无 UI 模式仅计数）。**不存在「回退 pi 默认压缩」路径**——
- * 默认压缩不掩码，摘要模型会看到真值，回退即泄漏。用户中止（abort）与
- * 失败取消同走 `{ cancel: true }`，但中止不计失败。
+ * The summary call goes through `ctx.modelRegistry.complete` (the session's
+ * current model, the extension-side facade); the prompt mirrors pi's default
+ * (see prompts.ts); previousSummary / customInstructions are masked before
+ * entering the summary context.
+ *
+ * Failure policy (spec story 24: zero leaks): the summary call retries
+ * (SUMMARY_RETRIES times with short backoff; user aborts are not failures);
+ * if retries are exhausted the compaction is cancelled via `{ cancel: true }`
+ * (the session continues un-compacted) + ctx.ui.notify warning with a retry
+ * hint + status bar marker + counters (headless mode counts only). There is
+ * **no fallback to pi's default compaction** — the default path does not
+ * mask, so the summarization model would see real values; falling back would
+ * leak. User aborts take the same `{ cancel: true }` path but are not counted
+ * as failures.
  */
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type {
@@ -29,8 +50,9 @@ import type {
 import { convertToLlm, prepareBranchEntries, serializeConversation } from "@earendil-works/pi-coding-agent";
 import type { Usage } from "@earendil-works/pi-ai";
 import { normalizeContext } from "@earendil-works/pi-ai";
+import type { JudgeTextMasker } from "../judge/index.ts";
 import type { MaskingPipeline } from "../masking/index.ts";
-import { maskMessageTree } from "../masking/index.ts";
+import { maskMessageTreeAsync } from "../masking/index.ts";
 import {
 	BRANCH_SUMMARY_PREAMBLE,
 	buildBranchPrompt,
@@ -58,9 +80,17 @@ export interface MaskedCompactionStatus {
 }
 
 export interface MaskedCompactionOptions {
-	/** 会话级掩码管线（与出站钩子共享同一注册表实例，保证伪值一致）。 */
+	/** Session-level masking pipeline (shares the registry with the egress
+	 *  hooks, keeping placeholder forms consistent). */
 	pipeline: MaskingPipeline;
-	/** 故障状态（缺省随工厂新建）；需要观测取消的调用方（测试/状态命令）传入。 */
+	/** Judge text masker, the same instance the egress chain uses (shared
+	 *  registry/clean cache/tombstones). When provided, summary input is
+	 *  masked judge-first then regex; omitted = regex only (sessions without
+	 *  a judge config keep the pre-#12 behavior). Judge failures stay inside
+	 *  the masker (fail_closed masking) and never cancel compaction. */
+	judge?: JudgeTextMasker;
+	/** Failure status (created by this factory when omitted); callers that
+	 *  need to observe cancellations (tests, status command) pass one in. */
 	status?: MaskedCompactionStatus;
 }
 
@@ -84,13 +114,26 @@ interface SummaryCall {
 /** 创建掩码压缩扩展（注册 session_before_compact / session_before_tree）。 */
 export function createMaskedCompactionExtension(options: MaskedCompactionOptions) {
 	const { pipeline } = options;
+	const judge = options.judge;
 	const status: MaskedCompactionStatus =
 		options.status ?? { cancellations: 0, lastCancellationError: undefined };
 
-	/** 消息 → LLM 形态（convertToLlm，含 branchSummary/compactionSummary 投影）→ 掩码文本叶 → 序列化文本。 */
-	const maskedConversationText = (messages: AgentMessage[]): string => {
+	/** Mask one summary-input text leaf with the egress chain's composition:
+	 *  judge first (when wired in — it needs the original text), then the regex
+	 *  pipeline (idempotent over already-issued placeholders). Judge classify
+	 *  failures fail closed inside the masker, so masking never interrupts
+	 *  compaction; retry/cancel semantics are owned by the summary call. */
+	const maskSummaryInput = async (text: string, ctx: ExtensionContext): Promise<string> =>
+		pipeline.maskText(judge === undefined ? text : await judge.mask(text, ctx));
+
+	/** Messages → LLM shape (convertToLlm, incl. branchSummary/compactionSummary
+	 *  projections) → mask text leaves → serialized conversation text. */
+	const maskedConversationText = async (
+		messages: AgentMessage[],
+		ctx: ExtensionContext,
+	): Promise<string> => {
 		const llmMessages = convertToLlm(structuredClone(messages));
-		maskMessageTree(llmMessages, pipeline.maskText);
+		await maskMessageTreeAsync(llmMessages, (text) => maskSummaryInput(text, ctx));
 		return serializeConversation(llmMessages);
 	};
 
@@ -223,13 +266,15 @@ export function createMaskedCompactionExtension(options: MaskedCompactionOptions
 			const messages = [...preparation.messagesToSummarize, ...preparation.turnPrefixMessages];
 			try {
 				const promptText = buildCompactionPrompt({
-					conversationText: maskedConversationText(messages),
+					conversationText: await maskedConversationText(messages, ctx),
 					previousSummary:
 						preparation.previousSummary !== undefined
-							? pipeline.maskText(preparation.previousSummary)
+							? await maskSummaryInput(preparation.previousSummary, ctx)
 							: undefined,
 					customInstructions:
-						customInstructions !== undefined ? pipeline.maskText(customInstructions) : undefined,
+						customInstructions !== undefined
+							? await maskSummaryInput(customInstructions, ctx)
+							: undefined,
 				});
 				const { text, usage } = await requestSummaryWithRetry(ctx, model, promptText, signal);
 				const compaction: CompactionResult = {
@@ -257,10 +302,10 @@ export function createMaskedCompactionExtension(options: MaskedCompactionOptions
 				const { messages } = prepareBranchEntries(preparation.entriesToSummarize, tokenBudget);
 				if (messages.length === 0) return; // pi 默认路径自行产出「No content to summarize」
 				const promptText = buildBranchPrompt({
-					conversationText: maskedConversationText(messages),
+					conversationText: await maskedConversationText(messages, ctx),
 					customInstructions:
 						preparation.customInstructions !== undefined
-							? pipeline.maskText(preparation.customInstructions)
+							? await maskSummaryInput(preparation.customInstructions, ctx)
 							: undefined,
 					replaceInstructions: preparation.replaceInstructions,
 				});
