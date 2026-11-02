@@ -1,12 +1,18 @@
 /**
- * 掩码压缩层公共出口（T6 交付）。
+ * Masked compaction layer public exports (T6; judge coverage since ticket #12).
  *
- * - `createMaskedCompactionExtension`：注册 `session_before_compact` /
- *   `session_before_tree`，以掩码摘要整体替换 pi 自带压缩/分支摘要
- *   （结果还原真值落盘）；摘要带重试（SUMMARY_RETRIES 次、短退避），
- *   重试仍失败则取消本次压缩并告警计数（会话继续不压缩，零泄漏；
- *   不存在回退默认压缩的路径）。
- * - `MaskedCompactionStatus`：取消计数与最近原因，供状态面/测试观测。
+ * - `createMaskedCompactionExtension`: registers `session_before_compact` /
+ *   `session_before_tree` and replaces pi's built-in compaction/branch summary
+ *   with a masked one (the stored result is restored to real values). Summary
+ *   input runs the egress chain's composition — judge masker first (when
+ *   provided via `options.judge`, the same instance the egress chain uses),
+ *   then the regex pipeline; judge failures fail closed inside the masker and
+ *   never cancel compaction. The summary call retries (SUMMARY_RETRIES times,
+ *   short backoff); when retries are exhausted the compaction is cancelled
+ *   with a warning and a counter (the session keeps running un-compacted,
+ *   zero leaks; there is no fallback to pi's default compaction).
+ * - `MaskedCompactionStatus`: cancellation counter and last reason, for the
+ *   status command and tests to observe.
  */
 export {
 	createMaskedCompactionExtension,
