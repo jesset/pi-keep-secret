@@ -4,3 +4,5 @@ dist/
 .DS_Store
 bun.lockb
 AGENTS.local.md
+# Must stay nonexistent: tests pin PI_KEEP_SECRET_CONFIG here for isolation
+.test-isolated-config.json
