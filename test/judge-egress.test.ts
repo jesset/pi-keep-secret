@@ -550,3 +550,91 @@ describe("T16 judge.api 线缆偏好（三分支装配，无名称硬校验）",
 		expect(notifications).toHaveLength(1);
 	});
 });
+
+describe("T20 placeholder form unification (first-issuer-wins, #21)", () => {
+	// One secret must never reach the provider in two different placeholder
+	// forms: whichever detection path issues first (judge leaf or regex leaf)
+	// pins the form and the other path reuses it. Pre-T20 a judge-hit leaf
+	// issued key-{hash} while a regex-hit leaf issued sk-{hash} for the same
+	// secret, so the model saw both forms in one request.
+
+	test("judge-hit leaf pins the form; a regex-hit leaf in the same request reuses it", async () => {
+		const pipeline = createMaskingPipeline();
+		const fake = scriptClassify({
+			// Gate by leaf content: the system leaf (GATEHIT) is judged and masks
+			// the secret (first issuance); the user leaf passes to the regex layer.
+			gate: (text) => (text.includes("GATEHIT") ? 0.98 : 0.02),
+			candidate: (value) => (value === OPENAI_KEY ? 0.96 : 0.04),
+		});
+		const h = await createHarnessSession({
+			extensionFactories: [
+				createJudgeEgressExtension({
+					modelRef: MODEL_REF,
+					pipeline,
+					resolveModel: () => fakeClassifierModel(),
+					classify: (_model, context) => fake.classify(context),
+				}),
+				createEgressMaskingExtension({ pipeline }),
+			],
+			cwdFiles: {
+				"AGENTS.md": `# Project rules\n\nDeploy key (GATEHIT): ${OPENAI_KEY}\n`,
+			},
+		});
+		try {
+			h.provider.setScript([{ text: "ack" }]);
+			await h.session.prompt(`internal audit note: the shared key ${OPENAI_KEY} stays private`);
+
+			const out = requestText(h.provider.requests()[0]);
+			expect(out).not.toContain(OPENAI_KEY);
+			// One form for one secret: both leaves carry the same key-{hash}
+			// placeholder; the openai detector's own sk-{hash} form never appears.
+			const forms = out.match(/key-[A-Z2-7]{12}/g);
+			expect(forms).not.toBeNull();
+			expect(new Set(forms).size).toBe(1);
+			expect(forms).toHaveLength(2); // system leaf + user leaf
+			expect(out).not.toMatch(/sk-[A-Z2-7]{12}/);
+			expect(pipeline.registry.get(forms![0]!)).toBe(OPENAI_KEY);
+		} finally {
+			h.dispose();
+		}
+	});
+
+	test("regex-hit leaf pins the form; a judge-hit leaf in a later turn reuses it", async () => {
+		const pipeline = createMaskingPipeline();
+		const fake = scriptClassify({
+			gate: (text) => (text.includes("GATEHIT") ? 0.98 : 0.02),
+			candidate: (value) => (value === OPENAI_KEY ? 0.96 : 0.04),
+		});
+		const h = await createHarnessSession({
+			extensionFactories: [
+				createJudgeEgressExtension({
+					modelRef: MODEL_REF,
+					pipeline,
+					resolveModel: () => fakeClassifierModel(),
+					classify: (_model, context) => fake.classify(context),
+				}),
+				createEgressMaskingExtension({ pipeline }),
+			],
+		});
+		try {
+			h.provider.setScript([{ text: "ok" }, { text: "ok" }]);
+			// Turn 1: the judge gate misses the secret; only the regex layer sees
+			// it, so sk-{hash} is the first-issued form.
+			await h.session.prompt(`internal audit note: the shared key ${OPENAI_KEY} stays private`);
+			// Turn 2: the judge gate hits the same secret on a new leaf; the judge
+			// masker must reuse the regex-issued form instead of key-{hash}.
+			await h.session.prompt(`GATEHIT deploy with the shared key ${OPENAI_KEY}`);
+
+			const out = requestText(h.provider.requests()[1]);
+			expect(out).not.toContain(OPENAI_KEY);
+			const forms = out.match(/sk-[A-Z2-7]{12}/g);
+			expect(forms).not.toBeNull();
+			expect(new Set(forms).size).toBe(1);
+			expect(forms).toHaveLength(2); // turn-1 leaf + turn-2 leaf
+			expect(out).not.toMatch(/key-[A-Z2-7]{12}/);
+			expect(pipeline.registry.get(forms![0]!)).toBe(OPENAI_KEY);
+		} finally {
+			h.dispose();
+		}
+	});
+});

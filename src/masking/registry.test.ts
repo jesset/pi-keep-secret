@@ -78,4 +78,31 @@ describe("伪值注册表", () => {
 		expect(registry.get(a)).toBe("sk-aaaaaaaaaaaaaaaaaaaa");
 		expect(registry.size).toBe(2);
 	});
+
+	test("first-issuer-wins: an issued secret keeps its first form; later templates are only suggestions", () => {
+		const registry = createPlaceholderRegistry();
+		const first = registry.issue("sk-UNIFYFIRST01", "sk-{hash}");
+		expect(first).toMatch(/^sk-[A-Z2-7]{12}$/);
+		// Another detector suggests its own template for the same secret; the
+		// suggestion is downgraded to a hint — one secret, one form per session.
+		expect(registry.issue("sk-UNIFYFIRST01", "ghp_{hash}")).toBe(first);
+		expect(registry.issue("sk-UNIFYFIRST01", "AKIA{hash}")).toBe(first);
+		// Different secrets still take their own suggested form.
+		expect(registry.issue("ghp_UNIFYSECOND02", "ghp_{hash}")).toMatch(/^ghp_[A-Z2-7]{12}$/);
+		expect(registry.size).toBe(2);
+	});
+
+	test("eviction cleans the reverse index: post-eviction re-issue follows the current suggestion", () => {
+		const registry = createPlaceholderRegistry({ limit: 1 });
+		const skForm = registry.issue("sk-EVICTUNIFY03", "sk-{hash}");
+		registry.issue("ghp_EVICTUNIFY04", "ghp_{hash}"); // LRU-evicts the entry above
+		expect(registry.has(skForm)).toBe(false);
+		// The reverse entry was evicted together with the placeholder entry, so a
+		// re-issue takes the current suggestion (no stale-form resurrection) ...
+		const ghpForm = registry.issue("sk-EVICTUNIFY03", "ghp_{hash}");
+		expect(ghpForm).toBe(makePlaceholder("sk-EVICTUNIFY03", "ghp_{hash}", 12));
+		expect(registry.get(ghpForm)).toBe("sk-EVICTUNIFY03");
+		// ... and that re-issued form then sticks (first-issuer-wins restarts).
+		expect(registry.issue("sk-EVICTUNIFY03", "sk-{hash}")).toBe(ghpForm);
+	});
 });
