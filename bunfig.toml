@@ -1,0 +1,5 @@
+# Global test configuration (ticket #18 Part 1): preload isolates every test
+# run from the user-level config by pinning PI_KEEP_SECRET_CONFIG to a
+# repo-local path that never exists (see ./test/preload.ts).
+[test]
+preload = ["./test/preload.ts"]

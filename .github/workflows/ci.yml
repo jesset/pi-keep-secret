@@ -28,3 +28,32 @@ jobs:
 
       - name: Test
         run: bun test
+
+  # Real-gateway calibration check (ticket #18 Part 2). The job always runs;
+  # the test file's own env gating skips (and passes) when the judge secrets
+  # are not configured (e.g. fork PRs) — GitHub Actions cannot branch on
+  # secrets in `if:`, so in-script gating is the established pattern. Never
+  # echo the env below: the test does not print the key.
+  live-e2e:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Live gateway e2e
+        env:
+          PI_KEEP_SECRET_JUDGE_BASE_URL: ${{ secrets.PI_KEEP_SECRET_JUDGE_BASE_URL }}
+          PI_KEEP_SECRET_JUDGE_MODEL: ${{ secrets.PI_KEEP_SECRET_JUDGE_MODEL }}
+          PI_KEEP_SECRET_JUDGE_API_KEY: ${{ secrets.PI_KEEP_SECRET_JUDGE_API_KEY }}
+          # Repo variable (not a secret); empty (unset) falls back to the
+          # script's default systemone wire instead of an invalid empty string.
+          PI_KEEP_SECRET_JUDGE_API: ${{ vars.VARS_PI_KEEP_SECRET_JUDGE_API || 'systemone' }}
+        run: bun test research/systemone-gateway.test.ts
