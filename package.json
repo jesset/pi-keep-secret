@@ -1,25 +1,66 @@
 {
-  "name": "pi-keep-secret",
-  "version": "0.1.0",
-  "private": true,
-  "type": "module",
-  "description": "Transparent egress secret masking for pi sessions (extension)",
-  "scripts": {
-    "test": "bun test"
-  },
-  "devDependencies": {
-    "@earendil-works/pi-agent-core": "1.4.0",
-    "@earendil-works/pi-ai": "1.4.0",
-    "@earendil-works/pi-coding-agent": "1.4.0",
-    "@types/bun": "^1.4.4"
-  },
-  "trustedDependencies": [
-    "@google/genai",
-    "protobufjs"
-  ],
-  "pi": {
-    "extensions": [
-      "extension/index.ts"
-    ]
-  }
+	"name": "pi-keep-secret",
+	"version": "0.1.0",
+	"type": "module",
+	"description": "Transparent egress secret masking for pi sessions (extension)",
+	"author": "Jesset (https://github.com/jesset)",
+	"main": "extension/index.ts",
+	"files": [
+		"extension",
+		"src",
+		"!src/**/*.test.ts",
+		"README.md",
+		"LICENSE",
+		"CHANGELOG.md"
+	],
+	"keywords": [
+		"pi-package",
+		"pi",
+		"pi-extension",
+		"extension",
+		"pi-coding-agent",
+		"security",
+		"secrets",
+		"masking",
+		"redaction",
+		"egress",
+		"guardrail",
+		"privacy",
+		"ai-agent"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/jesset/pi-keep-secret.git"
+	},
+	"homepage": "https://github.com/jesset/pi-keep-secret#readme",
+	"bugs": "https://github.com/jesset/pi-keep-secret/issues",
+	"license": "MIT",
+	"pi": {
+		"extensions": [
+			"extension/index.ts"
+		]
+	},
+	"scripts": {
+		"typecheck": "tsc --noEmit -p tsconfig.json",
+		"test": "bun test"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": ">=1.4.0"
+	},
+	"peerDependenciesMeta": {
+		"@earendil-works/pi-coding-agent": {
+			"optional": true
+		}
+	},
+	"devDependencies": {
+		"@earendil-works/pi-agent-core": "1.4.0",
+		"@earendil-works/pi-ai": "1.4.0",
+		"@earendil-works/pi-coding-agent": "1.4.0",
+		"@types/bun": "^1.4.4",
+		"typescript": "^7.0.2"
+	},
+	"trustedDependencies": [
+		"@google/genai",
+		"protobufjs"
+	]
 }
