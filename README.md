@@ -182,25 +182,29 @@ const { factory, loader, pipeline } = createConfiguredMaskingExtension({ configP
 - `ctx.ui.notify` 在无 UI 模式（print/RPC）是 no-op：配置错误在无 UI 环境只经 `loader.get().errors` 可见，T7 status 负责展示。
 ## 掩码压缩（T6，issue #8）
 
-代码：`src/compaction/`（extension/prompts）；验收用例：`test/compaction.test.ts`（接缝 1）。
+代码：`src/compaction/`（extension/prompts）；验收用例：`test/compaction.test.ts`、`test/compaction-judge.test.ts`（接缝 1）。
 
-- `session_before_compact` 处理器返回完整 `CompactionResult`，整体替换 pi 自带压缩（manual `/compact`、阈值、overflow 三路径都走此钩子）：preparation 的 messagesToSummarize + turnPrefixMessages → `convertToLlm`（含 branchSummary/compactionSummary 投影）→ 与出站同一掩码管线掩码文本叶 → `serializeConversation` 入摘要提示词 → `ctx.modelRegistry.complete`（当前会话模型）摘要 → 摘要文本按注册表还原 → `{ compaction: { summary, firstKeptEntryId, tokensBefore, usage } }`。
+- `session_before_compact` returns a full `CompactionResult`, replacing pi's built-in compaction entirely (manual `/compact`, threshold and overflow all go through this hook): preparation's messagesToSummarize + turnPrefixMessages → `convertToLlm` (incl. branchSummary/compactionSummary projections) → mask the text leaves with the egress chain's composition — judge masker first (when configured, ticket #12), then the regex pipeline → `serializeConversation` into the summary prompt → summarize via `ctx.modelRegistry.complete` (the session's current model) → restore the summary text via the registry → `{ compaction: { summary, firstKeptEntryId, tokensBefore, usage } }`.
+- Summary input is double-covered (ticket #12, closing the last leak surface where judge-only secrets rode the summary prompt): conversation messages, previousSummary and customInstructions all run the judge masker — the same instance the egress chain uses, so the registry/clean cache/tombstones are shared and placeholder forms stay unified (first-issuer-wins) — and then the regex pipeline. Judge classify failures fail closed (unverified candidates masked) and **compaction continues**; the retry/cancel path is reserved for the summarization call itself. A missing classifier model follows the egress `onMissing` policy: default fail_closed masks unverified candidates before summarizing; explicit `regex_only` degrades the summary input to the regex layer only (in that mode low-entropy, regex-invisible secrets still reach the summary request — see known limitation 2). Without a judge config section the summary input stays regex-only, unchanged.
 - 摘要提示词对齐 pi 默认（pi 1.4.0 未公开导出提示词常量，按原文复制于 `src/compaction/prompts.ts`，升级时需同步校对）；previousSummary / customInstructions 掩码后入摘要上下文，结果还原。
 - `session_before_tree` 同模式返回 `{ summary: { summary: 还原后文本, usage } }`（entriesToSummarize 经 `prepareBranchEntries` 投影）。
 - 故障策略（spec 故事 24：零泄漏）：摘要调用带重试（2 次重试、短退避；用户中止不重试不算失败）；重试仍失败 → 返回 `{ cancel: true }` 取消本次压缩（会话继续不压缩）+ `ctx.ui.notify` 告警与重试建议 + 状态栏标记 + `MaskedCompactionStatus` 计数（无 UI 模式仅计数）。**不存在「回退 pi 默认压缩」路径**——默认压缩不掩码，回退即泄漏。
 - 出站兑底：压缩/分支摘要消息（`compactionSummary`/`branchSummary` 自定义 AgentMessage，携带还原真值）的 `summary` 字段由遍历器掩码（T6 起进入出站覆盖）。
 
 ```ts
-// 组合接线（extension/index.ts）：出站掩码、回程还原、掩码压缩共享同一管线
+// Composition wiring (extension/index.ts): egress masking, ingress restoration
+// and masked compaction share one pipeline; the judge masker (when the judge
+// config section exists) is the same instance the egress chain uses (ticket #12).
 import { createMaskedCompactionExtension } from "./src/compaction/index.ts";
 import { createIngressRestorationExtension } from "./src/ingress/index.ts";
 import { createEgressMaskingExtension, createMaskingPipeline } from "./src/masking/index.ts";
 
 const pipeline = createMaskingPipeline();
+const judge: JudgeTextMasker | undefined = undefined; // created by the config layer when judge is configured
 const compose = (pi: ExtensionAPI): void => {
 	createEgressMaskingExtension({ pipeline })(pi);
 	createIngressRestorationExtension({ registry: pipeline.registry })(pi);
-	createMaskedCompactionExtension({ pipeline })(pi);
+	createMaskedCompactionExtension({ pipeline, judge })(pi);
 };
 ```
 
@@ -346,7 +350,7 @@ Findings from live behavioral testing (7 outbound requests, zero plaintext leaks
 各票实现过程中的发现与接受的取舍，集中列出：
 
 1. **流式期间短暂显示伪值**：`message_update` 为纯通知（不可改写），TUI 流式渲染期间助手输出短暂显示伪值，消息完成（`message_end` 还原）后转为真值（规格 #1 用户故事 18 已接受；T3）。
-2. **judge.onMissing=regex_only 降级期间 regex 不可见的 secret 会出站**：classifier 模型缺失/不可解析时默认 fail_closed（未验证候选一律掩码，零泄漏）；显式配置 `onMissing: "regex_only"` 才会降级仅 regex 层（可见：notify 一次 + 状态栏 + `/keep-secret` 降级计数 + 自测假密码项未通过）——低熵密码等 regex 不可见的 secret 在该模式下会出站，属知情取舍（T5/T8）。
+2. **Secrets invisible to the regex layer still egress while `judge.onMissing=regex_only` is degraded**: when the classifier model is missing/unresolvable, the default is fail_closed (unverified candidates always masked, zero leaks); only the explicit `onMissing: "regex_only"` degrades to the regex layer alone (visible: one-time notify + status bar + `/keep-secret` degraded counter + the self-test password item failing). In that mode low-entropy, regex-invisible secrets egress — and since ticket #12 the same policy governs the compaction summary input, so those secrets also reach the summarization model (the same informed trade-off; T5/T8/#12).
 3. **judge 供应商需可信**：judge 判定会把消息文本发给判定模型（System One 端点）；该供应商必须与主会话供应商同级别的可信边界（规格 #1；T5）。
 4. **transcript 本地保留真值**：会话文件按设计保留真值（本地磁盘保护是独立关注点，规格外）；仅出站请求恒伪值（T2 起，各票锚定）。
 5. **`before_agent_start` 强制 systemPrompt 绕过掩码**：pi 在 context 钩子之后投影强制 systemPrompt，不经 `context_with_system` 掩码；本扩展自身不强制 prompt 不受影响，但其他扩展若把密钥写进强制 prompt 则是泄漏路径（T2 发现，规格外）。
