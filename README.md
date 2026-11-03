@@ -247,6 +247,41 @@ Both routes (`/v1/systemone`, `/v1/decisions`) come from the same backend and th
 - `/keep-secret test` — the self-test described in [Quickstart](#quickstart).
 - `/keep-secret reload` — re-read the config file; detector changes hot-apply.
 
+All command and extension output is **English and plain text**: a single-line title, a rule, then grouped key/value blocks pre-wrapped to a 72-column budget (long values such as detector lists or config paths fold with a hanging indent, so the layout survives narrow terminals and `Warning: ` / `Error: ` prefixes). No interactive dialogs are used — output goes through `ctx.ui.notify`, which means the same text reaches the TUI and RPC clients, and print/JSON modes stay silent without changing what the command does.
+
+```
+pi-keep-secret · status
+────────────────────────────────────────────────────────────────────────
+Config
+  detectors     7 · mode replace
+  source        built-in defaults (no config file at ~/.pi/agent/…/config.json)
+  names         openai-key, github-pat, aws-access-key-id, google-api-key,
+                slack-bot-token, pem-private-key, jwt
+Session
+  placeholders  1 placeholder issued
+  clean cache   34 entries · hit rate 71% (85 hits / 119 scans)
+  hits          openai-key=2
+Judge
+  layer         regex only (no judge config)
+Compaction
+  cancelled     0
+```
+
+```
+pi-keep-secret · self-test — 4 samples, current detector set
+────────────────────────────────────────────────────────────────────────
+  ✓  sk- fake key        masked    expected masked
+  ✓  key in URL          masked    expected masked
+  ✓  fake password       unmasked  expected unmasked
+     low-entropy password: invisible to the regex layer — covered by the
+     judge layer once a judge section is configured
+  ✓  clean order number  unmasked  expected unmasked
+────────────────────────────────────────────────────────────────────────
+  ✓ 4/4 passed
+```
+
+`/keep-secret reload` reports `config` / `detectors` in the same shape: `hot-applied`, `unchanged`, or — on an invalid file — `reload failed` with an `Errors` block, one line per validation error.
+
 Uninstalling is just removing the package: `pi remove npm:pi-keep-secret` (or delete `~/.pi/agent/extensions/pi-keep-secret/` for the copy install). There is no other on-disk state — the registry and caches are in-process and die with the session.
 
 ## FAQ

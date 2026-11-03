@@ -537,7 +537,7 @@ describe("T16 judge.api 线缆偏好（三分支装配，无名称硬校验）",
 		expect(notifications[0]!.type).toBe("info");
 		expect(notifications[0]!.message).toContain("systemone");
 		expect(notifications[0]!.message).toContain("litellm-decisions");
-		expect(notifications[0]!.message).toContain("未生效");
+		expect(notifications[0]!.message).toContain("has no effect");
 		expect(statusKeys).toEqual([]); // 非降级不占状态栏
 		// 状态面标记：生效线缆为插件自定义名 + 偏好未生效
 		expect(masker.wire).toEqual({

@@ -173,13 +173,13 @@ export function createMaskedCompactionExtension(options: MaskedCompactionOptions
 			throw new SummaryAbortError();
 		}
 		if (response.stopReason === "error") {
-			throw new Error(response.errorMessage ?? "摘要模型返回错误");
+			throw new Error(response.errorMessage ?? "summarization model returned an error");
 		}
 		if (response.stopReason === "length") {
-			throw new Error("摘要命中 token 上限，内容不完整");
+			throw new Error("summary hit the token limit and is incomplete");
 		}
 		if (response.content.some((block) => block.type === "toolCall")) {
-			throw new Error("摘要尝试调用工具");
+			throw new Error("summary response attempted a tool call");
 		}
 		const text = response.content
 			.filter((block): block is { type: "text"; text: string } => block.type === "text")
@@ -187,7 +187,7 @@ export function createMaskedCompactionExtension(options: MaskedCompactionOptions
 			.join("\n")
 			.trim();
 		if (!text) {
-			throw new Error("摘要为空");
+			throw new Error("empty summary");
 		}
 		return { text, usage: response.usage };
 	};
@@ -247,12 +247,13 @@ export function createMaskedCompactionExtension(options: MaskedCompactionOptions
 		status.lastCancellationError = `${scope}: ${messageOf(error)}`;
 		if (ctx.hasUI) {
 			const warning =
-				`pi-keep-secret: ${scope}失败（已重试 ${SUMMARY_RETRIES} 次仍失败），已取消本次压缩——` +
-				`会话保持不压缩、未回退不掩码的默认压缩；稍后可重试 /compact——${messageOf(error)}`;
+				`pi-keep-secret: ${scope} failed after ${SUMMARY_RETRIES} retries — compaction cancelled. ` +
+				`The session stays uncompacted; there is no fallback to the unmasked default compaction. ` +
+				`Retry /compact later — ${messageOf(error)}`;
 			ctx.ui.notify(warning, "warning");
 			ctx.ui.setStatus(
 				STATUS_KEY,
-				`pi-keep-secret 掩码压缩已取消 ${status.cancellations} 次（重试后仍失败）`,
+				`pi-keep-secret masked compaction cancelled ${status.cancellations}× (retries exhausted)`,
 			);
 		}
 		return { cancel: true };
@@ -288,7 +289,7 @@ export function createMaskedCompactionExtension(options: MaskedCompactionOptions
 				if (error instanceof SummaryAbortError) {
 					return { cancel: true };
 				}
-				return reportCancellation(ctx, "掩码压缩摘要", error);
+				return reportCancellation(ctx, "masked compaction summary", error);
 			}
 		});
 
@@ -315,7 +316,7 @@ export function createMaskedCompactionExtension(options: MaskedCompactionOptions
 				if (error instanceof SummaryAbortError) {
 					return { cancel: true };
 				}
-				return reportCancellation(ctx, "掩码分支摘要", error);
+				return reportCancellation(ctx, "masked branch summary", error);
 			}
 		});
 	};

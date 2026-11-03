@@ -232,15 +232,15 @@ export function createJudgeTextMasker(options: JudgeEgressOptions): JudgeTextMas
 					if (ctx.hasUI) {
 						ctx.ui.notify(
 							onMissing === "regex_only"
-								? `pi-keep-secret: judge classifier 模型 ${modelRef.provider}/${modelRef.modelId} 未注册（onMissing=regex_only），出站仅 regex 检测层工作`
-								: `pi-keep-secret: judge classifier 模型 ${modelRef.provider}/${modelRef.modelId} 未注册，已 fail_closed（未验证候选一律掩码）——请注册该 classifier 模型，或显式配置 judge.onMissing="regex_only"`,
+								? `pi-keep-secret: judge classifier model ${modelRef.provider}/${modelRef.modelId} is not registered (onMissing=regex_only) — outbound masking runs on the regex layer only`
+								: `pi-keep-secret: judge classifier model ${modelRef.provider}/${modelRef.modelId} is not registered — fail_closed is active (every unverified candidate is masked). Register the classifier model, or set judge.onMissing="regex_only" explicitly`,
 							"warning",
 						);
 						ctx.ui.setStatus(
 							STATUS_KEY,
 							onMissing === "regex_only"
-								? "pi-keep-secret judge 已降级（仅 regex 检测）"
-								: "pi-keep-secret judge fail_closed（classifier 模型缺失）",
+								? "pi-keep-secret judge degraded (regex layer only)"
+								: "pi-keep-secret judge fail_closed (classifier model missing)",
 						);
 					}
 				}
@@ -284,7 +284,7 @@ export function createJudgeTextMasker(options: JudgeEgressOptions): JudgeTextMas
 					notifiedApiPreference = true;
 					if (ctx.hasUI) {
 						ctx.ui.notify(
-							`pi-keep-secret: judge.api 偏好 "${options.api}" 未生效——模型 ${modelRef.provider}/${modelRef.modelId} 注册为自定义 api "${model.api}"，线缆由该实现决定（judge 正常装配）`,
+							`pi-keep-secret: judge.api preference "${options.api}" has no effect — model ${modelRef.provider}/${modelRef.modelId} is registered with the custom api "${model.api}", so the plugin implementation picks the wire (judge is wired normally)`,
 							"info",
 						);
 					}
@@ -314,10 +314,10 @@ export function createJudgeTextMasker(options: JudgeEgressOptions): JudgeTextMas
 				notifiedError = verdict.error;
 				if (ctx.hasUI) {
 					ctx.ui.notify(
-						`pi-keep-secret: judge 故障已 fail_closed（未验证候选一律掩码）——${verdict.error}`,
+						`pi-keep-secret: judge failure, fail_closed is active (every unverified candidate is masked) — ${verdict.error}`,
 						"warning",
 					);
-					ctx.ui.setStatus(STATUS_KEY, "pi-keep-secret judge fail_closed 已生效");
+					ctx.ui.setStatus(STATUS_KEY, "pi-keep-secret judge fail_closed");
 				}
 			}
 		}

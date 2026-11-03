@@ -15,6 +15,11 @@
  * 三模式安全降级：输出一律经 ctx.ui.notify（TUI 直接可见、RPC 经
  * extension_ui_request 转发、print/json no-op 静默），无任何交互原语
  * （select/confirm/custom），无 UI 也不影响命令动作本身执行。
+ *
+ * 文案与排版：用户可见字符串一律英文（源码注释与 docs 保持中文），版面
+ * 由 `../ui/index.ts` 统一合成——标题 + 分隔线 + 分组键值表，长值在 72
+ * 列预算内预折行（悬挂缩进）。pi 对 warning/error 只给首行加前缀，因此
+ * 首行固定为单行标题，正文缩进 2 列。
  */
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { compileRegexDetector, detectRegexSpans, type CompiledRegexDetector } from "../engine/index.ts";
@@ -24,6 +29,15 @@ import type { ConfigLoader } from "../config/index.ts";
 import { configFingerprint } from "../config/index.ts";
 import type { MaskedCompactionStatus } from "../compaction/index.ts";
 import type { JudgeTextMasker, JudgeWire } from "../judge/index.ts";
+import {
+	formatBlockReport,
+	formatBullets,
+	formatReport,
+	formatTable,
+	type ReportField,
+	type ReportSection,
+	type ReportTableRow,
+} from "../ui/index.ts";
 
 export interface KeepSecretCommandsOptions {
 	/** 配置 loader（状态面的配置摘要来源；reload 动作消费）。 */
@@ -50,19 +64,19 @@ function precheckSuspects(text: string): string[] {
 	return [...names];
 }
 
-/** 配置来源描述：默认集 / 配置文件 / 非法回退（状态面第一行用）。 */
+/** 配置来源描述：默认集 / 配置文件 / 非法回退（状态面板 Config 分区用）。 */
 function describeConfigSource(loader: ConfigLoader): string {
 	const config = loader.get();
 	if (!config.exists) {
-		return `内置默认集（未找到配置文件 ${config.path}）`;
+		return `built-in defaults (no config file at ${config.path})`;
 	}
 	if (config.errors.length > 0) {
-		return `配置文件 ${config.path}（非法，已回退内置默认集）`;
+		return `${config.path} (invalid — fell back to built-in defaults)`;
 	}
-	return `配置文件 ${config.path}`;
+	return config.path;
 }
 
-/** 命中率百分比文本（零样本显示「n/a」）。 */
+/** 命中率百分比文本（零样本显示 n/a）。 */
 function hitRate(hits: number, total: number): string {
 	if (total === 0) {
 		return "n/a";
@@ -70,55 +84,94 @@ function hitRate(hits: number, total: number): string {
 	return `${Math.round((hits / total) * 100)}%`;
 }
 
-/** 生效线缆描述（T16：状态面 judge 行尾段；解析前不展示）。 */
+/** 数量 + 名词（单复数；不规整复数用 irregular 传出）。 */
+function plural(count: number, singular: string, irregular?: string): string {
+	return `${count} ${count === 1 ? singular : (irregular ?? `${singular}s`)}`;
+}
+
+/** 生效线缆描述（T16：状态面板 judge 分区；解析前不展示）。 */
 function describeJudgeWire(wire: JudgeWire): string {
 	switch (wire.source) {
 		case "registered":
-			return `跟随注册（${wire.api}）`;
+			return `follows registration (${wire.api})`;
 		case "override":
-			return `覆盖 ${wire.preference}（${wire.api}）`;
+			return `override ${wire.preference} (${wire.api})`;
 		case "plugin":
-			return `插件自定义 ${wire.api}（judge.api 偏好 ${wire.ineffectivePreference} 未生效）`;
+			return `plugin custom ${wire.api} (judge.api preference ${wire.ineffectivePreference} ignored)`;
 	}
+}
+
+/** 生效检测器名摘要（并列成一行，超宽由排版器折行）。 */
+function describeDetectors(options: KeepSecretCommandsOptions): string {
+	const detectors = options.loader.get().detectors;
+	return detectors.map((detector) => detector.name).join(", ");
 }
 
 /** /keep-secret 状态面板文本（数据源：loader/pipeline/compaction/judge）。 */
 function buildStatusReport(options: KeepSecretCommandsOptions): string {
 	const config = options.loader.get();
-	const lines: string[] = [
-		"pi-keep-secret 状态",
-		`检测器：${config.detectors.length} 个（模式：${config.detectorsMode}），来源：${describeConfigSource(options.loader)}`,
-		`  名称：${config.detectors.map((d) => d.name).join(", ")}`,
-		`伪值注册表：${options.pipeline.registry.size} 条`,
+	const sections: ReportSection[] = [
+		{
+			heading: "Config",
+			fields: [
+				{ label: "detectors", value: `${config.detectors.length} · mode ${config.detectorsMode}` },
+				{ label: "source", value: describeConfigSource(options.loader) },
+				{ label: "names", value: describeDetectors(options) },
+			],
+		},
 	];
-	for (const error of config.errors) {
-		lines.push(`配置错误：${error}（已回退内置默认集）`);
+	if (config.errors.length > 0) {
+		sections.push({ heading: "Config errors", bulletMarker: "✗", bullets: config.errors });
 	}
+
 	const cache = options.pipeline.cacheStats();
-	lines.push(
-		`clean cache：${cache.size} 条，命中率 ${hitRate(cache.hits, cache.hits + cache.misses)}（命中 ${cache.hits} / 检测 ${cache.misses}）`,
-	);
 	const hits = options.pipeline.detectorHitCounts();
-	lines.push(
-		hits.size === 0
-			? "检测器命中：（无）"
-			: `检测器命中：${[...hits.entries()].map(([name, count]) => `${name}=${count}`).join(", ")}`,
-	);
-	const judgeMode = config.judge?.onMissing ?? "fail_closed";
-	const wirePart =
-		options.judge?.wire === undefined ? "" : `；线缆：${describeJudgeWire(options.judge.wire)}`;
-	lines.push(
-		options.judge === undefined
-			? "judge：未接入（未配置 judge 段，仅 regex 检测层）"
-			: `judge：已判定 ${options.judge.status.judgedTexts} 叶，截断 ${options.judge.status.truncatedCandidates} 次，fail-closed ${options.judge.status.failClosed} 次，降级 ${options.judge.status.degradedTexts} 叶（模型缺失策略：${judgeMode}${wirePart}）`,
-	);
-	lines.push(
-		`掩码压缩取消：${options.compaction.cancellations} 次` +
-			(options.compaction.cancellations > 0 && options.compaction.lastCancellationError !== undefined
-				? `（最近原因：${options.compaction.lastCancellationError}）`
-				: ""),
-	);
-	return lines.join("\n");
+	sections.push({
+		heading: "Session",
+		fields: [
+			{ label: "placeholders", value: `${plural(options.pipeline.registry.size, "placeholder")} issued` },
+			{
+				label: "clean cache",
+				value:
+					`${plural(cache.size, "entry", "entries")} · ` +
+					`hit rate ${hitRate(cache.hits, cache.hits + cache.misses)} ` +
+					`(${plural(cache.hits, "hit")} / ${plural(cache.misses, "scan")})`,
+			},
+			{
+				label: "hits",
+				value:
+					hits.size === 0
+						? "(none)"
+						: [...hits.entries()].map(([name, count]) => `${name}=${count}`).join(", "),
+			},
+		],
+	});
+
+	const judgeFields: ReportField[] = [];
+	if (options.judge === undefined) {
+		judgeFields.push({ label: "layer", value: "regex only (no judge config)" });
+	} else {
+		const status = options.judge.status;
+		judgeFields.push({ label: "judged", value: plural(status.judgedTexts, "text") });
+		judgeFields.push({ label: "truncated", value: plural(status.truncatedCandidates, "candidate") });
+		judgeFields.push({ label: "fail-closed", value: plural(status.failClosed, "text") });
+		judgeFields.push({ label: "degraded", value: plural(status.degradedTexts, "text") });
+		judgeFields.push({ label: "on missing", value: config.judge?.onMissing ?? "fail_closed" });
+		if (options.judge.wire !== undefined) {
+			judgeFields.push({ label: "wire", value: describeJudgeWire(options.judge.wire) });
+		}
+	}
+	sections.push({ heading: "Judge", fields: judgeFields });
+
+	const compactionFields: ReportField[] = [
+		{ label: "cancelled", value: `${options.compaction.cancellations}` },
+	];
+	if (options.compaction.cancellations > 0 && options.compaction.lastCancellationError !== undefined) {
+		compactionFields.push({ label: "last error", value: options.compaction.lastCancellationError });
+	}
+	sections.push({ heading: "Compaction", fields: compactionFields });
+
+	return formatReport({ title: "pi-keep-secret · status", sections });
 }
 
 /** 自测合成样本（固定常量；假密码项的期望随 judge 是否启用动态化）。 */
@@ -129,30 +182,33 @@ interface SelfTestSample {
 	expectMasked: boolean;
 	/** judge 启用时的期望（覆盖 expectMasked：低熵密码归 judge 层）。 */
 	expectMaskedWithJudge?: boolean;
-	/** 期望说明。 */
+	/** 期望说明（表格行内注记；judge 未启用口径）。 */
 	note?: string;
+	/** judge 启用时的行内注记（覆盖 note）。 */
+	noteWithJudge?: string;
 }
 
 const SELF_TEST_SAMPLES: SelfTestSample[] = [
 	{
-		label: "sk- 假 key",
+		label: "sk- fake key",
 		text: "临时密钥：sk-live-abcdefghijklmnopqrstuvwxyz012345 请尽快轮换",
 		expectMasked: true,
 	},
 	{
-		label: "URL 藏 key",
+		label: "key in URL",
 		text: "下载：https://cdn.example.com/v1/file?token=sk-live-qrstuvwxyzabcde0123456789&dl=1",
 		expectMasked: true,
 	},
 	{
-		label: "假密码",
+		label: "fake password",
 		text: "密码不是 hunter2secret，是 Xk9$mQzT7vLw2Pn4",
 		expectMasked: false,
 		expectMaskedWithJudge: true,
-		note: "低熵密码 regex 层不命中，归 judge 层（配置 judge 段启用后本项期望掩码）",
+		note: "low-entropy password: invisible to the regex layer — covered by the judge layer once a judge section is configured",
+		noteWithJudge: "low-entropy password: invisible to the regex layer, covered by the judge layer",
 	},
 	{
-		label: "干净订单号",
+		label: "clean order number",
 		text: "订单号 ORD-20240612-000123 已发货",
 		expectMasked: false,
 	},
@@ -165,15 +221,15 @@ async function buildSelfTestReport(
 ): Promise<{ text: string; allPassed: boolean }> {
 	const judgeEnabled = options.judge !== undefined;
 	// 模型缺失 + fail_closed（默认）：未验证候选一律掩码——全部样本期望掩码
-	//（含干净订单号：候选被兑底掩码属预期，而非配置问题）
+	//（含干净订单号：候选被兜底掩码属预期，而非配置问题）
 	const failClosedNoModel =
 		options.judge !== undefined &&
 		options.judge.onMissing === "fail_closed" &&
 		options.judge.modelMissing;
-	const lines = ["pi-keep-secret 自测（合成样本，当前生效检测器集）"];
+	const rows: ReportTableRow[] = [];
 	let passed = 0;
 	for (const sample of SELF_TEST_SAMPLES) {
-		// 与出站链同序：judge 先判原文，regex 后兑底（伪值幂等跳过）；
+		// 与出站链同序：judge 先判原文，regex 后兜底（伪值幂等跳过）；
 		// judge 降级（regex_only）时 mask 原样返回，仅 regex 层结果——假密码项如实报未通过
 		let current = sample.text;
 		if (options.judge !== undefined) {
@@ -190,30 +246,67 @@ async function buildSelfTestReport(
 		if (ok) {
 			passed += 1;
 		}
-		lines.push(
-			`${sample.label}：${masked ? "已掩码" : "未掩码"}（期望：${expectMasked ? "掩码" : "未掩码"}${
-				sample.note === undefined ? "" : `——${sample.note}`
-			}）${ok ? "✓ 通过" : "✗ 未通过"}`,
-		);
+		rows.push({
+			cells: [
+				ok ? "✓" : "✗",
+				sample.label,
+				masked ? "masked" : "unmasked",
+				`expected ${expectMasked ? "masked" : "unmasked"}`,
+			],
+			note: judgeEnabled ? (sample.noteWithJudge ?? sample.note) : sample.note,
+		});
 	}
 	const allPassed = passed === SELF_TEST_SAMPLES.length;
-	lines.push(
-		`${passed}/${SELF_TEST_SAMPLES.length} 通过${allPassed ? "" : "（有未通过项——请检查当前检测器配置）"}`,
-	);
-	if (
-		judgeEnabled &&
-		options.judge !== undefined &&
-		options.judge.status.degradedTexts > 0 &&
-		!allPassed
-	) {
-		lines.push("注意：judge 已降级（classifier 模型不可用，仅 regex 检测层工作）——假密码项未通过即降级信号");
-	}
-	if (failClosedNoModel) {
-		lines.push(
-			"注意：judge classifier 模型缺失，fail_closed 已生效（未验证候选一律掩码）——样本全部掩码属预期兑底；请注册 classifier 模型，或显式配置 judge.onMissing=\"regex_only\"",
+	const notes: string[] = [];
+	if (judgeEnabled && options.judge !== undefined && options.judge.status.degradedTexts > 0 && !allPassed) {
+		notes.push(
+			"judge degraded (classifier model unavailable, regex layer only) — " +
+				"the failing fake-password sample is the degradation signal",
 		);
 	}
-	return { text: lines.join("\n"), allPassed };
+	if (failClosedNoModel) {
+		notes.push(
+			"classifier model missing: fail_closed is active (all unverified candidates masked), so every " +
+				"sample masking is the expected fallback — register the classifier model, or set " +
+				'judge.onMissing="regex_only" explicitly',
+		);
+	}
+	const summary = allPassed
+		? `✓ ${passed}/${SELF_TEST_SAMPLES.length} passed`
+		: `✗ ${passed}/${SELF_TEST_SAMPLES.length} passed — check the active detector configuration`;
+	return {
+		text: formatBlockReport({
+			title: `pi-keep-secret · self-test — ${SELF_TEST_SAMPLES.length} samples, current detector set`,
+			body: [
+				...formatTable({ rows }),
+				...(notes.length === 0 ? [] : ["", ...formatBullets({ bullets: notes })]),
+			],
+			footer: [summary],
+		}),
+		allPassed,
+	};
+}
+
+/** reload 结果面板（三种结局统一骨架：config / detectors + 可选取舍提示）。 */
+function buildReloadReport(spec: {
+	configValue: string;
+	detectorsValue?: string;
+	note?: string;
+}): string {
+	const sections: ReportSection[] = [
+		{
+			fields: [
+				{ label: "config", value: spec.configValue },
+				...(spec.detectorsValue === undefined
+					? []
+					: [{ label: "detectors", value: spec.detectorsValue }]),
+			],
+		},
+	];
+	if (spec.note !== undefined) {
+		sections.push({ bullets: [spec.note] });
+	}
+	return formatReport({ title: "pi-keep-secret · reload", sections });
 }
 
 /** 创建 T7 可见性扩展：input 预检通知 + /keep-secret 命令面。 */
@@ -223,7 +316,8 @@ export function createKeepSecretCommandsExtension(options: KeepSecretCommandsOpt
 			const suspects = precheckSuspects(event.text);
 			if (suspects.length > 0) {
 				ctx.ui.notify(
-					`pi-keep-secret：提交内容含疑似凭据（${suspects.join(", ")}），出站将自动掩码为占位符——请确认没有误粘贴真实密钥`,
+					`pi-keep-secret: this prompt looks like it contains a credential (${suspects.join(", ")}) — ` +
+						"outbound requests will carry a placeholder instead; double-check you did not paste a real secret",
 					"warning",
 				);
 			}
@@ -231,7 +325,7 @@ export function createKeepSecretCommandsExtension(options: KeepSecretCommandsOpt
 		});
 
 		pi.registerCommand("keep-secret", {
-			description: "掩码扩展状态 / 自测 / 配置热重载（status | test | reload）",
+			description: "Masking status, self-test, and config hot reload (status | test | reload)",
 			handler: async (args, ctx) => {
 				switch (args.trim()) {
 				case "": {
@@ -247,9 +341,23 @@ export function createKeepSecretCommandsExtension(options: KeepSecretCommandsOpt
 					const before = options.loader.get();
 					const beforeFingerprint = configFingerprint(before);
 					const after = options.loader.reload(); // 变更时同步触发热应用（applyDetectors + 清空缓存）
+					const activeDetectors = after.detectors.map((detector) => detector.name).join(", ");
 					if (after.errors.length > 0) {
 						ctx.ui.notify(
-							`pi-keep-secret reload：配置错误（已回退内置默认集）——\n${after.errors.join("\n")}`,
+							formatReport({
+								title: "pi-keep-secret · reload failed",
+								sections: [
+									{
+										fields: [
+											{
+												label: "config",
+												value: `invalid — fell back to built-in defaults (${after.path})`,
+											},
+										],
+									},
+									{ heading: "Errors", bulletMarker: "✗", bullets: after.errors },
+								],
+							}),
 							"error",
 						);
 					} else if (configFingerprint(after) !== beforeFingerprint) {
@@ -257,18 +365,29 @@ export function createKeepSecretCommandsExtension(options: KeepSecretCommandsOpt
 						// 集是否变化仅决定提示语（热应用 vs 仅新会话生效）
 						if (JSON.stringify(before.detectors) !== JSON.stringify(after.detectors)) {
 							ctx.ui.notify(
-								`pi-keep-secret reload：检测器集已热应用（${after.detectors.length} 个：${after.detectors.map((d) => d.name).join(", ")}；hashLength/cleanCache 变更仅新会话生效）`,
+								buildReloadReport({
+									configValue: "re-read",
+									detectorsValue: `hot-applied — ${after.detectors.length} active: ${activeDetectors}`,
+									note: "hashLength / cleanCache / judge changes take effect in new sessions",
+								}),
 								"info",
 							);
 						} else {
 							ctx.ui.notify(
-								"pi-keep-secret reload：配置已重读，检测器集无变更（judge/hashLength/cleanCache 变更仅新会话生效）",
+								buildReloadReport({
+									configValue: "re-read",
+									detectorsValue: `unchanged — ${after.detectors.length} active: ${activeDetectors}`,
+									note: "non-detector changes (judge / hashLength / cleanCache) take effect in new sessions",
+								}),
 								"info",
 							);
 						}
 					} else {
 						ctx.ui.notify(
-							"pi-keep-secret reload：配置无变更",
+							buildReloadReport({
+								configValue: "unchanged",
+								detectorsValue: `${after.detectors.length} active: ${activeDetectors}`,
+							}),
 							"info",
 						);
 					}
@@ -276,7 +395,27 @@ export function createKeepSecretCommandsExtension(options: KeepSecretCommandsOpt
 				}
 				default: {
 					ctx.ui.notify(
-						`未知子命令 ${JSON.stringify(args.trim())}。用法：/keep-secret（状态）| /keep-secret test（自测）| /keep-secret reload（配置热重载）`,
+						formatReport({
+							title: `pi-keep-secret · unknown subcommand ${JSON.stringify(args.trim())}`,
+							sections: [
+								{
+									fields: [
+										{
+											label: "/keep-secret",
+											value: "status: detector config, session counters, judge and compaction state",
+										},
+										{
+											label: "/keep-secret test",
+											value: "run synthetic samples through the live masking chain",
+										},
+										{
+											label: "/keep-secret reload",
+											value: "re-read the config file; detector changes hot-apply",
+										},
+									],
+								},
+							],
+						}),
 						"warning",
 					);
 				}
