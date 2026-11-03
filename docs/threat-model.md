@@ -116,6 +116,17 @@ Detection layers and their failure semantics:
   the same trust boundary as your main session model — e.g. a gateway you
   operate. If no such endpoint exists, run regex-only (omit the `judge`
   section) rather than sending text to a less-trusted party.
+- **A local judge turns that trust requirement into a structural
+  guarantee.** Deploying the classifier inside the local domain — llama.cpp
+  on the same machine (every chat model doubles as a `llama-cpp-classify`
+  classifier) or a LiteLLM gateway / protocol-compatible endpoint on the
+  LAN — keeps the candidate-bearing text of judge calls from ever crossing
+  the local boundary. The only traffic that still leaves is the main
+  conversation and its re-projections, which carry placeholders only. Real
+  values then exist solely in local processes (pi and the local judge) and
+  on local disk (session files). This does not shrink the scope above: a
+  compromised local machine or readable local disk stays out of scope —
+  the guarantee is about network topology, not endpoint security.
 - **The extension itself runs in-process with full session access.** It is
   code you install into pi; review it like any other extension. It makes
   no network calls of its own — only the session's existing model requests
