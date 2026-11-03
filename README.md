@@ -29,6 +29,28 @@ flowchart LR
 
 Detection runs in two layers: a fast, configurable regex detector set for known credential shapes (OpenAI keys, GitHub PATs, AWS access keys, Google API keys, Slack bot tokens, PEM private keys, JWTs), and an optional [System One judge](#judge-setup) — a classifier model that catches low-entropy secrets no regex can see. Judge failures fail closed: unverified candidates are masked, never released.
 
+## Recommended topology
+
+The deployment shape this extension is designed around: **run the decision model on infrastructure you control — your machine or your LAN — so secrets never leave the local domain.** Judge calls carry candidate strings, and those candidates are real secret fragments (judging needs the original text). With a local judge, that traffic stays inside the local domain; the only outbound flow left is the main conversation, which carries placeholders only. Real values then live in exactly two places: local processes (pi and the local judge) and local disk (session files). The [threat model](docs/threat-model.md#trust-boundaries)'s "judge provider must be trusted" trade-off becomes a structural guarantee.
+
+```mermaid
+flowchart LR
+    subgraph local["Local domain — this machine / your LAN: real values stay inside"]
+        You["You"] -->|"real secret"| T["Tools & session files<br/>(real values)"]
+        T --> M["pi + pi-keep-secret"]
+        M -->|"candidate-bearing text<br/>(real fragments)"| J["Local judge<br/>(llama.cpp / local gateway)"]
+        J -->|"verdicts"| M
+    end
+    M ==>|"the only egress:<br/>main conversation, placeholders only"| C["Cloud LLM"]
+```
+
+| Judge placement | Judge traffic (candidate-bearing text) | Main conversation traffic |
+|---|---|---|
+| Cloud | Leaves your machine — the judge provider must sit inside your main provider's trust boundary | Placeholders only |
+| **Local (recommended)** | Never leaves the local domain — a closed loop on your machine / LAN | Placeholders only — the only egress left |
+
+How to get there — the three local-judge channels (llama.cpp natively, a local LiteLLM gateway, or any LAN endpoint speaking System One / OpenAI Decisions) — is covered in [Local judge deployment](#local-judge-deployment).
+
 ## Quickstart
 
 **1. Install.** pi-keep-secret is published on npm and installs as a [pi package](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/packages.md):
@@ -136,6 +158,8 @@ The judge layer catches secrets that regexes cannot (a pasted password, a low-en
 - `"api": "typesafe-system-one"` — pi-ai's System One transport (POST `<baseUrl>/systemone`)
 - `"api": "openai-decisions"` — pi-ai's OpenAI Decisions transport (POST `<baseUrl>/decisions`)
 
+Any local llama.cpp model doubles as a classifier too (`llama-cpp-classify`) — see [Local judge deployment](#local-judge-deployment) below.
+
 A LiteLLM gateway serves both routes from the same backend; set the provider's `baseUrl` to `https://<host>/v1` (the transport appends the path). Example `models.json`:
 
 ```json
@@ -175,6 +199,41 @@ Full `judge` keys: `provider`, `modelId` (required, the classifier reference), `
 
 How it judges: a single gate question ("does a complete credential exist in this text?") short-circuits clean texts; on a gate hit, each extracted candidate gets its own boolean question in batches. Classify errors, missing answers, and candidates beyond the batch guardrail are all masked as unverified — a down judge never means an unmasked request.
 
+### Local judge deployment
+
+The [recommended topology](#recommended-topology): keep judge traffic — the candidate-bearing text — inside the local domain. Three channels:
+
+**llama.cpp (native pi support).** Start the router (`llama serve`; keep it on `127.0.0.1` or bind it to a LAN address), then `/login llama.cpp` in pi and load a chat model with `/llama` (see pi's [llama.cpp guide](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/llama-cpp.md)). pi's llama.cpp provider lists every chat model as a classifier as well, under the `llama-cpp-classify` API: the model never generates an answer — each question becomes one chat prompt, and the answer is read from the next-token probabilities of its `Yes`/`No` labels. (Native decision models such as Jev are listed too, via llama.cpp's System One endpoint.) No `models.json` entry is needed — reference the loaded model directly; `modelId` is the id shown by `/model`:
+
+```json
+{
+  "judge": {
+    "provider": "llama.cpp",
+    "modelId": "qwen3-4b",
+    "onMissing": "fail_closed"
+  }
+}
+```
+
+Threshold tuning applies to this channel: chat-model label probabilities are calibrated differently from trained decision models (raw label probabilities tend to be overconfident), so the `gateThreshold` (0.5) / `candidateThreshold` (0.7) defaults may need adjusting per model — `/keep-secret test` shows the effect. Leave `judge.api` unset here: it chooses between the System One and Decisions wires and has no llama.cpp meaning.
+
+**Local / LAN LiteLLM gateway.** The same registration as above, with the provider's `baseUrl` pointing at your own gateway instead of a cloud host:
+
+```json
+{
+  "providers": {
+    "litellm": {
+      "baseUrl": "http://localhost:4000/v1",
+      "apiKey": "$LITELLM_API_KEY"
+    }
+  }
+}
+```
+
+Both routes (`/v1/systemone`, `/v1/decisions`) come from the same backend and the `judge.api` wire preference applies unchanged — no config semantics differ from the cloud setup.
+
+**Any LAN endpoint speaking System One or OpenAI Decisions.** A self-hosted service implementing either protocol is a judge endpoint like any other: register a classifier model pointing at it (`"api": "typesafe-system-one"` or `"openai-decisions"`), then reference it from the `judge` section.
+
 ## How it behaves
 
 - **The model may notice.** A provider sees consistent placeholders where a secret was; models sometimes comment on the masking layer. That carries no leak — the provider never sees the real value.
@@ -196,7 +255,10 @@ Uninstalling is just removing the package: `pi remove npm:pi-keep-secret` (or de
 A clean-text cache short-circuits re-scanning: each round only newly added messages are actually scanned, so steady-state cost grows with the conversation delta, not its length. Texts that contained a secret are never cached-clean and are re-scanned every round (that is the safety property). The judge adds one gate question per text leaf, batched candidate questions only on gate hits, chunked at 24 000 chars with an 8-batch guardrail against pathological blocks.
 
 **Which models and providers are supported?**
-The masking itself is provider-agnostic — it runs inside the pi process before any request, so every provider pi supports is covered. The judge layer specifically needs a classifier model speaking System One or OpenAI Decisions (e.g. behind a LiteLLM gateway's `/v1/systemone` or `/v1/decisions`).
+The masking itself is provider-agnostic — it runs inside the pi process before any request, so every provider pi supports is covered. The judge layer specifically needs a classifier model speaking System One or OpenAI Decisions (e.g. behind a LiteLLM gateway's `/v1/systemone` or `/v1/decisions`) — or, locally, any chat model served by llama.cpp, which pi lists as a `llama-cpp-classify` classifier; see [Local judge deployment](#local-judge-deployment).
+
+**Does the judge see my secrets?**
+The judge's gate and candidate questions carry the candidate-bearing text — real secret fragments, because judging needs the original; that is the whole reason the judge endpoint belongs inside your trust boundary. Run it locally (llama.cpp on this machine, or a LAN gateway / endpoint) and those calls never leave the local domain — the [recommended topology](#recommended-topology). Either way the judge only returns verdicts: it stores nothing, and what is kept locally (transcript, tools, registry) is unchanged.
 
 **Where are my secrets stored?**
 Nowhere new. Real values live where they already lived (your files, your transcript); the placeholder mapping and caches are in-process, session-scoped, and vanish when the session ends. No telemetry, no external calls except the model requests you already make — plus judge questions if you configure the judge.

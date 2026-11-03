@@ -29,6 +29,28 @@ flowchart LR
 
 检测分两层：一层是快速、可配置的 regex 检测器集，覆盖已知凭据形态（OpenAI key、GitHub PAT、AWS 访问 key、Google API key、Slack bot token、PEM 私钥、JWT）；另一层是可选的 [System One judge](#judge-配置)——一个分类器模型，能抓到 regex 看不见的低熵密钥。judge 故障时 fail closed：未验证候选一律掩码，绝不放行。
 
+## 推荐拓扑
+
+本扩展围绕的典型部署形态：**决策模型运行在你掌控的基础设施上——本机或局域网——secret 因此不离开本地域。** judge 调用携带候选串，而候选串是真实的 secret 片段（判定需要原文）。judge 本地部署后，这类流量全程留在本地域内；剩下的唯一出站流量是主对话——且只含伪值。真值于是只存在于两处：本地进程（pi 与本地 judge）和本地磁盘（会话文件）。[威胁模型](docs/threat-model.md#trust-boundaries)中「judge 供应商需可信」的权衡，就此升级为结构性保证。
+
+```mermaid
+flowchart LR
+    subgraph local["本地域——本机 / 局域网：真值留在域内"]
+        You["你"] -->|"真值密钥"| T["工具与会话文件<br/>(真值)"]
+        T --> M["pi + pi-keep-secret"]
+        M -->|"含候选的文本<br/>(真实片段)"| J["本地 judge<br/>(llama.cpp / 本地网关)"]
+        J -->|"判定结果"| M
+    end
+    M ==>|"唯一出网流量:<br/>主对话，仅伪值"| C["云端 LLM"]
+```
+
+| judge 部署位置 | judge 流量（含候选文本） | 主对话流量 |
+|---|---|---|
+| 云端 | 离开你的机器——judge 供应商必须处于与主供应商同等的信任边界内 | 仅伪值 |
+| **本地（推荐）** | 全程不出本地域——本机 / 局域网内的闭环 | 仅伪值——仅存的出网流量 |
+
+如何落地——三条本地 judge 通道（原生 llama.cpp、本地 LiteLLM 网关、任意兼容 System One / OpenAI Decisions 的局域网端点）——见[本地 judge 部署](#本地-judge-部署)。
+
 ## 快速开始
 
 **1. 安装。** pi-keep-secret 已发布到 npm，以 [pi 包](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/packages.md)形态安装：
@@ -136,6 +158,8 @@ judge 层抓 regex 抓不到的密钥（粘贴的密码、低熵 token）。它�
 - `"api": "typesafe-system-one"`——pi-ai 的 System One 传输（POST `<baseUrl>/systemone`）
 - `"api": "openai-decisions"`——pi-ai 的 OpenAI Decisions 传输（POST `<baseUrl>/decisions`）
 
+本机或局域网的 llama.cpp 模型也可兼作分类器（`llama-cpp-classify`）——见下方[本地 judge 部署](#本地-judge-部署)。
+
 LiteLLM 网关的同一后端同时提供两条路由；provider 的 `baseUrl` 配 `https://<host>/v1`（传输层拼接路径）。`models.json` 示例：
 
 ```json
@@ -175,6 +199,41 @@ LiteLLM 网关的同一后端同时提供两条路由；provider 的 `baseUrl` �
 
 判定方式：先发单个 gate 问题（「该文本中是否存在完整凭据？」）短路干净文本；gate 命中后，抽取出的每个候选逐个获得布尔问题、按批发送。classify 出错、缺应答、超出批量护栏的候选都按未验证掩码——judge 不可用绝不意味着未掩码的请求。
 
+### 本地 judge 部署
+
+[推荐拓扑](#推荐拓扑)的落地：让 judge 流量——含候选的文本——留在本地域内。三条通道：
+
+**llama.cpp（pi 原生支持）。** 启动 router（`llama serve`；保持 `127.0.0.1` 或绑定局域网地址），在 pi 里 `/login llama.cpp`，再用 `/llama` 加载一个 chat 模型（见 pi 的 [llama.cpp 指南](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/llama-cpp.md)）。pi 的 llama.cpp provider 会把每个 chat 模型同时列为分类器，api 为 `llama-cpp-classify`：模型不生成答案——每个问题变成一个 chat prompt，答案从 `Yes`/`No` 标签的下一 token 概率中读出。（Jev 等原生 decision 模型也会被列出，走 llama.cpp 的 System One 端点。）无需 `models.json` 条目——直接引用已加载模型；`modelId` 即 `/model` 显示的 id：
+
+```json
+{
+  "judge": {
+    "provider": "llama.cpp",
+    "modelId": "qwen3-4b",
+    "onMissing": "fail_closed"
+  }
+}
+```
+
+该通道需注意阈值调校：chat 模型的标签概率校准方式与训练型决策模型不同（原始标签概率往往过度自信），`gateThreshold`（0.5）/ `candidateThreshold`（0.7）默认值可能需要按模型调整——`/keep-secret test` 可看效果。另外此处保持 `judge.api` 缺省：它只在 System One 与 Decisions 两条线缆间做选择，对 llama.cpp 无意义。
+
+**本地 / 局域网 LiteLLM 网关。** 与上文相同的注册方式，只是 provider 的 `baseUrl` 指向你自己的网关而非云端主机：
+
+```json
+{
+  "providers": {
+    "litellm": {
+      "baseUrl": "http://localhost:4000/v1",
+      "apiKey": "$LITELLM_API_KEY"
+    }
+  }
+}
+```
+
+两条路由（`/v1/systemone`、`/v1/decisions`）出自同一后端，`judge.api` 线缆偏好照常适用——配置语义与云端部署完全一致。
+
+**任意兼容 System One 或 OpenAI Decisions 的局域网端点。** 自建服务只要实现任一协议，就与其他 judge 端点无异：注册指向它的分类器模型（`"api": "typesafe-system-one"` 或 `"openai-decisions"`），再在 `judge` 段引用。
+
 ## 行为表现
 
 - **模型可能有所察觉。** 供应商在密钥位置看到的是一致的伪值；模型有时会评论掩码层的存在。这不构成泄漏——供应商永远看不到真值。
@@ -196,7 +255,10 @@ LiteLLM 网关的同一后端同时提供两条路由；provider 的 `baseUrl` �
 干净文本缓存短路重复扫描：每轮只真正扫描新增消息，稳态成本随对话增量而非总长度增长。含过密钥的文本永不缓存干净结论、每轮重扫（这正是安全属性）。judge 为每个文本叶增加一次 gate 问题，仅 gate 命中才批量发候选问题，24000 字符分块、8 批护栏防病态大块。
 
 **支持哪些模型和供应商？**
-掩码本身与供应商无关——它在 pi 进程内、任何请求发出之前运行，pi 支持的供应商全部覆盖。judge 层特定需要一个说 System One 或 OpenAI Decisions 协议的分类器模型（例如 LiteLLM 网关的 `/v1/systemone` 或 `/v1/decisions` 背后）。
+掩码本身与供应商无关——它在 pi 进程内、任何请求发出之前运行，pi 支持的供应商全部覆盖。judge 层特定需要一个说 System One 或 OpenAI Decisions 协议的分类器模型（例如 LiteLLM 网关的 `/v1/systemone` 或 `/v1/decisions` 背后）——本地跑 llama.cpp 时，任何已加载 chat 模型都兼作 `llama-cpp-classify` 分类器，见[本地 judge 部署](#本地-judge-部署)。
+
+**judge 会看到我的密钥吗？**
+judge 的 gate 与候选问题携带的是含候选的文本——真实的 secret 片段，因为判定需要原文；这正是 judge 端点必须处于你信任边界之内的全部原因。把它跑在本地（本机 llama.cpp，或局域网网关/端点），这些调用就全程不出本地域——即[推荐拓扑](#推荐拓扑)。无论哪种部署，judge 都只返回判定结论：它不存储任何东西，本地保存的内容（会话记录、工具、注册表）不受影响。
 
 **我的密钥存在哪里？**
 不存在新的存储。真值待在它们本来待的地方（你的文件、你的会话记录）；伪值映射与缓存是进程内的、会话级的，会话结束即消失。无遥测、无既有模型请求之外的外部调用——配置了 judge 才有 judge 问题。
