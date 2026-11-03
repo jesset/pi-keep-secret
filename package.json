@@ -2,7 +2,7 @@
 	"name": "pi-keep-secret",
 	"version": "0.1.0",
 	"type": "module",
-	"description": "Transparent egress secret masking for pi sessions (extension)",
+	"description": "Transparent egress secret masking for pi coding-agent sessions",
 	"author": "Jesset (https://github.com/jesset)",
 	"main": "extension/index.ts",
 	"files": [
@@ -19,6 +19,7 @@
 		"pi-extension",
 		"extension",
 		"pi-coding-agent",
+		"coding-agent",
 		"security",
 		"secrets",
 		"masking",
@@ -26,6 +27,7 @@
 		"egress",
 		"guardrail",
 		"privacy",
+		"llm",
 		"ai-agent"
 	],
 	"repository": {
