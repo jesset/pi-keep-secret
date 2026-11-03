@@ -6,9 +6,21 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-03
+
+### Added
+
+- 报告排版层 `src/ui/`（`formatReport` / `formatTable` / `formatBullets` / `formatBlockReport`）：East Asian Width 感知的可见宽度计算、72 列预算内预折行（超宽路径优先在 `/` 处断行）、键值列全局对齐、悬挂缩进、分组键值块与表格；输出纯文本 + 结构字符，不注入 ANSI（主题色由 pi 施加：`info` 走 dim，`warning` / `error` 仅首行加前缀）。配 19 例单元测试覆盖宽度、折行、对齐、悬挂缩进与输出卫生。
+- UI 语言守卫测试：静态扫描 `ctx.ui.notify` / `ctx.ui.setStatus` / `pi.registerCommand` 调用点内的字符串字面量禁止 CJK；行为面遍历状态/自测/reload/未知子命令，以及无 judge、judge 降级、模型缺失、非法配置、入站预检等分支的输出。
+
 ### Changed
 
-- 用户可见 UI 文案统一英文（源码注释与 `docs/` 保持中文）：`/keep-secret` 的命令描述、状态/自测/reload/未知子命令输出、入站预检通知，以及配置错误、judge 模型缺失/故障/线缆偏好、掩码压缩取消的 notify 与状态栏文案。新增 `src/ui/report.ts` 排版层（宽度感知预折行 + 悬挂缩进 + 分组键值表/表格，纯文本无 ANSI），状态面板改为「标题 + 分隔线 + 分组键值块」，自测改为逐样本表格 + 结论收尾，reload 统一 `config` / `detectors` 骨架。长值（检测器名单、配置路径、校验错误）在 72 列预算内折行，续行对齐值列，兼容 `Warning: ` / `Error: ` 首行前缀。新增 UI 语言守卫测试（静态扫描 notify/setStatus/命令注册的字符串字面量 + 行为面遍历各分支输出，禁止 CJK 回流）。
+- 用户可见 UI 文案统一英文（源码注释与 `docs/` 保持中文）：`/keep-secret` 命令描述、状态/自测/reload/未知子命令输出、入站预检通知，以及配置错误、judge 模型缺失/故障/线缆偏好未生效、掩码压缩取消的 notify 与状态栏文案。
+- 命令输出改由排版层统一合成：状态面板为「标题 + 分隔线 + 分组键值块（Config / Config errors / Session / Judge / Compaction）」，自测为逐样本表格 + 结论收尾，reload 统一 `config` / `detectors` 骨架（hot-applied / unchanged / reload failed + Errors 块）；长值折行后续行对齐值列，兼容 `Warning: ` / `Error: ` 首行前缀。
+
+### Documentation
+
+- README / README.zh-CN 的 Commands 章节补充样例输出与「英文 + 纯文本 + 72 列预算 + 无交互弹窗」不变量说明。
 
 ## [0.1.1] - 2026-11-03
 
