@@ -6,6 +6,22 @@
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-03
+
+No functional changes since 0.1.0 — documentation and npm metadata only.
+
+### Documentation
+
+- Open-source doc face: product-shaped README with full zh-CN mirror, threat model (`docs/threat-model.md`), `SECURITY.md`, `CONTRIBUTING.md`, and migration of the development history to `docs/dev-notes.md`; public docs are provenance-neutral.
+- "Recommended topology" section: deploy the judge model locally (localhost/LAN) so secret material never leaves the local domain — three verified channels (native llama.cpp classifier via `llama-cpp-classify`, local LiteLLM gateway, any LAN System One/decisions endpoint), with a boundary diagram and judge-placement comparison table.
+- Tagline sharpened: "Model providers see only placeholders. Your tools and transcript keep the real values."
+
+### Maintenance
+
+- `package.json` npm metadata (description, keywords) — effective from this release.
+
+## [0.1.0] - 2026-11-02
+
 首个可用版本：pi 会话的透明出站密钥掩码扩展。出站请求里的凭据替换为格式保持的确定性伪值，回程响应还原真值，本地 transcript 与工具执行不受影响。规格见 GitHub issue jesset/pi-keep-secret#1。
 
 ### Added
