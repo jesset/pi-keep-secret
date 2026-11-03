@@ -6,6 +6,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- 用户可见 UI 文案统一英文（源码注释与 `docs/` 保持中文）：`/keep-secret` 的命令描述、状态/自测/reload/未知子命令输出、入站预检通知，以及配置错误、judge 模型缺失/故障/线缆偏好、掩码压缩取消的 notify 与状态栏文案。新增 `src/ui/report.ts` 排版层（宽度感知预折行 + 悬挂缩进 + 分组键值表/表格，纯文本无 ANSI），状态面板改为「标题 + 分隔线 + 分组键值块」，自测改为逐样本表格 + 结论收尾，reload 统一 `config` / `detectors` 骨架。长值（检测器名单、配置路径、校验错误）在 72 列预算内折行，续行对齐值列，兼容 `Warning: ` / `Error: ` 首行前缀。新增 UI 语言守卫测试（静态扫描 notify/setStatus/命令注册的字符串字面量 + 行为面遍历各分支输出，禁止 CJK 回流）。
+
 ## [0.1.1] - 2026-11-03
 
 No functional changes since 0.1.0 — documentation and npm metadata only.

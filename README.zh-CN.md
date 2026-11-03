@@ -247,6 +247,41 @@ LiteLLM 网关的同一后端同时提供两条路由；provider 的 `baseUrl` �
 - `/keep-secret test`——[快速开始](#快速开始)所述的自测。
 - `/keep-secret reload`——重读配置文件；检测器变更热应用。
 
+命令与扩展的**输出一律英文、纯文本**：单行标题 + 分隔线 + 分组键值块，长值（检测器名单、配置路径）在 72 列预算内预折行并悬挂缩进——窄终端以及 `Warning: ` / `Error: ` 前缀下版面都不错位。不使用任何交互弹窗：输出走 `ctx.ui.notify`，同一段文本同时进入 TUI 与 RPC 客户端，print/JSON 模式静默（不影响命令动作本身）。
+
+```
+pi-keep-secret · status
+────────────────────────────────────────────────────────────────────────
+Config
+  detectors     7 · mode replace
+  source        built-in defaults (no config file at ~/.pi/agent/…/config.json)
+  names         openai-key, github-pat, aws-access-key-id, google-api-key,
+                slack-bot-token, pem-private-key, jwt
+Session
+  placeholders  1 placeholder issued
+  clean cache   34 entries · hit rate 71% (85 hits / 119 scans)
+  hits          openai-key=2
+Judge
+  layer         regex only (no judge config)
+Compaction
+  cancelled     0
+```
+
+```
+pi-keep-secret · self-test — 4 samples, current detector set
+────────────────────────────────────────────────────────────────────────
+  ✓  sk- fake key        masked    expected masked
+  ✓  key in URL          masked    expected masked
+  ✓  fake password       unmasked  expected unmasked
+     low-entropy password: invisible to the regex layer — covered by the
+     judge layer once a judge section is configured
+  ✓  clean order number  unmasked  expected unmasked
+────────────────────────────────────────────────────────────────────────
+  ✓ 4/4 passed
+```
+
+`/keep-secret reload` 用同一形状报告 `config` / `detectors`：`hot-applied`、`unchanged`，或文件非法时的 `reload failed` + `Errors` 块（每条校验错误一行）。
+
 卸载即移除包：`pi remove npm:pi-keep-secret`（拷贝安装则删除 `~/.pi/agent/extensions/pi-keep-secret/`）。没有其他落盘状态——注册表与缓存均为进程内、随会话消亡。
 
 ## 常见问题

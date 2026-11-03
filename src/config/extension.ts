@@ -113,7 +113,7 @@ export function createConfiguredMaskingExtension(
 				if (!reported.has(error)) {
 					reported.add(error);
 					ctx.ui.notify(
-						`pi-keep-secret: 配置错误，已回退内置默认检测器集 — ${error}`,
+						`pi-keep-secret: config error — fell back to the built-in detector set: ${error}`,
 						"error",
 					);
 				}

@@ -104,6 +104,11 @@ async function runKeepSecretCommand(
 	return notifications.map((n) => n.message).join("\n");
 }
 
+/** 折叠空白（报告按 72 列预算预先折行；断多词短语前先归一）。 */
+function flat(text: string): string {
+	return text.replace(/\s+/g, " ");
+}
+
 describe("T8 正式组合接线（judge 接入 extension/index.ts）", () => {
 	test("配置 judge 段 + 可用 classifier：密码类 secret 掩码为 key-{hash}，regex 层共存，命令面点亮", async () => {
 		const fake = passwordJudge();
@@ -127,10 +132,13 @@ describe("T8 正式组合接线（judge 接入 extension/index.ts）", () => {
 
 			// 命令面点亮：状态行展示 judge 计数；自测假密码期望掩码且 4/4 通过
 			const status = await runKeepSecretCommand(ext, "");
-			expect(status).toMatch(/judge：已判定 \d+ 叶，截断 0 次，fail-closed 0 次，降级 0 叶/);
+			expect(status).toMatch(/judged\s+\d+ texts/);
+			expect(status).toMatch(/truncated\s+0 candidates/);
+			expect(status).toMatch(/fail-closed\s+0 texts/);
+			expect(status).toMatch(/degraded\s+0 texts/);
 			const selfTest = await runKeepSecretCommand(ext, "test");
-			expect(selfTest).toMatch(/假密码：已掩码（期望：掩码.*✓ 通过/);
-			expect(selfTest).toMatch(/4\/4 通过/);
+			expect(selfTest).toMatch(/✓\s+fake password\s+masked\s+expected masked/);
+			expect(selfTest).toMatch(/✓ 4\/4 passed/);
 		} finally {
 			h.dispose();
 		}
@@ -173,10 +181,10 @@ describe("T8 正式组合接线（judge 接入 extension/index.ts）", () => {
 		// 命令面（同一装配经工厂形态提取）：未接入行 + 自测期望未掩码
 		const ext = createKeepSecretExtension({ configPath });
 		const status = await runKeepSecretCommand(ext, "");
-		expect(status).toContain("judge：未接入（未配置 judge 段，仅 regex 检测层）");
+		expect(status).toContain("regex only (no judge config)");
 		const selfTest = await runKeepSecretCommand(ext, "test");
-		expect(selfTest).toMatch(/假密码：未掩码（期望：未掩码/);
-		expect(selfTest).toMatch(/4\/4 通过/);
+		expect(selfTest).toMatch(/✓\s+fake password\s+unmasked\s+expected unmasked/);
+		expect(selfTest).toMatch(/✓ 4\/4 passed/);
 	});
 
 	test("配置 judge 但模型不可用（默认 fail_closed）：未验证候选一律掩码，命令面 fail-closed 计数与策略可见", async () => {
@@ -203,12 +211,14 @@ describe("T8 正式组合接线（judge 接入 extension/index.ts）", () => {
 			await h2.session.prompt(`部署密码 ${PASSWORD}，密钥 ${OPENAI_KEY}`);
 			await h2.session.prompt("继续");
 			const status = await runKeepSecretCommand(ext, "");
-			expect(status).toMatch(
-				/judge：已判定 0 叶，截断 0 次，fail-closed [1-9]\d* 次，降级 0 叶（模型缺失策略：fail_closed）/,
-			);
+			expect(status).toMatch(/judged\s+0 texts/);
+			expect(status).toMatch(/truncated\s+0 candidates/);
+			expect(status).toMatch(/fail-closed\s+[1-9]\d* texts/);
+			expect(status).toMatch(/degraded\s+0 texts/);
+			expect(status).toMatch(/on missing\s+fail_closed/);
 			const selfTest = await runKeepSecretCommand(ext, "test");
-			expect(selfTest).toMatch(/假密码：已掩码（期望：掩码/);
-			expect(selfTest).toMatch(/4\/4 通过/);
+			expect(selfTest).toMatch(/✓\s+fake password\s+masked\s+expected masked/);
+			expect(selfTest).toMatch(/✓ 4\/4 passed/);
 		} finally {
 			h2.dispose();
 		}
@@ -241,13 +251,15 @@ describe("T8 正式组合接线（judge 接入 extension/index.ts）", () => {
 			await h2.session.prompt(`部署密码 ${PASSWORD}，密钥 ${OPENAI_KEY}`);
 			await h2.session.prompt("继续");
 			const status = await runKeepSecretCommand(ext, "");
-			expect(status).toMatch(
-				/judge：已判定 0 叶，截断 0 次，fail-closed 0 次，降级 \d+ 叶（模型缺失策略：regex_only）/,
-			);
+			expect(status).toMatch(/judged\s+0 texts/);
+			expect(status).toMatch(/truncated\s+0 candidates/);
+			expect(status).toMatch(/fail-closed\s+0 texts/);
+			expect(status).toMatch(/degraded\s+\d+ texts/);
+			expect(status).toMatch(/on missing\s+regex_only/);
 			const selfTest = await runKeepSecretCommand(ext, "test");
-			expect(selfTest).toMatch(/假密码：未掩码（期望：掩码/);
-			expect(selfTest).toMatch(/3\/4 通过/);
-			expect(selfTest).toContain("judge 已降级");
+			expect(selfTest).toMatch(/✗\s+fake password\s+unmasked\s+expected masked/);
+			expect(selfTest).toMatch(/✗ 3\/4 passed/);
+			expect(selfTest).toContain("judge degraded");
 		} finally {
 			h2.dispose();
 		}
@@ -311,7 +323,7 @@ describe("T8 端到端收敛用例（正式组合入口）", () => {
 			expect(second).not.toContain(ORDER);
 			// 命令面故障可见
 			const status = await runKeepSecretCommand(ext, "");
-			expect(status).toMatch(/fail-closed [1-9]\d* 次/);
+			expect(status).toMatch(/fail-closed\s+[1-9]\d* texts/);
 		} finally {
 			h.dispose();
 		}
@@ -443,8 +455,11 @@ describe("T16 judge.api 线缆偏好（正式组合入口）", () => {
 			expect(out).not.toContain(OPENAI_KEY);
 			expect(seenApis.length).toBeGreaterThan(0);
 			const status = await runKeepSecretCommand(ext, "");
-			expect(status).toMatch(/judge：已判定 \d+ 叶，截断 0 次，fail-closed 0 次，降级 0 叶/);
-			expect(status).toContain("线缆：覆盖 systemone（typesafe-system-one）");
+			expect(status).toMatch(/judged\s+\d+ texts/);
+			expect(status).toMatch(/truncated\s+0 candidates/);
+			expect(status).toMatch(/fail-closed\s+0 texts/);
+			expect(status).toMatch(/degraded\s+0 texts/);
+			expect(status).toContain("override systemone (typesafe-system-one)");
 		} finally {
 			h.dispose();
 		}
@@ -474,8 +489,9 @@ describe("T16 judge.api 线缆偏好（正式组合入口）", () => {
 			expect(seenApis.length).toBeGreaterThan(0);
 			expect(new Set(seenApis)).toEqual(new Set(["openai-decisions"])); // classify 收到的 model.api 为覆盖值
 			const status = await runKeepSecretCommand(ext, "");
-			expect(status).toMatch(/fail-closed 0 次，降级 0 叶/);
-			expect(status).toContain("线缆：覆盖 decisions（openai-decisions）");
+			expect(status).toMatch(/fail-closed\s+0 texts/);
+			expect(status).toMatch(/degraded\s+0 texts/);
+			expect(status).toContain("override decisions (openai-decisions)");
 		} finally {
 			h.dispose();
 		}
@@ -507,10 +523,13 @@ describe("T16 judge.api 线缆偏好（正式组合入口）", () => {
 			expect(new Set(seenApis)).toEqual(new Set(["litellm-decisions"])); // 插件实现不被改写
 			// 命令面：无降级计数，插件线缆与偏好未生效标记可见
 			const status = await runKeepSecretCommand(ext, "");
-			expect(status).toMatch(/judge：已判定 \d+ 叶，截断 0 次，fail-closed 0 次，降级 0 叶/);
-			expect(status).toContain("线缆：插件自定义 litellm-decisions（judge.api 偏好 systemone 未生效）");
+			expect(status).toMatch(/judged\s+\d+ texts/);
+			expect(status).toMatch(/truncated\s+0 candidates/);
+			expect(status).toMatch(/fail-closed\s+0 texts/);
+			expect(status).toMatch(/degraded\s+0 texts/);
+			expect(flat(status)).toContain("plugin custom litellm-decisions (judge.api preference systemone ignored)");
 			const selfTest = await runKeepSecretCommand(ext, "test");
-			expect(selfTest).toMatch(/4\/4 通过/); // judge 正常工作：假密码项掩码通过
+			expect(selfTest).toMatch(/✓ 4\/4 passed/); // judge 正常工作：假密码项掩码通过
 		} finally {
 			h.dispose();
 		}

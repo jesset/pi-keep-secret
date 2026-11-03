@@ -97,7 +97,7 @@ describe("T7 input 预检通知（默认 regex 集快扫，非阻塞）", () => 
 
 		expect(notifications).toHaveLength(1);
 		expect(notifications[0].type).toBe("warning");
-		expect(notifications[0].message).toContain("疑似凭据");
+		expect(notifications[0].message).toContain("looks like it contains a credential");
 		expect(notifications[0].message).toContain("openai-key");
 		expect(result).toBeUndefined(); // 纯通知：不返回 transform/handled
 	});
@@ -135,6 +135,11 @@ async function runCommand(commands: (pi: ExtensionAPI) => void, args: string): P
 	const { ctx, notifications } = recordingContext();
 	await commandHandler!(args, ctx);
 	return notifications.map((n) => n.message).join("\n");
+}
+
+/** 折叠空白（报告按 72 列预算预先折行；断言多词短语前先归一）。 */
+function flat(text: string): string {
+	return text.replace(/\s+/g, " ");
 }
 
 /** 空状态计数（每用例独立实例）。 */
@@ -180,32 +185,34 @@ describe("T7 /keep-secret 状态面板", () => {
 
 			// 检测器配置摘要：来源（默认集）、条数（内置默认集 7 个）、名列表
 			expect(status1).toContain("pi-keep-secret");
-			expect(status1).toContain("来源：内置默认集");
-			expect(status1).toMatch(/检测器：7 个/);
+			expect(status1).toContain("built-in defaults (no config file at");
+			expect(status1).toMatch(/detectors\s+7 · mode replace/);
 			expect(status1).toContain("openai-key");
 			// 注册表条目数：1 个不同 secret → 1 条
-			expect(status1).toMatch(/伪值注册表：1 条/);
-			// clean cache：条目数与命中率（含「命中 x / 检测 y」明细）
-			expect(status1).toMatch(/clean cache：\d+ 条，命中率 \d+%（命中 \d+ \/ 检测 \d+）/);
+			expect(status1).toMatch(/placeholders\s+1 placeholder issued/);
+			// clean cache：条目数与命中率（含「hits / scans」明细）
+			expect(status1).toMatch(
+				/clean cache\s+\d+ entries · hit rate \d+% \(\d+ hits? \/ \d+ scans?\)/,
+			);
 			// 各检测器命中计数：openai-key 第一轮 1 次
 			expect(status1).toMatch(/openai-key=1/);
-			// judge 预留位（T5 未合入）
-			expect(status1).toContain("judge：未接入");
+			// judge 预留位（未配置 judge 段）
+			expect(status1).toContain("regex only (no judge config)");
 			// 压缩取消计数
-			expect(status1).toMatch(/掩码压缩取消：0 次/);
+			expect(status1).toMatch(/cancelled\s+0/);
 
 			// 第二轮：新 secret 入会话 → 计数器递增
 			await h.session.prompt(`rotate to ${OTHER_KEY}`);
 			const status2 = await runCommand(commands, "");
 			// openai-key：第一轮 1 + 第二轮重扫历史 secret 消息 1 + 新 secret 1 = 3
 			expect(status2).toMatch(/openai-key=3/);
-			expect(status2).toMatch(/伪值注册表：2 条/);
+			expect(status2).toMatch(/2 placeholders issued/);
 			// clean cache 检测计数递增（第一轮已判定的干净文本被命中短路）
-			const scans1 = Number(status1.match(/检测 (\d+)/)?.[1]);
-			const scans2 = Number(status2.match(/检测 (\d+)/)?.[1]);
+			const scans1 = Number(status1.match(/(\d+) scans?/)?.[1]);
+			const scans2 = Number(status2.match(/(\d+) scans?/)?.[1]);
 			expect(scans2).toBeGreaterThan(scans1);
-			const hits1 = Number(status1.match(/命中 (\d+)/)?.[1]);
-			const hits2 = Number(status2.match(/命中 (\d+)/)?.[1]);
+			const hits1 = Number(status1.match(/(\d+) hits?/)?.[1]);
+			const hits2 = Number(status2.match(/(\d+) hits?/)?.[1]);
 			expect(hits2).toBeGreaterThan(hits1);
 		} finally {
 			h.dispose();
@@ -224,7 +231,7 @@ describe("T7 /keep-secret 状态面板", () => {
 			).commands,
 			"",
 		);
-		expect(replaceText).toMatch(/检测器：1 个（模式：replace）/);
+		expect(replaceText).toMatch(/detectors\s+1 · mode replace/);
 
 		// merge：内置 7（同名 openai-key 被覆盖仍在原位）+ 新增 corp，共 8 个
 		const mergeText = await runCommand(
@@ -239,14 +246,14 @@ describe("T7 /keep-secret 状态面板", () => {
 			).commands,
 			"",
 		);
-		expect(mergeText).toMatch(/检测器：8 个（模式：merge）/);
+		expect(mergeText).toMatch(/detectors\s+8 · mode merge/);
 		expect(mergeText).toContain("corp-api-key");
 	});
 
 	test("注入状态对象：压缩取消与 judge 计数展示（已判定/截断/fail-closed/降级）", async () => {
 		const made = makeCommands();
 		made.compaction.cancellations = 2;
-		made.compaction.lastCancellationError = "掩码压缩摘要: 摘要为空";
+		made.compaction.lastCancellationError = "masked compaction summary: empty summary";
 		const judgeStatus = {
 			...emptyJudgeStatus(),
 			judgedTexts: 7,
@@ -260,9 +267,12 @@ describe("T7 /keep-secret 状态面板", () => {
 			judge: identityJudge(judgeStatus),
 		});
 		const text = await runCommand(withJudge, "");
-		expect(text).toMatch(/掩码压缩取消：2 次/);
-		expect(text).toContain("掩码压缩摘要: 摘要为空");
-		expect(text).toMatch(/judge：已判定 7 叶，截断 3 次，fail-closed 1 次，降级 0 叶/);
+		expect(text).toMatch(/cancelled\s+2/);
+		expect(text).toContain("masked compaction summary: empty summary");
+		expect(text).toMatch(/judged\s+7 texts/);
+		expect(text).toMatch(/truncated\s+3 candidates/);
+		expect(text).toMatch(/fail-closed\s+1 text/);
+		expect(text).toMatch(/degraded\s+0 texts/);
 	});
 
 	test("T16 状态面线缆展示：跟随注册 / 偏好覆盖 / 插件自定义（偏好未生效）；解析前不展示线缆段", async () => {
@@ -277,22 +287,22 @@ describe("T7 /keep-secret 状态面板", () => {
 			return await runCommand(commands, "");
 		};
 		// 模型未解析前（wire undefined）：不展示线缆段
-		expect(await statusLine(undefined)).not.toContain("线缆：");
+		expect(await statusLine(undefined)).not.toContain("wire");
 		// 分支 1：缺省偏好——跟随模型注册条目
 		expect(await statusLine({ source: "registered", api: "typesafe-system-one" })).toContain(
-			"线缆：跟随注册（typesafe-system-one）",
+			"follows registration (typesafe-system-one)",
 		);
 		// 分支 2：已知 classifier api + 偏好——覆盖分发线缆
 		expect(
 			await statusLine({ source: "override", preference: "systemone", api: "typesafe-system-one" }),
-		).toContain("线缆：覆盖 systemone（typesafe-system-one）");
+		).toContain("override systemone (typesafe-system-one)");
 		expect(
 			await statusLine({ source: "override", preference: "decisions", api: "openai-decisions" }),
-		).toContain("线缆：覆盖 decisions（openai-decisions）");
+		).toContain("override decisions (openai-decisions)");
 		// 分支 3：插件自定义 api——尊重插件实现 + 偏好未生效标记
 		expect(
-			await statusLine({ source: "plugin", api: "litellm-decisions", ineffectivePreference: "systemone" }),
-		).toContain("线缆：插件自定义 litellm-decisions（judge.api 偏好 systemone 未生效）");
+			flat(await statusLine({ source: "plugin", api: "litellm-decisions", ineffectivePreference: "systemone" })),
+		).toContain("plugin custom litellm-decisions (judge.api preference systemone ignored)");
 	});
 
 	test("非法配置：状态面报配置错误与回退标记（无 UI 模式的错误可见出口）", async () => {
@@ -300,8 +310,8 @@ describe("T7 /keep-secret 状态面板", () => {
 			JSON.stringify({ detectors: [{ name: "bad", pattern: "corp-[{" }] }),
 		);
 		const text = await runCommand(commands, "");
-		expect(text).toContain("配置错误");
-		expect(text).toMatch(/已回退内置默认集/);
+		expect(text).toContain("Config errors");
+		expect(flat(text)).toMatch(/fell back to built-in defaults/);
 	});
 });
 
@@ -315,12 +325,13 @@ describe("T7 /keep-secret test 合成样本自测", () => {
 
 		expect(notifications).toHaveLength(1);
 		expect(notifications[0].type).toBe("info");
-		expect(text).toContain("pi-keep-secret 自测");
-		expect(text).toMatch(/sk- 假 key：已掩码（期望：掩码）✓ 通过/);
-		expect(text).toMatch(/URL 藏 key：已掩码（期望：掩码）✓ 通过/);
-		expect(text).toMatch(/干净订单号：未掩码（期望：未掩码）✓ 通过/);
-		expect(text).toMatch(/假密码：未掩码（期望：未掩码——低熵密码 regex 层不命中/);
-		expect(text).toMatch(/4\/4 通过/);
+		expect(text).toContain("pi-keep-secret · self-test");
+		expect(text).toMatch(/✓\s+sk- fake key\s+masked\s+expected masked/);
+		expect(text).toMatch(/✓\s+key in URL\s+masked\s+expected masked/);
+		expect(text).toMatch(/✓\s+clean order number\s+unmasked\s+expected unmasked/);
+		expect(text).toMatch(/✓\s+fake password\s+unmasked\s+expected unmasked/);
+		expect(flat(text)).toContain("covered by the judge layer once a judge section is configured");
+		expect(text).toMatch(/✓ 4\/4 passed/);
 
 		// 自测实际驱动会话管线：两个样本 key 名自册表新增 2 条伪值
 		expect(made.pipeline.registry.size).toBe(2);
@@ -336,8 +347,8 @@ describe("T7 /keep-secret test 合成样本自测", () => {
 				judge: passwordJudgingJudge(),
 			});
 			const text = await runCommand(commands, "test");
-			expect(text).toMatch(/假密码：已掩码（期望：掩码/);
-			expect(text).toMatch(/4\/4 通过/);
+			expect(text).toMatch(/✓\s+fake password\s+masked\s+expected masked/);
+			expect(text).toMatch(/✓ 4\/4 passed/);
 			expect(text).not.toMatch(/✗/);
 		});
 
@@ -362,9 +373,9 @@ describe("T7 /keep-secret test 合成样本自测", () => {
 				judge: failClosedJudge,
 			});
 			const text = await runCommand(commands, "test");
-			expect(text).toMatch(/干净订单号：已掩码（期望：掩码）✓ 通过/); // 兑底掩码属预期
-			expect(text).toMatch(/4\/4 通过/);
-			expect(text).toContain("fail_closed 已生效");
+			expect(text).toMatch(/✓\s+clean order number\s+masked\s+expected masked/); // 兑底掩码属预期
+			expect(text).toMatch(/✓ 4\/4 passed/);
+			expect(text).toContain("fail_closed is active");
 			expect(text).toContain("judge.onMissing=\"regex_only\"");
 		});
 
@@ -382,9 +393,9 @@ describe("T7 /keep-secret test 合成样本自测", () => {
 			await commandHandler!("test", ctx);
 			expect(notifications[0].type).toBe("warning");
 			const text = notifications[0].message;
-			expect(text).toMatch(/假密码：未掩码（期望：掩码/);
-			expect(text).toMatch(/3\/4 通过/);
-			expect(text).toContain("judge 已降级");
+			expect(text).toMatch(/✗\s+fake password\s+unmasked\s+expected masked/);
+			expect(text).toMatch(/✗ 3\/4 passed/);
+			expect(text).toContain("judge degraded");
 		});
 	});
 
@@ -400,9 +411,9 @@ describe("T7 /keep-secret test 合成样本自测", () => {
 		const text = notifications.map((n) => n.message).join("\n");
 
 		expect(notifications[0].type).toBe("warning");
-		expect(text).toMatch(/sk- 假 key：未掩码（期望：掩码）✗ 未通过/);
-		expect(text).toMatch(/URL 藏 key：未掩码（期望：掩码）✗ 未通过/);
-		expect(text).toMatch(/2\/4 通过/);
+		expect(text).toMatch(/✗\s+sk- fake key\s+unmasked\s+expected masked/);
+		expect(text).toMatch(/✗\s+key in URL\s+unmasked\s+expected masked/);
+		expect(text).toMatch(/✗ 2\/4 passed/);
 	});
 });
 
@@ -430,7 +441,7 @@ describe("T7 /keep-secret reload 配置热重载", () => {
 			// 重写配置为 v2（补 beta 检测器），经命令面 reload
 			writeFileSync(made.configPath, ALPHA_BETA_CONFIG, "utf8");
 			const text = await runCommand(made.commands, "reload");
-			expect(text).toContain("已热应用");
+			expect(text).toContain("hot-applied");
 			expect(text).toContain("beta-key");
 
 			// 新 pattern 立即生效：历史 beta 消息重掩码出站
@@ -446,7 +457,7 @@ describe("T7 /keep-secret reload 配置热重载", () => {
 	test("配置无变更 reload → notify 报告无变更（不动检测器集）", async () => {
 		const made = makeCommands(ALPHA_CONFIG);
 		const text = await runCommand(made.commands, "reload");
-		expect(text).toContain("无变更");
+		expect(text).toContain("unchanged");
 		expect(made.loader.get().detectors).toHaveLength(1);
 	});
 
@@ -462,9 +473,9 @@ describe("T7 /keep-secret reload 配置热重载", () => {
 			"utf8",
 		);
 		const text = await runCommand(made.commands, "reload");
-		expect(text).toContain("检测器集无变更");
-		expect(text).toContain("仅新会话生效");
-		expect(text).not.toContain("已热应用"); // 检测器集未变：不触发热应用
+		expect(text).toMatch(/detectors\s+unchanged/);
+		expect(flat(text)).toContain("take effect in new sessions");
+		expect(text).not.toContain("hot-applied"); // 检测器集未变：不触发热应用
 		expect(made.loader.get().judge?.modelId).toBe("typesafe/jev-latest");
 	});
 
@@ -472,8 +483,8 @@ describe("T7 /keep-secret reload 配置热重载", () => {
 		const made = makeCommands(ALPHA_CONFIG);
 		writeFileSync(made.configPath, JSON.stringify({ detectors: [{ name: "bad", pattern: "((" }] }), "utf8");
 		const text = await runCommand(made.commands, "reload");
-		expect(text).toContain("配置错误");
-		expect(text).toMatch(/已回退内置默认集/);
+		expect(text).toContain("reload failed");
+		expect(flat(text)).toMatch(/fell back to built-in defaults/);
 		expect(made.loader.get().detectors.map((d) => d.name)).toContain("openai-key");
 	});
 });
@@ -512,7 +523,7 @@ describe("T7 组合入口与三模式安全降级", () => {
 	test("未知子命令 → 用法提示（不抛错）", async () => {
 		const made = makeCommands();
 		const text = await runCommand(made.commands, "bogus");
-		expect(text).toContain("未知子命令");
+		expect(text).toContain("unknown subcommand");
 		expect(text).toContain("/keep-secret test");
 	});
 
@@ -524,5 +535,121 @@ describe("T7 组合入口与三模式安全降级", () => {
 			await commandHandler!(args, ctx);
 		}
 		expect(notifications).toHaveLength(3); // 动作均执行（真实 print 模式 notify 为 no-op，不抛错）
+	});
+});
+
+/**
+ * UI 语言守卫：用户可见字符串一律英文（源码注释与 docs 保持中文）。
+ *
+ * 两面夹住回归：
+ * - 静态面：所有 `ctx.ui.notify(` / `ctx.ui.setStatus(` / `pi.registerCommand(`
+ *   调用点内的字符串字面量不得含 CJK（注释、样例载荷不在字面量内，不误伤）；
+ * - 行为面：状态/自测/reload/未知子命令/预检通知的实际输出不得含 CJK
+ *   （含 judge 启用、降级、模型缺失、非法配置等分支）。
+ */
+const CJK_PATTERN = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/;
+
+/** 用户可见 UI 串所在源文件（组合根 + 三处 notify/setStatus 调用点）。 */
+const UI_SOURCES = [
+	join(import.meta.dir, "..", "src", "commands", "extension.ts"),
+	join(import.meta.dir, "..", "src", "config", "extension.ts"),
+	join(import.meta.dir, "..", "src", "judge", "extension.ts"),
+	join(import.meta.dir, "..", "src", "compaction", "extension.ts"),
+	join(import.meta.dir, "..", "extension", "index.ts"),
+];
+
+/** 提取 `callee(` 的平衡括号参数块（覆盖模板字面量中的括号）。 */
+function callArgumentBlocks(source: string, callee: string): string[] {
+	const blocks: string[] = [];
+	let from = 0;
+	for (;;) {
+		const start = source.indexOf(`${callee}(`, from);
+		if (start < 0) break;
+		let depth = 0;
+		let end = start + callee.length;
+		for (; end < source.length; end++) {
+			const char = source[end];
+			if (char === "(") depth += 1;
+			else if (char === ")") {
+				depth -= 1;
+				if (depth === 0) break;
+			}
+		}
+		blocks.push(source.slice(start + callee.length + 1, end));
+		from = end + 1;
+	}
+	return blocks;
+}
+
+/** 参数块内的字符串字面量（中英混排、模板插值均可）。 */
+function stringLiterals(text: string): string[] {
+	return text.match(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`/g) ?? [];
+}
+
+describe("T7 UI 语言守卫（用户可见字符串一律英文）", () => {
+	test("notify / setStatus / 命令注册的字符串字面量不含 CJK", async () => {
+		const offenders: string[] = [];
+		for (const path of UI_SOURCES) {
+			const source = await Bun.file(path).text();
+			for (const callee of ["ctx.ui.notify", "ctx.ui.setStatus", "pi.registerCommand"]) {
+				for (const block of callArgumentBlocks(source, callee)) {
+					for (const literal of stringLiterals(block)) {
+						if (CJK_PATTERN.test(literal)) {
+							offenders.push(`${path} → ${callee}: ${literal}`);
+						}
+					}
+				}
+			}
+		}
+		expect(offenders).toEqual([]);
+	});
+
+	test("命令面输出不含 CJK（状态/自测/reload/未知子命令/预检各分支）", async () => {
+		const passwordJudge: JudgeTextMasker = {
+			status: emptyJudgeStatus(),
+			onMissing: "fail_closed",
+			modelMissing: false,
+			wire: { source: "registered", api: "typesafe-system-one" },
+			mask: async (text) => text,
+		};
+		const variants = [
+			{ judge: undefined },
+			{
+				judge: {
+					...passwordJudge,
+					status: { ...emptyJudgeStatus(), judgedTexts: 7, failClosed: 1, degradedTexts: 2 },
+				},
+			},
+			{ judge: { ...passwordJudge, modelMissing: true } },
+		];
+		const outputs: string[] = [];
+		for (const variant of variants) {
+			const made = makeCommands();
+			const commands = createKeepSecretCommandsExtension({
+				loader: made.loader,
+				pipeline: made.pipeline,
+				compaction: made.compaction,
+				judge: variant.judge,
+			});
+			const { commandHandler } = registerExtension(commands);
+			const { ctx, notifications } = recordingContext();
+			for (const args of ["", "test", "reload", "bogus"]) {
+				await commandHandler!(args, ctx);
+			}
+			outputs.push(...notifications.map((notification) => notification.message));
+		}
+		// 非法配置分支（状态面错误列表）
+		const bad = makeCommands(JSON.stringify({ detectors: [{ name: "bad", pattern: "corp-[{" }] }));
+		outputs.push(await runCommand(bad.commands, ""));
+		// 预检通知
+		const { inputHandler } = registerExtension(makeCommands().commands);
+		const precheck = recordingContext();
+		await inputHandler!({ type: "input", text: `deploy with ${OPENAI_KEY}` }, precheck.ctx);
+		outputs.push(...precheck.notifications.map((notification) => notification.message));
+
+		expect(outputs.length).toBeGreaterThan(5);
+		for (const output of outputs) {
+			expect(output).not.toMatch(CJK_PATTERN);
+		}
 	});
 });
