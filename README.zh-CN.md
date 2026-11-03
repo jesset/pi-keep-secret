@@ -4,7 +4,7 @@
 [![npm](https://img.shields.io/npm/v/pi-keep-secret)](https://www.npmjs.com/package/pi-keep-secret)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**供应商看到伪值。你的工具与会话记录保留真值。**
+**模型供应商只看到伪值。你的工具与会话记录保留真值。**
 
 pi-keep-secret 是 [pi](https://github.com/earendil-works/pi) 编码代理会话的开源扩展，对**一切出站模型请求**中的密钥做掩码——确定性、可逆、对本地工作流完全透明。
 

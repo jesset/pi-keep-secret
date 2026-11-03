@@ -4,7 +4,7 @@
 [![npm](https://img.shields.io/npm/v/pi-keep-secret)](https://www.npmjs.com/package/pi-keep-secret)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Providers see placeholders. Your tools and transcript keep the real values.**
+**Model providers see only placeholders. Your tools and transcript keep the real values.**
 
 pi-keep-secret is an open-source extension for [pi](https://github.com/earendil-works/pi) coding-agent sessions that masks secrets in **every outbound model request** — deterministically, reversibly, and transparently to your local workflow.
 
