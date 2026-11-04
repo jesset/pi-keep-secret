@@ -39,6 +39,21 @@
   no-op）；reload 通知文案改由分类驱动，列出实际变更的仅新会话生效段名；
   订阅回调签名追加第二参数 `outcome`。
 
+- **消息遍历收敛为单一叶枚举（架构评审候选 3）**：`collectTextLeaves`
+  成为消息角色与豁免规则的唯一载体（可写文本叶枚举为 `{ get, set }` 单
+  元）；`maskMessageTree` / `maskMessageTreeAsync` 退为执行器——同步执行
+  器零 await/微任务（regex 热路径保持），异步执行器按消息并发、消息内
+  串行（语义逐字保持）。新增消息角色只改一处；原「同步/异步孪生是有意
+  保留的重复」的压制理由（per-leaf Promise 包装）不再适用。新增
+  `src/masking/walk.test.ts` parity 矩阵：全角色夹具双执行器访问叶多重集
+  一致、掩码结果深度相等、豁免字段（image data/details/toolsAdded 等）
+  两边原样、并发形状（跨消息并发 + 消息内串行）锚定。`ingress/restore.ts`
+  的还原遍历未纳入（豁免语义不同，独立评估）。
+- **测试替身收编（架构评审候选 4 收尾）**：`registerExtension`（记录
+  input 处理器与 /keep-secret 命令 handler）、`recordingContext`、
+  `emptyJudgeStatus` 统一收进 `test/helpers.ts` 单份；commands 直测与
+  e2e 共用同一替身，删除各自本地副本。
+
 ## [0.2.0] - 2026-11-03
 
 ### Added

@@ -87,20 +87,31 @@ export function emptyJudgeStatus(): JudgeStatus {
 	};
 }
 
-/** stub pi：从扩展工厂提取注册的 /keep-secret 命令 handler（与 pi 同一调用面；
- *  其余注册面为 no-op——本 stub 只观察命令注册）。 */
-export function registerCommandHandler(factory: (pi: ExtensionAPI) => void) {
-	let commandHandler: ((args: string, ctx: ExtensionCommandContext) => Promise<void> | void) | undefined;
+/** stub pi：从扩展工厂提取注册的 input 处理器与 /keep-secret 命令 handler
+ *  （与 pi 同一调用面；其余注册面为 no-op）。commands 直测与 e2e 共用
+ *  同一替身（架构评审候选 4：替身一份，防测试口径漂移）。 */
+export function registerExtension(factory: (pi: ExtensionAPI) => void) {
+	const registered: {
+		inputHandler?: (
+			event: { type: "input"; text: string },
+			ctx: ExtensionCommandContext,
+		) => unknown;
+		commandHandler?: (args: string, ctx: ExtensionCommandContext) => Promise<void> | void;
+	} = {};
 	const pi = {
-		on: () => {},
+		on: (event: string, handler: unknown) => {
+			if (event === "input") {
+				registered.inputHandler = handler as NonNullable<typeof registered.inputHandler>;
+			}
+		},
 		registerCommand: (name: string, options: { handler: unknown }) => {
 			if (name === "keep-secret") {
-				commandHandler = options.handler as NonNullable<typeof commandHandler>;
+				registered.commandHandler = options.handler as NonNullable<typeof registered.commandHandler>;
 			}
 		},
 	} as unknown as ExtensionAPI;
 	factory(pi);
-	return { get commandHandler() { return commandHandler; } };
+	return registered;
 }
 
 /** 记录 notify 调用的 ctx（命令 handler 直测观察点）。 */

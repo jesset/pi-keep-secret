@@ -1,10 +1,19 @@
 /**
- * 消息树遍历器：对请求本地副本（pi 已 structuredClone）的文本叶做掩码，
- * 研究笔记 §2 规则（规格 #1 Implementation Decisions「Message walk」）。
- * 按消息种类逐步覆盖（user → toolResult → assistant → system →
- * bashExecution/custom 自定义消息）。
+ * 消息树遍历器（架构评审候选 3 收敛后的形态）：角色与豁免知识的唯一
+ * 载体是 `collectTextLeaves`——把一条消息的可写文本叶枚举为
+ * `{ get, set }` 单元（TextLeaf）；`maskMessageTree`（同步执行器）与
+ * `maskMessageTreeAsync`（异步执行器）只决定执行策略，不再各自理解
+ * 消息结构。新增消息角色只改 collectTextLeaves 一处；两个执行器的
+ * parity（访问叶集合与豁免语义逐角色一致）由 src/masking/walk.test.ts
+ * 以同一份全角色夹具锚定。
  *
- * 豁免（结构字段，永不改写）：ImageContent.data、*Signature、id/name/
+ * 历史注记：本文件曾逐角色维护同步/异步两份 switch（「有意保留的重复」，
+ * 压制理由是 `string | Promise<string>` 式合并会破坏同步路径零开销）。
+ * TextLeaf 枚举不经过该权衡：同步执行器完全无 await/微任务（regex 出站
+ * 热路径），仅有的代价是每叶两个闭包——相对每叶的检测成本（哈希 +
+ * 正则）可忽略。
+ *
+ * 豁免（结构字段，永不枚举）：ImageContent.data、*Signature、id/name/
  * role/type/mimeType 类键、toolsAdded/toolsRemoved（工具 schema）、
  * nestedCalls（不发模型）、argumentsError、toolResult.details（工具私有）、
  * custom 消息的 details（不进模型上下文）。
@@ -20,198 +29,161 @@ export type TextMasker = (text: string) => string;
 /** 异步单文本叶掩码函数（judge 等 LLM 判定检测器）。 */
 export type AsyncTextMasker = (text: string) => Promise<string>;
 
-/** SystemMessage 的 prose：content（string/text 块）与 sections 字符串值；toolsAdded/toolsRemoved 豁免。 */
-function maskSystemProse(message: SystemMessage, maskText: TextMasker): void {
-	if (typeof message.content === "string") {
-		message.content = maskText(message.content);
-	} else {
-		maskTextParts(message.content, maskText);
-	}
-	if (message.sections !== undefined) {
-		for (const key of Object.keys(message.sections)) {
-			const section = message.sections[key];
-			if (typeof section === "string") {
-				message.sections[key] = maskText(section);
-			}
-		}
-	}
+/** 可写文本叶：读原文、写掩码结果（结构知识的原子单元）。 */
+export interface TextLeaf {
+	get(): string;
+	set(value: string): void;
 }
 
-/** 内容数组的 text 块（ImageContent 等非文本叶不动）。 */
-function maskTextParts(parts: (TextContent | ImageContent)[], maskText: TextMasker): void {
-	for (const part of parts) {
-		if (part.type === "text") {
-			part.text = maskText(part.text);
-		}
-	}
+/** 叶单元构造（get/set 闭包捕获所属容器对象）。 */
+function leaf(get: () => string, set: (value: string) => void): TextLeaf {
+	return { get, set };
 }
 
-/** 深遍历 JSON 值的字符串叶并原位回写（toolCall.arguments 用；数组/嵌套对象全下钻）。 */
-function maskJsonStrings(value: unknown, maskText: TextMasker): void {
-	if (Array.isArray(value)) {
-		for (let i = 0; i < value.length; i++) {
-			const item = value[i];
-			if (typeof item === "string") {
-				value[i] = maskText(item);
-			} else {
-				maskJsonStrings(item, maskText);
-			}
-		}
-		return;
+/** 对象上字符串槽位的叶（非字符串值不枚举——豁免规则的实现点之一）。 */
+function stringSlotLeaves(holder: object, key: string | number, current: unknown): TextLeaf[] {
+	if (typeof current === "string") {
+		const record = holder as Record<string | number, string>;
+		return [leaf(() => record[key], (value) => { record[key] = value; })];
 	}
-	if (value && typeof value === "object") {
-		for (const key of Object.keys(value)) {
-			const item = (value as Record<string, unknown>)[key];
-			if (typeof item === "string") {
-				(value as Record<string, unknown>)[key] = maskText(item);
-			} else {
-				maskJsonStrings(item, maskText);
-			}
-		}
+	if (current !== null && typeof current === "object") {
+		return jsonStringLeaves(current);
 	}
+	return [];
 }
 
 /**
- * 对消息树的文本叶原位掩码。覆盖：UserMessage（string/text 块）、
- * ToolResultMessage 的 text 块（ImageContent.data 豁免）、AssistantMessage
- * 的 text/thinking 块与 toolCall.arguments 深遍历字符串值、SystemMessage
- * 的 prose 与 sections 字符串值（toolsAdded/toolsRemoved 豁免）、pi
- * 压缩/分支摘要消息的 summary 字段（掩码压缩后携带还原真值进上下文，
- * 出站必须重掩码；T6 引入）、bashExecution 的 command/output 与 custom
- * 消息的 content——两者经 pi convertToLlm 投影为 user 文本进 LLM 上下文
+ * 深遍历 JSON 值的字符串叶（toolCall.arguments 用；数组/嵌套对象全下钻）。
+ */
+function jsonStringLeaves(value: unknown): TextLeaf[] {
+	const leaves: TextLeaf[] = [];
+	if (Array.isArray(value)) {
+		for (let i = 0; i < value.length; i++) {
+			leaves.push(...stringSlotLeaves(value, i, value[i]));
+		}
+		return leaves;
+	}
+	if (value && typeof value === "object") {
+		for (const key of Object.keys(value)) {
+			leaves.push(...stringSlotLeaves(value, key, (value as Record<string, unknown>)[key]));
+		}
+	}
+	return leaves;
+}
+
+/** 内容数组的 text 块（ImageContent.data 等非文本叶不枚举）。 */
+function textPartLeaves(parts: (TextContent | ImageContent)[]): TextLeaf[] {
+	const leaves: TextLeaf[] = [];
+	for (const part of parts) {
+		if (part.type === "text") {
+			leaves.push(leaf(() => part.text, (value) => { part.text = value; }));
+		}
+	}
+	return leaves;
+}
+
+/** string 或 text 块数组的 content 叶（user/custom 消息共用形态）。 */
+function stringOrPartsLeaves(message: { content: string | (TextContent | ImageContent)[] }): TextLeaf[] {
+	if (typeof message.content === "string") {
+		return [leaf(() => message.content as string, (value) => { message.content = value; })];
+	}
+	return textPartLeaves(message.content);
+}
+
+/** SystemMessage 的 prose：content（string/text 块）与 sections 字符串值；toolsAdded/toolsRemoved 豁免。 */
+function systemProseLeaves(message: SystemMessage): TextLeaf[] {
+	const leaves = stringOrPartsLeaves(message);
+	const sections = message.sections;
+	if (sections !== undefined) {
+		for (const key of Object.keys(sections)) {
+			if (typeof sections[key] === "string") {
+				leaves.push(...stringSlotLeaves(sections, key, sections[key]));
+			}
+		}
+	}
+	return leaves;
+}
+
+/**
+ * 枚举一条消息的全部可写文本叶（角色/豁免知识的唯一载体）。
+ * 覆盖：UserMessage（string/text 块）、ToolResultMessage 的 text 块
+ * （ImageContent.data 豁免）、AssistantMessage 的 text/thinking 块与
+ * toolCall.arguments 深遍历字符串值、SystemMessage 的 prose 与 sections
+ * 字符串值（toolsAdded/toolsRemoved 豁免）、pi 压缩/分支摘要消息的
+ * summary 字段（掩码压缩后携带还原真值进上下文，出站必须重掩码；T6
+ * 引入）、bashExecution 的 command/output 与 custom 消息的 content——
+ * 两者经 pi convertToLlm 投影为 user 文本进 LLM 上下文
  * （bashExecutionToText / content 直投影；!! 前缀的 excludeFromContext
  * 消息不投影，掩码对其无副作用）。
  */
+export function collectTextLeaves(message: AgentMessage): TextLeaf[] {
+	switch (message.role) {
+		case "user": {
+			return stringOrPartsLeaves(message);
+		}
+		case "system": {
+			return systemProseLeaves(message);
+		}
+		case "toolResult": {
+			return textPartLeaves(message.content);
+		}
+		case "assistant": {
+			const leaves: TextLeaf[] = [];
+			for (const block of message.content) {
+				if (block.type === "text") {
+					leaves.push(leaf(() => block.text, (value) => { block.text = value; }));
+				} else if (block.type === "thinking") {
+					leaves.push(leaf(() => block.thinking, (value) => { block.thinking = value; }));
+				} else if (block.type === "toolCall") {
+					leaves.push(...jsonStringLeaves(block.arguments));
+				}
+			}
+			return leaves;
+		}
+		case "bashExecution": {
+			// pi 经 bashExecutionToText 把 command+output 投影为 user 文本进
+			// LLM 上下文（!! 前缀的 excludeFromContext 消息不投影，掩码无副作用）
+			return [
+				leaf(() => message.command, (value) => { message.command = value; }),
+				leaf(() => message.output, (value) => { message.output = value; }),
+			];
+		}
+		case "custom": {
+			// CustomMessage.content（string 或 text 块）投影为 user 消息（details
+			// 不进模型上下文，不枚举）
+			return stringOrPartsLeaves(message);
+		}
+		case "compactionSummary":
+		case "branchSummary": {
+			// 结构式访问：pi 经 CustomAgentMessages 注入的压缩/分支摘要消息，
+			// summary 是进 LLM 上下文的 prose（convertToLlm 展开为 user 文本）
+			const holder = message as { summary?: unknown };
+			return typeof holder.summary === "string"
+				? [leaf(() => holder.summary as string, (value) => { holder.summary = value; })]
+				: [];
+		}
+		default:
+			return [];
+	}
+}
+
+/**
+ * 对消息树的文本叶原位掩码（同步执行器）：逐消息、消息内按枚举序执行，
+ * 零 await/微任务（regex 出站与掩码压缩的热路径）。
+ */
 export function maskMessageTree(messages: AgentMessage[], maskText: TextMasker): void {
 	for (const message of messages) {
-		switch (message.role) {
-			case "user": {
-				if (typeof message.content === "string") {
-					message.content = maskText(message.content);
-				} else {
-					maskTextParts(message.content, maskText);
-				}
-				break;
-			}
-			case "system": {
-				maskSystemProse(message, maskText);
-				break;
-			}
-			case "toolResult": {
-				maskTextParts(message.content, maskText);
-				break;
-			}
-			case "assistant": {
-				for (const block of message.content) {
-					if (block.type === "text") {
-						block.text = maskText(block.text);
-					} else if (block.type === "thinking") {
-						block.thinking = maskText(block.thinking);
-					} else if (block.type === "toolCall") {
-						maskJsonStrings(block.arguments, maskText);
-					}
-				}
-				break;
-			}
-			case "bashExecution": {
-				// pi 经 bashExecutionToText 把 command+output 投影为 user 文本进
-				// LLM 上下文（!! 前缀的 excludeFromContext 消息不投影，掩码无副作用）
-				message.command = maskText(message.command);
-				message.output = maskText(message.output);
-				break;
-			}
-			case "custom": {
-				// CustomMessage.content（string 或 text 块）投影为 user 消息（details
-				// 不进模型上下文，不动）
-				if (typeof message.content === "string") {
-					message.content = maskText(message.content);
-				} else {
-					maskTextParts(message.content, maskText);
-				}
-				break;
-			}
-			case "compactionSummary":
-			case "branchSummary": {
-				// 结构式访问：pi 经 CustomAgentMessages 注入的压缩/分支摘要消息，
-				// summary 是进 LLM 上下文的 prose（convertToLlm 展开为 user 文本）
-				const summary = (message as { summary?: unknown }).summary;
-				if (typeof summary === "string") {
-					(message as { summary: string }).summary = maskText(summary);
-				}
-				break;
-			}
-			default:
-				break;
-		}
-	}
-}
-
-async function maskSystemProseAsync(
-	message: SystemMessage,
-	maskText: AsyncTextMasker,
-): Promise<void> {
-	if (typeof message.content === "string") {
-		message.content = await maskText(message.content);
-	} else {
-		await maskTextPartsAsync(message.content, maskText);
-	}
-	if (message.sections !== undefined) {
-		for (const key of Object.keys(message.sections)) {
-			const section = message.sections[key];
-			if (typeof section === "string") {
-				message.sections[key] = await maskText(section);
-			}
-		}
-	}
-}
-
-async function maskTextPartsAsync(
-	parts: (TextContent | ImageContent)[],
-	maskText: AsyncTextMasker,
-): Promise<void> {
-	for (const part of parts) {
-		if (part.type === "text") {
-			part.text = await maskText(part.text);
-		}
-	}
-}
-
-async function maskJsonStringsAsync(value: unknown, maskText: AsyncTextMasker): Promise<void> {
-	if (Array.isArray(value)) {
-		for (let i = 0; i < value.length; i++) {
-			const item = value[i];
-			if (typeof item === "string") {
-				value[i] = await maskText(item);
-			} else {
-				await maskJsonStringsAsync(item, maskText);
-			}
-		}
-		return;
-	}
-	if (value && typeof value === "object") {
-		for (const key of Object.keys(value)) {
-			const item = (value as Record<string, unknown>)[key];
-			if (typeof item === "string") {
-				(value as Record<string, unknown>)[key] = await maskText(item);
-			} else {
-				await maskJsonStringsAsync(item, maskText);
-			}
+		for (const textLeaf of collectTextLeaves(message)) {
+			textLeaf.set(maskText(textLeaf.get()));
 		}
 	}
 }
 
 /**
- * maskMessageTree 的异步孪生：judge（LLM 判定检测器，ticket #7）等异步
- * 掩码路径的出站遍历。覆盖范围与同步版逐角色一致（含 T6 摘要消息的
- * summary 字段与 bashExecution/custom 自定义消息）；同步遍历保持 T2/T6
- * 路径零开销，不因异步检测器行变。
- * 按消息并发（消息级并发，对齐参考实现：LLM 调用另有会话级信号量限流）。
- *
- * 同步/异步孪生是有意保留的重复（去重压制理由）：若合并为接受
- * `string | Promise<string>` 的单一通用遍历器，同步路径（regex 出站与
- * 掩码压缩——每请求热路径）的每个文本叶都要跨 await/promise 包装，
- * 破坏「同步路径零开销」的既有理由；因此逐角色镜像两份，新增角色必须
- * 两份同步修改（用例分别锚定同步链与 judge 异步链）。
+ * maskMessageTree 的异步执行器（judge 等 LLM 判定检测器的出站遍历）：
+ * 按消息并发（消息级并发，对齐参考实现：LLM 调用另有会话级信号量限流）、
+ * 消息内叶按枚举序串行。覆盖范围与同步执行器由同一 collectTextLeaves
+ * 保证逐角色一致（src/masking/walk.test.ts 锚定 parity）。
  */
 export async function maskMessageTreeAsync(
 	messages: AgentMessage[],
@@ -219,59 +191,8 @@ export async function maskMessageTreeAsync(
 ): Promise<void> {
 	await Promise.all(
 		messages.map(async (message) => {
-			switch (message.role) {
-				case "user": {
-					if (typeof message.content === "string") {
-						message.content = await maskText(message.content);
-					} else {
-						await maskTextPartsAsync(message.content, maskText);
-					}
-					break;
-				}
-				case "system": {
-					await maskSystemProseAsync(message, maskText);
-					break;
-				}
-				case "toolResult": {
-					await maskTextPartsAsync(message.content, maskText);
-					break;
-				}
-				case "assistant": {
-					for (const block of message.content) {
-						if (block.type === "text") {
-							block.text = await maskText(block.text);
-						} else if (block.type === "thinking") {
-							block.thinking = await maskText(block.thinking);
-						} else if (block.type === "toolCall") {
-							await maskJsonStringsAsync(block.arguments, maskText);
-						}
-					}
-					break;
-				}
-				case "bashExecution": {
-					// 与同步版同覆盖：command/output 投影为 user 文本进 LLM 上下文
-					message.command = await maskText(message.command);
-					message.output = await maskText(message.output);
-					break;
-				}
-				case "custom": {
-					if (typeof message.content === "string") {
-						message.content = await maskText(message.content);
-					} else {
-						await maskTextPartsAsync(message.content, maskText);
-					}
-					break;
-				}
-				case "compactionSummary":
-				case "branchSummary": {
-					const holder = message as { summary?: unknown };
-					if (typeof holder.summary === "string") {
-						holder.summary = await maskText(holder.summary);
-					}
-					break;
-				}
-				default:
-					break;
+			for (const textLeaf of collectTextLeaves(message)) {
+				textLeaf.set(await maskText(textLeaf.get()));
 			}
 		}),
 	);

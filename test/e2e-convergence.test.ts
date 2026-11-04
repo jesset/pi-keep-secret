@@ -29,7 +29,7 @@ import {
 	emptyJudgeStatus,
 	fakeClassifierModel,
 	recordingContext,
-	registerCommandHandler,
+	registerExtension,
 	scriptClassify,
 } from "./helpers.ts";
 
@@ -97,7 +97,7 @@ async function runKeepSecretCommand(
 	factory: ReturnType<typeof createKeepSecretExtension>,
 	args: string,
 ): Promise<string> {
-	const { commandHandler } = registerCommandHandler(factory);
+	const { commandHandler } = registerExtension(factory);
 	expect(commandHandler).toBeDefined();
 	const { ctx, notifications } = recordingContext();
 	await commandHandler!(args, ctx);
