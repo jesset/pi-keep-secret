@@ -4,29 +4,23 @@
  * 模型缺失降级（仅 regex 层 + 状态计数不静默）与 fail_closed 全链路。
  *
  * 假 classifier 方案（研究笔记 §4）：适配器逻辑已在 src/judge/system-one.test.ts
- * 以注入 ClassifyFn 的纯替身覆盖；本文件在扩展工厂的两个注入点
- * （resolveModel/classify）挂进程内替身驱动完整钩子链，概率脚本锚定
- * 真实网关实测校准数字（§1：中文句中密码 0.96 掩码 / 订单号 0.04 丢弃 /
- * gate 0.98）。真实网关验证见 research/systemone-gateway.test.ts（默认
- * 跳过，环境变量启用）。judge 扩展必须先于 regex 出站扩展注册（判定
- * 需要原文；regex 层幂等过滤已签发伪值）。
+ * 以注入 ClassifyFn 的纯替身覆盖；本文件在管线的两个注入点（resolveModel/
+ * classify）挂进程内替身驱动完整钩子链，概率脚本锚定真实网关实测校准数字
+ * （§1：中文句中密码 0.96 掩码 / 订单号 0.04 丢弃 / gate 0.98）。真实网关
+ * 验证见 research/systemone-gateway.test.ts（默认跳过，环境变量启用）。
+ * ADR-0001：出站为单扩展单次遍历，消费管线统一入口（judge→regex 组合内聚
+ * 管线）；测试装配只建一个 judged 管线 + 单出站扩展。
  */
 import { describe, expect, test } from "bun:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type {
-	ClassifierApi,
-	ClassifierContext,
-	ClassifierModel,
-	ClassifierResult,
-} from "@earendil-works/pi-ai";
 import { createHarnessSession, requestText } from "../src/harness/fake-session.ts";
+import { createJudgeTextMasker, type ClassifierModelRef } from "../src/judge/index.ts";
 import {
-	createJudgeEgressExtension,
-	createJudgeTextMasker,
-	type ClassifierModelRef,
-	type JudgeStatus,
-} from "../src/judge/index.ts";
-import { createEgressMaskingExtension, createMaskingPipeline } from "../src/masking/index.ts";
+	createEgressMaskingExtension,
+	createMaskingPipeline,
+	createPlaceholderRegistry,
+} from "../src/masking/index.ts";
+import { fakeClassifierModel, scriptClassify } from "./helpers.ts";
 
 /** judge 命中锚（真实网关实测 0.96 掩码）与非凭据锚（0.04 丢弃）。 */
 const PASSWORD = "N0Judged-K3y9wq";
@@ -34,98 +28,24 @@ const ORDER = "1029384756";
 /** regex 层锚（内置默认检测器；降级用例证明 regex 照常工作）。 */
 const OPENAI_KEY = "sk-live-abcdefghijklmnopqrst";
 
-/** 进程内假 classifier 模型（仅测试；api 可指定两种线缆形态）。 */
-function fakeClassifierModel(api: string = "typesafe-system-one"): ClassifierModel<ClassifierApi> {
-	return {
-		type: "classifier",
-		id: "jev-fake",
-		name: "Fake Jev",
-		api,
-		provider: "keep-secret-fake",
-		baseUrl: "http://127.0.0.1:1/fake",
-		input: ["text"],
-		cost: {},
-		contextWindow: 128000,
-	} as unknown as ClassifierModel<ClassifierApi>;
-}
-
-/** 概率脚本假 classify：记录调用，gate/candidate 概率由脚本给出；可选
- *  stall 挂起制造并发窗口并统计在途峰值（消息级并发观测）。 */
-function scriptClassify(script: {
-	gate: (text: string) => number;
-	candidate: (value: string) => number;
-	error?: boolean;
-	stall?: () => Promise<void>;
-}) {
-	const calls: ClassifierContext[] = [];
-	let inFlight = 0;
-	let peak = 0;
-	const classify = async (context: ClassifierContext): Promise<ClassifierResult> => {
-		calls.push(structuredClone(context));
-		if (script.stall) {
-			inFlight++;
-			peak = Math.max(peak, inFlight);
-			await script.stall();
-			inFlight--;
-		}
-		const base = {
-			api: "typesafe-system-one" as const,
-			provider: "keep-secret-fake",
-			model: "jev-fake",
-			timestamp: Date.now(),
-		};
-		if (script.error) {
-			return { ...base, answers: {}, stopReason: "error", errorMessage: "judge down" };
-		}
-		const answers: Record<string, { type: "bool"; probability: number }> = {};
-		const text = typeof context.state.text === "string" ? context.state.text : "";
-		for (const id of Object.keys(context.questions)) {
-			if (id === "gate") {
-				answers[id] = { type: "bool", probability: script.gate(text) };
-				continue;
-			}
-			const candidates = context.state.candidates as Record<string, unknown> | undefined;
-			const index = id.slice("cand_".length);
-			const value = typeof candidates?.[index] === "string" ? candidates[index] : "";
-			answers[id] = { type: "bool", probability: script.candidate(value) };
-		}
-		return { ...base, answers, stopReason: "stop" };
-	};
-	return { classify, calls, peak: () => peak };
-}
-
-/** 空状态计数（每用例独立实例，断言不静默降级）。 */
-function emptyStatus(): JudgeStatus {
-	return {
-		degradedTexts: 0,
-		lastResolutionError: undefined,
-		judgedTexts: 0,
-		failClosed: 0,
-		truncatedCandidates: 0,
-	};
-}
-
 const MODEL_REF: ClassifierModelRef = { provider: "keep-secret-fake", modelId: "jev-fake" };
 
 describe("T5 judge 出站扩展（接缝 1）", () => {
 	test("模型在位：judge 命中出站只见 key-{hash} 伪值，非凭据保留，regex 层共存", async () => {
-		const pipeline = createMaskingPipeline();
-		const status = emptyStatus();
 		const fake = scriptClassify({
 			gate: () => 0.98,
 			candidate: (value) => (value === PASSWORD ? 0.96 : 0.04),
 		});
+		const pipeline = createMaskingPipeline({
+			judge: {
+				config: { provider: MODEL_REF.provider, modelId: MODEL_REF.modelId },
+				resolveModel: () => fakeClassifierModel(),
+				classify: (_model, context) => fake.classify(context),
+			},
+		});
+		const status = pipeline.judgeInfo()!.status;
 		const h = await createHarnessSession({
-			extensionFactories: [
-				createJudgeEgressExtension({
-					modelRef: MODEL_REF,
-					pipeline,
-					status,
-					resolveModel: () => fakeClassifierModel(),
-					classify: (_model, context) => fake.classify(context),
-				}),
-				createEgressMaskingExtension({ pipeline }),
-			],
+			extensionFactories: [createEgressMaskingExtension({ pipeline })],
 		});
 		try {
 			h.provider.setScript([{ text: "ack" }]);
@@ -151,20 +71,17 @@ describe("T5 judge 出站扩展（接缝 1）", () => {
 	});
 
 	test("classifier 模型缺失（默认 fail_closed）：未验证候选一律掩码，regex 层共存，零真值出站", async () => {
-		const pipeline = createMaskingPipeline();
-		const status = emptyStatus();
+		// 缺省 resolveModel → ctx.modelRegistry.findOfType("classifier", ...)
+		// harness 注册表没有该模型 → 模型缺失路径（spec 故事 19：down
+		// judge never means an unmasked request——与 classify 故障同则）
+		const pipeline = createMaskingPipeline({
+			judge: {
+				config: { provider: "no-such-provider", modelId: "no-such-model" },
+			},
+		});
+		const status = pipeline.judgeInfo()!.status;
 		const h = await createHarnessSession({
-			extensionFactories: [
-				// 缺省 resolveModel → ctx.modelRegistry.findOfType("classifier", ...)
-			// harness 注册表没有该模型 → 模型缺失路径（spec 故事 19：down
-			// judge never means an unmasked request——与 classify 故障同则）
-			createJudgeEgressExtension({
-				modelRef: { provider: "no-such-provider", modelId: "no-such-model" },
-				pipeline,
-				status,
-			}),
-			createEgressMaskingExtension({ pipeline }),
-			],
+			extensionFactories: [createEgressMaskingExtension({ pipeline })],
 		});
 		try {
 			h.provider.setScript([{ text: "ack" }]);
@@ -196,18 +113,18 @@ describe("T5 judge 出站扩展（接缝 1）", () => {
 	});
 
 	test("onMissing=regex_only：模型缺失显式降级——出站仅 regex 掩码 + 状态计数不静默", async () => {
-		const pipeline = createMaskingPipeline();
-		const status = emptyStatus();
-		const h = await createHarnessSession({
-			extensionFactories: [
-				createJudgeEgressExtension({
-					modelRef: { provider: "no-such-provider", modelId: "no-such-model" },
-					pipeline,
-					status,
+		const pipeline = createMaskingPipeline({
+			judge: {
+				config: {
+					provider: "no-such-provider",
+					modelId: "no-such-model",
 					onMissing: "regex_only",
-				}),
-				createEgressMaskingExtension({ pipeline }),
-			],
+				},
+			},
+		});
+		const status = pipeline.judgeInfo()!.status;
+		const h = await createHarnessSession({
+			extensionFactories: [createEgressMaskingExtension({ pipeline })],
 		});
 		try {
 			h.provider.setScript([{ text: "ack" }]);
@@ -226,20 +143,17 @@ describe("T5 judge 出站扩展（接缝 1）", () => {
 	});
 
 	test("judge 故障注入 → 该消息未验证候选全掩（fail_closed 全链路）", async () => {
-		const pipeline = createMaskingPipeline();
-		const status = emptyStatus();
 		const fake = scriptClassify({ gate: () => 0.98, candidate: () => 0.96, error: true });
+		const pipeline = createMaskingPipeline({
+			judge: {
+				config: { provider: MODEL_REF.provider, modelId: MODEL_REF.modelId },
+				resolveModel: () => fakeClassifierModel(),
+				classify: (_model, context) => fake.classify(context),
+			},
+		});
+		const status = pipeline.judgeInfo()!.status;
 		const h = await createHarnessSession({
-			extensionFactories: [
-				createJudgeEgressExtension({
-					modelRef: MODEL_REF,
-					pipeline,
-					status,
-					resolveModel: () => fakeClassifierModel(),
-					classify: (_model, context) => fake.classify(context),
-				}),
-				createEgressMaskingExtension({ pipeline }),
-			],
+			extensionFactories: [createEgressMaskingExtension({ pipeline })],
 		});
 		try {
 			h.provider.setScript([{ text: "ack" }]);
@@ -258,22 +172,20 @@ describe("T5 judge 出站扩展（接缝 1）", () => {
 	});
 
 	test("消息级并发：多文本叶的 gate 调用在退道内重叠（信号量限 8）", async () => {
-		const pipeline = createMaskingPipeline();
 		const fake = scriptClassify({
 			gate: () => 0.02, // 干净文本：每叶一次 gate 后短路
 			candidate: () => 0.02,
 			stall: () => new Promise((resolve) => setTimeout(resolve, 10)),
 		});
+		const pipeline = createMaskingPipeline({
+			judge: {
+				config: { provider: MODEL_REF.provider, modelId: MODEL_REF.modelId },
+				resolveModel: () => fakeClassifierModel(),
+				classify: (_model, context) => fake.classify(context),
+			},
+		});
 		const h = await createHarnessSession({
-			extensionFactories: [
-				createJudgeEgressExtension({
-					modelRef: MODEL_REF,
-					pipeline,
-					resolveModel: () => fakeClassifierModel(),
-					classify: (_model, context) => fake.classify(context),
-				}),
-				createEgressMaskingExtension({ pipeline }),
-			],
+			extensionFactories: [createEgressMaskingExtension({ pipeline })],
 		});
 		try {
 			h.provider.setScript([{ text: "ack" }]);
@@ -287,21 +199,19 @@ describe("T5 judge 出站扩展（接缝 1）", () => {
 	});
 
 	test("与 clean cache 协同：干净消息缓存后不再发起 gate（非 clean 记墓碑）", async () => {
-		const pipeline = createMaskingPipeline();
 		const fake = scriptClassify({
 			gate: (text) => (text.includes(PASSWORD) ? 0.98 : 0.02),
 			candidate: (value) => (value === PASSWORD ? 0.96 : 0.04),
 		});
+		const pipeline = createMaskingPipeline({
+			judge: {
+				config: { provider: MODEL_REF.provider, modelId: MODEL_REF.modelId },
+				resolveModel: () => fakeClassifierModel(),
+				classify: (_model, context) => fake.classify(context),
+			},
+		});
 		const h = await createHarnessSession({
-			extensionFactories: [
-				createJudgeEgressExtension({
-					modelRef: MODEL_REF,
-					pipeline,
-					resolveModel: () => fakeClassifierModel(),
-					classify: (_model, context) => fake.classify(context),
-				}),
-				createEgressMaskingExtension({ pipeline }),
-			],
+			extensionFactories: [createEgressMaskingExtension({ pipeline })],
 		});
 		try {
 			h.provider.setScript([{ text: "ok" }, { text: "ok" }]);
@@ -325,42 +235,42 @@ describe("T5 judge 出站扩展（接缝 1）", () => {
 	});
 });
 
-describe("T8 judge 文本掩码器（createJudgeTextMasker）", () => {
+describe("T8 judge 文本掩码器（经管线统一入口）", () => {
 	/** 无 UI 的最小 ctx（降级/故障告警在无 UI 模式仅计数）。 */
 	const noUiCtx = { hasUI: false } as unknown as ExtensionContext;
 
-	test("模型缺失 + onMissing=regex_only：降级放行 + 计数 + 墓碑（regex 干净结论不得覆写）", async () => {
-		const pipeline = createMaskingPipeline();
-		const status = emptyStatus();
+	test("模型缺失 + onMissing=regex_only：降级放行 + 计数 + 墓碑（未写成干净，每轮重走 judge 层）", async () => {
+		const registry = createPlaceholderRegistry();
 		const masker = createJudgeTextMasker({
 			modelRef: MODEL_REF,
-			pipeline,
-			status,
+			registry,
 			onMissing: "regex_only", // 显式知情选择：保留降级放行行为
 			resolveModel: () => undefined, // classifier 模型不可用
 		});
+		const pipeline = createMaskingPipeline({ registry, judge: { masker } });
+		const status = pipeline.judgeInfo()!.status;
 		const text = `部署密码 ${PASSWORD}，订单 ${ORDER}`;
-		const masked = await masker.mask(text, noUiCtx);
-		expect(masked).toBe(text); // 降级：judge 层放行（regex 层照常工作）
+		expect(await pipeline.mask(text, noUiCtx)).toBe(text); // 降级：judge 层放行（regex 阶段照常工作）
 		expect(status.degradedTexts).toBe(1);
 		expect(status.failClosed).toBe(0);
 		expect(status.lastResolutionError).toContain("keep-secret-fake/jev-fake");
-		// 墓碑：regex 层零命中也不得把该文本写成干净（防 judge 恢复后被缓存短路）
-		pipeline.maskText(text);
-		expect(pipeline.cleanCache.isClean(text)).toBe(false);
+		// 墓碑（行为断言，ADR-0001）：降级放行过、regex 零命中的文本不得被
+		// 写成干净——第二次 mask 仍重走 judge 层（非缓存短路）
+		expect(await pipeline.mask(text, noUiCtx)).toBe(text);
+		expect(status.degradedTexts).toBe(2);
 	});
 
 	test("模型缺失 + 默认 fail_closed：未验证候选一律掩码（真值本地保留）+ 计数 + 墓碑", async () => {
-		const pipeline = createMaskingPipeline();
-		const status = emptyStatus();
+		const registry = createPlaceholderRegistry();
 		const masker = createJudgeTextMasker({
 			modelRef: MODEL_REF,
-			pipeline,
-			status,
+			registry,
 			resolveModel: () => undefined, // classifier 模型不可用
 		});
+		const pipeline = createMaskingPipeline({ registry, judge: { masker } });
+		const status = pipeline.judgeInfo()!.status;
 		const text = `部署密码 ${PASSWORD}，订单 ${ORDER}`;
-		const masked = await masker.mask(text, noUiCtx);
+		const masked = await pipeline.mask(text, noUiCtx);
 		// 与 classify 故障同路径：候选（含判非凭据形状的订单号）未验证 → 一律掩码
 		expect(masked).not.toBe(text);
 		expect(masked).not.toContain(PASSWORD);
@@ -371,15 +281,16 @@ describe("T8 judge 文本掩码器（createJudgeTextMasker）", () => {
 		expect(status.degradedTexts).toBe(0);
 		expect(status.lastResolutionError).toContain("keep-secret-fake/jev-fake");
 		// 幂等：掩码后的文本再过一次不得嵌套伪值（已是注册表伪值的候选被过滤）
-		const twice = await masker.mask(masked, noUiCtx);
+		const twice = await pipeline.mask(masked, noUiCtx);
 		expect(twice.split(placeholder).length - 1).toBe(masked.split(placeholder).length - 1);
-		// 墓碑：regex 层零命中也不得把原文写成干净（防 judge 恢复后被缓存短路）
-		pipeline.maskText(text);
-		expect(pipeline.cleanCache.isClean(text)).toBe(false);
+		expect(status.failClosed).toBe(2); // 每次完整掩码都经 fail_closed 兜底（含幂等重过）
+		// 墓碑（行为断言）：原文每轮重判（failClosed 递增），未被缓存短路
+		await pipeline.mask(text, noUiCtx);
+		expect(status.failClosed).toBe(3);
 	});
 
 	test("模型恢复后重判：同一段降级放行过的文本被 judge 掩码（墓碑未被覆写）", async () => {
-		const pipeline = createMaskingPipeline();
+		const registry = createPlaceholderRegistry();
 		const fake = scriptClassify({
 			gate: () => 0.98,
 			candidate: (value) => (value === PASSWORD ? 0.96 : 0.04),
@@ -387,39 +298,40 @@ describe("T8 judge 文本掩码器（createJudgeTextMasker）", () => {
 		let model: ReturnType<typeof fakeClassifierModel> | undefined;
 		const masker = createJudgeTextMasker({
 			modelRef: MODEL_REF,
-			pipeline,
+			registry,
 			onMissing: "regex_only", // 本用例锚定降级墓碑与恢复重判的协同
 			resolveModel: () => model,
 			classify: (_m, context) => fake.classify(context),
 		});
+		const pipeline = createMaskingPipeline({ registry, judge: { masker } });
 		const text = `部署密码 ${PASSWORD}，订单 ${ORDER}`;
-		// 阶段 1：模型缺失 → 降级放行 + 墓碑；regex 层零命中后也不得标记干净
-		expect(await masker.mask(text, noUiCtx)).toBe(text);
-		pipeline.maskText(text);
+		// 阶段 1：模型缺失 → 降级放行 + 墓碑（regex 零命中也不得标记干净）
+		expect(await pipeline.mask(text, noUiCtx)).toBe(text);
 		// 阶段 2：模型注册后恢复 → 墓碑保证重判而非缓存短路
 		model = fakeClassifierModel();
-		const masked = await masker.mask(text, noUiCtx);
+		const masked = await pipeline.mask(text, noUiCtx);
 		expect(masked).not.toBe(text);
 		expect(masked).not.toContain(PASSWORD);
 		expect(masked).toMatch(/key-[A-Z2-7]{12}/);
 		expect(masked).toContain(ORDER); // 判非凭据：保留
 	});
 
-	test("自测复用同一掩码器：judge 先行、regex 兑底，与出站链同序", async () => {
-		const pipeline = createMaskingPipeline();
+	test("统一出站入口：单次 mask 即双层结果（judge 先行、regex 兑底，与出站链同一入口）", async () => {
+		const registry = createPlaceholderRegistry();
 		const fake = scriptClassify({
 			gate: () => 0.98,
 			candidate: (value) => (value === PASSWORD ? 0.96 : 0.04),
 		});
 		const masker = createJudgeTextMasker({
 			modelRef: MODEL_REF,
-			pipeline,
+			registry,
 			resolveModel: () => fakeClassifierModel(),
 			classify: (_m, context) => fake.classify(context),
 		});
+		const pipeline = createMaskingPipeline({ registry, judge: { masker } });
 		const text = `密码 ${PASSWORD}，密钥 ${OPENAI_KEY}`;
-		// 出站链同序：judge 先判原文，regex 后兑底（伪值幂等跳过）
-		const masked = pipeline.maskText(await masker.mask(text, noUiCtx));
+		// 出站链同一入口：一次调用完成 judge 判原文 + regex 兑底（伪值幂等跳过）
+		const masked = await pipeline.mask(text, noUiCtx);
 		expect(masked).not.toContain(PASSWORD);
 		expect(masked).not.toContain(OPENAI_KEY);
 		expect(masked).toMatch(/key-[A-Z2-7]{12}/);
@@ -447,18 +359,21 @@ describe("T16 judge.api 线缆偏好（三分支装配，无名称硬校验）",
 
 	test("分支 1（缺省 api）：跟随模型注册条目——两种协议假模型均装配并走通两阶段判定", async () => {
 		for (const modelApi of ["typesafe-system-one", "openai-decisions"] as const) {
-			const pipeline = createMaskingPipeline();
+			const registry = createPlaceholderRegistry();
 			const fake = scriptClassify({
 				gate: () => 0.98,
 				candidate: (value) => (value === PASSWORD ? 0.96 : 0.04),
 			});
 			const masker = createJudgeTextMasker({
 				modelRef: MODEL_REF,
-				pipeline, // 不传 api：跟随模型注册条目的 api 字段（线缆由注册决定）
+				registry, // 不传 api：跟随模型注册条目的 api 字段（线缆由注册决定）
 				resolveModel: () => fakeClassifierModel(modelApi),
 				classify: (_m, context) => fake.classify(context),
 			});
-			const masked = await masker.mask(`部署密码 ${PASSWORD}，订单 ${ORDER}`, noUiCtx);
+			const { text: masked } = await masker.mask(
+				`部署密码 ${PASSWORD}，订单 ${ORDER}`,
+				noUiCtx,
+			);
 			expect(masked).not.toContain(PASSWORD);
 			expect(masked).toContain(ORDER);
 			expect(masked).toMatch(/key-[A-Z2-7]{12}/);
@@ -477,7 +392,7 @@ describe("T16 judge.api 线缆偏好（三分支装配，无名称硬校验）",
 			{ api: "decisions", modelApi: "typesafe-system-one", classifyApi: "openai-decisions" },
 		] as const;
 		for (const { api, modelApi, classifyApi } of cases) {
-			const pipeline = createMaskingPipeline();
+			const registry = createPlaceholderRegistry();
 			const fake = scriptClassify({
 				gate: () => 0.98,
 				candidate: (value) => (value === PASSWORD ? 0.96 : 0.04),
@@ -485,7 +400,7 @@ describe("T16 judge.api 线缆偏好（三分支装配，无名称硬校验）",
 			const seenApis: string[] = [];
 			const masker = createJudgeTextMasker({
 				modelRef: MODEL_REF,
-				pipeline,
+				registry,
 				api, // 配置选择线缆：classify 分发走偏好映射的 pi-ai 传输
 				resolveModel: () => fakeClassifierModel(modelApi),
 				classify: (m, context) => {
@@ -493,7 +408,10 @@ describe("T16 judge.api 线缆偏好（三分支装配，无名称硬校验）",
 					return fake.classify(context);
 				},
 			});
-			const masked = await masker.mask(`部署密码 ${PASSWORD}，订单 ${ORDER}`, noUiCtx);
+			const { text: masked } = await masker.mask(
+				`部署密码 ${PASSWORD}，订单 ${ORDER}`,
+				noUiCtx,
+			);
 			expect(masked).not.toContain(PASSWORD); // 覆盖线缆照常判定掩码
 			expect(masked).toContain(ORDER);
 			expect(masker.status.judgedTexts).toBeGreaterThan(0);
@@ -505,7 +423,7 @@ describe("T16 judge.api 线缆偏好（三分支装配，无名称硬校验）",
 	});
 
 	test("分支 3（插件自定义 api + 偏好）：尊重插件实现——正常装配掩码 + 一次性 info 通知 + 偏好未生效标记", async () => {
-		const pipeline = createMaskingPipeline();
+		const registry = createPlaceholderRegistry();
 		const fake = scriptClassify({
 			gate: () => 0.98,
 			candidate: (value) => (value === PASSWORD ? 0.96 : 0.04),
@@ -514,7 +432,7 @@ describe("T16 judge.api 线缆偏好（三分支装配，无名称硬校验）",
 		const { ctx, notifications, statusKeys } = uiCtx();
 		const masker = createJudgeTextMasker({
 			modelRef: MODEL_REF,
-			pipeline,
+			registry,
 			api: "systemone", // 用户现场场景（#16）：插件注册的自定义 api，偏好不生效但正常装配
 			resolveModel: () => fakeClassifierModel("litellm-decisions"),
 			classify: (m, context) => {
@@ -523,7 +441,7 @@ describe("T16 judge.api 线缆偏好（三分支装配，无名称硬校验）",
 			},
 		});
 		const text = `部署密码 ${PASSWORD}，订单 ${ORDER}`;
-		const masked = await masker.mask(text, ctx);
+		const { text: masked } = await masker.mask(text, ctx);
 		expect(masked).not.toContain(PASSWORD); // 正常装配：judge 判定掩码照常
 		expect(masked).toContain(ORDER);
 		expect(masked).toMatch(/key-[A-Z2-7]{12}/);
@@ -558,24 +476,22 @@ describe("T20 placeholder form unification (first-issuer-wins, #21)", () => {
 	// issued key-{hash} while a regex-hit leaf issued sk-{hash} for the same
 	// secret, so the model saw both forms in one request.
 
-	test("judge-hit leaf pins the form; a regex-hit leaf in the same request reuses it", async () => {
-		const pipeline = createMaskingPipeline();
+	test("one secret, one form per request: whichever layer issues first pins it (concurrent leaves)", async () => {
 		const fake = scriptClassify({
 			// Gate by leaf content: the system leaf (GATEHIT) is judged and masks
 			// the secret (first issuance); the user leaf passes to the regex layer.
 			gate: (text) => (text.includes("GATEHIT") ? 0.98 : 0.02),
 			candidate: (value) => (value === OPENAI_KEY ? 0.96 : 0.04),
 		});
+		const pipeline = createMaskingPipeline({
+			judge: {
+				config: { provider: MODEL_REF.provider, modelId: MODEL_REF.modelId },
+				resolveModel: () => fakeClassifierModel(),
+				classify: (_model, context) => fake.classify(context),
+			},
+		});
 		const h = await createHarnessSession({
-			extensionFactories: [
-				createJudgeEgressExtension({
-					modelRef: MODEL_REF,
-					pipeline,
-					resolveModel: () => fakeClassifierModel(),
-					classify: (_model, context) => fake.classify(context),
-				}),
-				createEgressMaskingExtension({ pipeline }),
-			],
+			extensionFactories: [createEgressMaskingExtension({ pipeline })],
 			cwdFiles: {
 				"AGENTS.md": `# Project rules\n\nDeploy key (GATEHIT): ${OPENAI_KEY}\n`,
 			},
@@ -586,13 +502,15 @@ describe("T20 placeholder form unification (first-issuer-wins, #21)", () => {
 
 			const out = requestText(h.provider.requests()[0]);
 			expect(out).not.toContain(OPENAI_KEY);
-			// One form for one secret: both leaves carry the same key-{hash}
-			// placeholder; the openai detector's own sk-{hash} form never appears.
-			const forms = out.match(/key-[A-Z2-7]{12}/g);
+			// Leaves are masked concurrently (message-level concurrency), so
+			// which layer issues first — the judged system leaf or the regex-only
+			// user leaf — is genuinely racy. The invariant the registry guarantees
+			// is: ONE form per secret. Both leaves carry the same placeholder and
+			// the other template's form never appears in the request.
+			const forms = out.match(/(?:key|sk)-[A-Z2-7]{12}/g);
 			expect(forms).not.toBeNull();
-			expect(new Set(forms).size).toBe(1);
 			expect(forms).toHaveLength(2); // system leaf + user leaf
-			expect(out).not.toMatch(/sk-[A-Z2-7]{12}/);
+			expect(new Set(forms).size).toBe(1); // exactly one form for one secret
 			expect(pipeline.registry.get(forms![0]!)).toBe(OPENAI_KEY);
 		} finally {
 			h.dispose();
@@ -600,21 +518,19 @@ describe("T20 placeholder form unification (first-issuer-wins, #21)", () => {
 	});
 
 	test("regex-hit leaf pins the form; a judge-hit leaf in a later turn reuses it", async () => {
-		const pipeline = createMaskingPipeline();
 		const fake = scriptClassify({
 			gate: (text) => (text.includes("GATEHIT") ? 0.98 : 0.02),
 			candidate: (value) => (value === OPENAI_KEY ? 0.96 : 0.04),
 		});
+		const pipeline = createMaskingPipeline({
+			judge: {
+				config: { provider: MODEL_REF.provider, modelId: MODEL_REF.modelId },
+				resolveModel: () => fakeClassifierModel(),
+				classify: (_model, context) => fake.classify(context),
+			},
+		});
 		const h = await createHarnessSession({
-			extensionFactories: [
-				createJudgeEgressExtension({
-					modelRef: MODEL_REF,
-					pipeline,
-					resolveModel: () => fakeClassifierModel(),
-					classify: (_model, context) => fake.classify(context),
-				}),
-				createEgressMaskingExtension({ pipeline }),
-			],
+			extensionFactories: [createEgressMaskingExtension({ pipeline })],
 		});
 		try {
 			h.provider.setScript([{ text: "ok" }, { text: "ok" }]);

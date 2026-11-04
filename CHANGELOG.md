@@ -6,6 +6,30 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **架构（ADR-0001）：出站掩码组合与 Clean Verdict 协议内聚进掩码管线。**
+  `createMaskingPipeline` 成为唯一出站掩码所有者：未配置 judge 公开同步
+  `maskText`（regex 快路径）；配置 judge 后唯一出站入口为异步 `mask`
+  （judge 层先行 → regex 阶段兑底 → clean cache 一次查一次写；同步 regex
+  阶段退为内部实现，不再存在绕过 judge 的出站通道）。出站收缩为单扩展
+  单次遍历（原 judge/regex 双 hook 的注册顺序契约移除）；judge 创建内聚
+  进管线构造（`judge` 配置段或掩码器替身经管线 options 传入），掩码压缩
+  与自测改消费统一入口——新增出站路径结构上不可能漏接 judge（ticket #12
+  压缩漏掩码事故的根治）。`cleanCache` 不再作为管线公开成员（协议触点
+  7 → 2）；命令面 judge 状态改经 `pipeline.judgeInfo()` 只读快照读取，
+  状态面 `on missing` 改读会话生效策略（原先读 reload 后的磁盘新配置，
+  可能展示未生效策略）。叶间消息级并发下「judge 模板必先签发」不再确定
+  ——同一 secret 单一形态不变量由注册表 first-issuer-wins 保证（测试已
+  改锚该不变量）。测试侧：judge/压缩/命令用例改走统一入口与正式组合装
+  配，`classify`/`resolveModel`/judge 替身注入点原样平移至管线 options，
+  clean 协议断言改行为面（classify 调用次数/计数递增/重判行为），
+  `test/helpers.ts` 共享 classifier 替身取代 `judge-egress` 本地副本。
+  程序化接口变更：`MaskingPipeline` 拆分为 `MaskingPipeline`（无 judge，
+  同步 `maskText`）/ `JudgedMaskingPipeline`（有 judge，异步 `mask`）双形
+  态；`createConfiguredMaskingExtension` 不再返回 `judge`；`src/judge/
+  extension.ts` 拆入 `src/judge/masker.ts`（judge 出站扩展工厂移除）。
+
 ## [0.2.0] - 2026-11-03
 
 ### Added

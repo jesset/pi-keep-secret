@@ -7,33 +7,38 @@
  *
  * Assertions stay at the public seam: what the summary "model" (faux view)
  * receives, what lands in the session as the stored summary, and which
- * status counters moved. The compaction factories are composed exactly like
- * the formal entry (judge egress → regex egress → masked compaction sharing
- * one pipeline and one JudgeTextMasker instance); the formal entry itself is
- * covered by the last two cases via createKeepSecretExtension.
+ * status counters moved. Since ADR-0001 the composition IS the formal one:
+ * createConfiguredMaskingExtension builds the judged pipeline (judge layer
+ * internal to the pipeline) and the masked compaction extension consumes the
+ * pipeline's unified egress entry — the manual judge/regex hook wiring that
+ * once drifted from the formal entry no longer exists. The full entry itself
+ * is covered by the last two cases via createKeepSecretExtension.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { makePlaceholder } from "../src/engine/index.ts";
 import {
 	createMaskedCompactionExtension,
 	type MaskedCompactionStatus,
 } from "../src/compaction/index.ts";
+import { createConfiguredMaskingExtension } from "../src/config/index.ts";
 import {
 	createHarnessSession,
 	requestText,
 	type HarnessSession,
 } from "../src/harness/fake-session.ts";
-import {
-	createJudgeEgressExtension,
-	createJudgeTextMasker,
-	type ClassifierModelRef,
-} from "../src/judge/index.ts";
-import { createEgressMaskingExtension, createMaskingPipeline } from "../src/masking/index.ts";
 import { createKeepSecretExtension } from "../extension/index.ts";
-import { emptyJudgeStatus, fakeClassifierModel, scriptClassify } from "./helpers.ts";
+import { fakeClassifierModel, scriptClassify } from "./helpers.ts";
+
+/** 正式组合的临时配置目录（afterEach 统一清理）。 */
+const tempDirs: string[] = [];
+afterEach(() => {
+	for (const dir of tempDirs.splice(0)) {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
 
 /** Judge-only anchor: low-entropy password, invisible to the regex layer (judge hit 0.96). */
 const PASSWORD = "N0Judged-K3y9wq";
@@ -47,8 +52,6 @@ const ORDER_PLACEHOLDER = makePlaceholder(ORDER, "key-{hash}", 12);
 const OPENAI_PLACEHOLDER = makePlaceholder(OPENAI_KEY, "sk-{hash}", 12);
 /** Padding so the second user message is large enough to hold the cut point. */
 const PAD = "context padding for cut point placement. ".repeat(24);
-
-const MODEL_REF: ClassifierModelRef = { provider: "keep-secret-fake", modelId: "jev-fake" };
 
 /** Entry ids of all message entries with the given role, in session order. */
 function messageEntryIds(h: HarnessSession, role: string): string[] {
@@ -64,9 +67,11 @@ function compactionEntry(h: HarnessSession) {
 }
 
 /**
- * Full compaction chain with judge coverage: one pipeline + one JudgeTextMasker
- * shared by the egress judge extension and the masked compaction extension —
- * the same shape as the formal composition in extension/index.ts.
+ * Full compaction chain with judge coverage via the formal composition: a
+ * temp config.json with a judge section drives createConfiguredMaskingExtension
+ * (judge layer internal to the pipeline), and the masked compaction extension
+ * consumes the same pipeline's unified egress entry — the wiring of
+ * extension/index.ts minus commands/ingress, so status objects stay observable.
  */
 function createJudgedCompactionSessionFactories(options: {
 	gate: (text: string) => number;
@@ -75,19 +80,28 @@ function createJudgedCompactionSessionFactories(options: {
 	onMissing?: "fail_closed" | "regex_only";
 	resolveModel?: () => ReturnType<typeof fakeClassifierModel> | undefined;
 }) {
-	const pipeline = createMaskingPipeline();
-	const judgeStatus = emptyJudgeStatus();
 	const fake = scriptClassify({
 		gate: options.gate,
 		candidate: options.candidate,
 		error: options.error,
 	});
-	const masker = createJudgeTextMasker({
-		modelRef: MODEL_REF,
-		pipeline,
-		status: judgeStatus,
-		onMissing: options.onMissing,
-		resolveModel: options.resolveModel ?? (() => fakeClassifierModel()),
+	const judgeSection: Record<string, unknown> = {
+		provider: "keep-secret-fake",
+		modelId: "jev-fake",
+		redactTemplate: "key-{hash}",
+	};
+	if (options.onMissing !== undefined) {
+		judgeSection.onMissing = options.onMissing;
+	}
+	const dir = mkdtempSync(join(tmpdir(), "pi-keep-secret-t12-factory-"));
+	tempDirs.push(dir);
+	writeFileSync(join(dir, "config.json"), JSON.stringify({ judge: judgeSection }), "utf8");
+	const { factory, pipeline } = createConfiguredMaskingExtension({
+		configPath: join(dir, "config.json"),
+		resolveModel:
+			options.resolveModel === undefined
+				? () => fakeClassifierModel()
+				: (_ctx, _ref) => options.resolveModel!(),
 		classify: (_model, context) => fake.classify(context),
 	});
 	const compactionStatus: MaskedCompactionStatus = {
@@ -95,11 +109,10 @@ function createJudgedCompactionSessionFactories(options: {
 		lastCancellationError: undefined,
 	};
 	const extensionFactories = [
-		createJudgeEgressExtension({ modelRef: MODEL_REF, pipeline, masker }),
-		createEgressMaskingExtension({ pipeline }),
-		createMaskedCompactionExtension({ pipeline, judge: masker, status: compactionStatus }),
+		factory,
+		createMaskedCompactionExtension({ pipeline, status: compactionStatus }),
 	];
-	return { pipeline, judgeStatus, compactionStatus, fake, extensionFactories };
+	return { pipeline, judgeStatus: pipeline.judgeInfo()!.status, compactionStatus, fake, extensionFactories };
 }
 
 /** Judge gate that hits only leaves containing the judge-only password. */

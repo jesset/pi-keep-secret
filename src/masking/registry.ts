@@ -24,7 +24,7 @@
  * drops its reverse entry too, so a post-eviction re-issue deterministically
  * follows the current template suggestion (no stale-form resurrection).
  */
-import { makePlaceholder } from "../engine/index.ts";
+import { makePlaceholder, redactText, type Span } from "../engine/index.ts";
 
 /** Default capacity cap (aligned with the reference implementation 5000 LRU). */
 const DEFAULT_LIMIT = 5000;
@@ -52,6 +52,29 @@ export interface PlaceholderRegistry {
 	readonly size: number;
 	/** Clear (session end / tests). */
 	clear(): void;
+}
+
+/** Span 掩码共享尾段：注册表幂等过滤（已是本注册表伪值的 span 跳过，防嵌
+ *  套）→ redactText（注入注册表签发器：确定性伪值 + 碰撞兑底 + LRU 写入）。
+ *  regex 管线阶段与 judge 层（命中/兑底 span）同形去重；返回应用后的文本
+ *  与应用的 span 数（0 = 原样返回）。置于此处供掩码管线与 judge 层共用，
+ *  避免两模块经掩码管线 barrel 形成环依赖。 */
+export function redactSpansWithRegistry(
+	text: string,
+	spans: readonly Span[],
+	registry: PlaceholderRegistry,
+	templates: Map<string, string>,
+): { text: string; applied: number } {
+	const applicable = spans.filter((span) => !registry.has(text.slice(span.start, span.end)));
+	if (applicable.length === 0) {
+		return { text, applied: 0 };
+	}
+	return {
+		text: redactText(text, applicable, templates, {
+			issuePlaceholder: (secret, detector) => registry.issue(secret, templates.get(detector)!),
+		}).text,
+		applied: applicable.length,
+	};
 }
 
 /** Create an in-process placeholder registry. */

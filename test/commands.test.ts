@@ -22,7 +22,8 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import { createConfiguredMaskingExtension, CONFIG_PATH_ENV } from "../src/config/index.ts";
 import type { MaskedCompactionStatus } from "../src/compaction/index.ts";
 import { createKeepSecretCommandsExtension } from "../src/commands/index.ts";
-import type { JudgeStatus, JudgeTextMasker, JudgeWire } from "../src/judge/index.ts";
+import type { JudgeLayerOutcome, JudgeStatus, JudgeTextMasker, JudgeWire } from "../src/judge/index.ts";
+import { createMaskingPipeline } from "../src/masking/index.ts";
 import { createHarnessSession, requestText } from "../src/harness/fake-session.ts";
 
 const OPENAI_KEY = "sk-live-abcdefghijklmnopqrst";
@@ -153,9 +154,10 @@ function emptyJudgeStatus(): JudgeStatus {
 	};
 }
 
-/** 恒等掩码器的 judge 句柄（状态可注入；自测时假密码不被掩码）。 */
+/** 恒等掩码器的 judge 替身（状态可注入；自测时假密码不被掩码；恒 clean）。 */
 function identityJudge(status: JudgeStatus = emptyJudgeStatus(), onMissing: "fail_closed" | "regex_only" = "fail_closed"): JudgeTextMasker {
-	return { status, onMissing, modelMissing: false, wire: undefined, mask: async (text) => text };
+	const mask = async (text: string): Promise<JudgeLayerOutcome> => ({ text, verdict: "clean" });
+	return { status, onMissing, modelMissing: false, wire: undefined, mask };
 }
 
 /** 自测假密码样本里的真值（judge 启用时期望被掩码的串）。 */
@@ -163,13 +165,11 @@ const SELF_TEST_PASSWORD = "Xk9$mQzT7vLw2Pn4";
 
 /** 命中假密码的 judge 句柄（模拟可用 judge：仅掩密码样本真值）。 */
 function passwordJudgingJudge(status: JudgeStatus = emptyJudgeStatus()): JudgeTextMasker {
-	return {
-		status,
-		onMissing: "fail_closed",
-		modelMissing: false,
-		wire: undefined,
-		mask: async (text) => text.split(SELF_TEST_PASSWORD).join("key-JUDGEDFAKE1"),
-	};
+	const mask = async (text: string): Promise<JudgeLayerOutcome> => ({
+		text: text.split(SELF_TEST_PASSWORD).join("key-JUDGEDFAKE1"),
+		verdict: "masked",
+	});
+	return { status, onMissing: "fail_closed", modelMissing: false, wire: undefined, mask };
 }
 
 describe("T7 /keep-secret 状态面板", () => {
@@ -262,9 +262,9 @@ describe("T7 /keep-secret 状态面板", () => {
 		};
 		const withJudge = createKeepSecretCommandsExtension({
 			loader: made.loader,
-			pipeline: made.pipeline,
+			// judge 替身经管线 options 注入（ADR-0001：命令面不再单独持有 judge）
+			pipeline: createMaskingPipeline({ judge: { masker: identityJudge(judgeStatus) } }),
 			compaction: made.compaction,
-			judge: identityJudge(judgeStatus),
 		});
 		const text = await runCommand(withJudge, "");
 		expect(text).toMatch(/cancelled\s+2/);
@@ -280,9 +280,8 @@ describe("T7 /keep-secret 状态面板", () => {
 		const statusLine = async (wire: JudgeWire | undefined): Promise<string> => {
 			const commands = createKeepSecretCommandsExtension({
 				loader: made.loader,
-				pipeline: made.pipeline,
+				pipeline: createMaskingPipeline({ judge: { masker: { ...identityJudge(), wire } } }),
 				compaction: made.compaction,
-				judge: { ...identityJudge(), wire },
 			});
 			return await runCommand(commands, "");
 		};
@@ -342,9 +341,8 @@ describe("T7 /keep-secret test 合成样本自测", () => {
 			const made = makeCommands();
 			const commands = createKeepSecretCommandsExtension({
 				loader: made.loader,
-				pipeline: made.pipeline,
+				pipeline: createMaskingPipeline({ judge: { masker: passwordJudgingJudge() } }),
 				compaction: made.compaction,
-				judge: passwordJudgingJudge(),
 			});
 			const text = await runCommand(commands, "test");
 			expect(text).toMatch(/✓\s+fake password\s+masked\s+expected masked/);
@@ -360,17 +358,18 @@ describe("T7 /keep-secret test 合成样本自测", () => {
 				onMissing: "fail_closed",
 				modelMissing: true,
 				wire: undefined,
-				mask: async (text) =>
-					text
+				mask: async (text): Promise<JudgeLayerOutcome> => ({
+					text: text
 						.replace(/ORD-\d{8}-\d{6}/, "key-FAKEFAKEFAKE")
 						.split(SELF_TEST_PASSWORD)
 						.join("key-FAKEFAILCLS"),
+					verdict: "masked",
+				}),
 			};
 			const commands = createKeepSecretCommandsExtension({
 				loader: made.loader,
-				pipeline: made.pipeline,
+				pipeline: createMaskingPipeline({ judge: { masker: failClosedJudge } }),
 				compaction: made.compaction,
-				judge: failClosedJudge,
 			});
 			const text = await runCommand(commands, "test");
 			expect(text).toMatch(/✓\s+clean order number\s+masked\s+expected masked/); // 兑底掩码属预期
@@ -384,9 +383,8 @@ describe("T7 /keep-secret test 合成样本自测", () => {
 			const degraded = { ...emptyJudgeStatus(), degradedTexts: 2 };
 			const commands = createKeepSecretCommandsExtension({
 				loader: made.loader,
-				pipeline: made.pipeline,
+				pipeline: createMaskingPipeline({ judge: { masker: identityJudge(degraded) } }),
 				compaction: made.compaction,
-				judge: identityJudge(degraded),
 			});
 			const { commandHandler } = registerExtension(commands);
 			const { ctx, notifications } = recordingContext();
@@ -553,7 +551,7 @@ const CJK_PATTERN = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/;
 const UI_SOURCES = [
 	join(import.meta.dir, "..", "src", "commands", "extension.ts"),
 	join(import.meta.dir, "..", "src", "config", "extension.ts"),
-	join(import.meta.dir, "..", "src", "judge", "extension.ts"),
+	join(import.meta.dir, "..", "src", "judge", "masker.ts"),
 	join(import.meta.dir, "..", "src", "compaction", "extension.ts"),
 	join(import.meta.dir, "..", "extension", "index.ts"),
 ];
@@ -610,26 +608,25 @@ describe("T7 UI 语言守卫（用户可见字符串一律英文）", () => {
 			onMissing: "fail_closed",
 			modelMissing: false,
 			wire: { source: "registered", api: "typesafe-system-one" },
-			mask: async (text) => text,
+			mask: async (text): Promise<JudgeLayerOutcome> => ({ text, verdict: "clean" }),
 		};
 		const variants = [
-			{ judge: undefined },
+			{ masker: undefined },
 			{
-				judge: {
+				masker: {
 					...passwordJudge,
 					status: { ...emptyJudgeStatus(), judgedTexts: 7, failClosed: 1, degradedTexts: 2 },
 				},
 			},
-			{ judge: { ...passwordJudge, modelMissing: true } },
+			{ masker: { ...passwordJudge, modelMissing: true } },
 		];
 		const outputs: string[] = [];
 		for (const variant of variants) {
 			const made = makeCommands();
 			const commands = createKeepSecretCommandsExtension({
 				loader: made.loader,
-				pipeline: made.pipeline,
+				pipeline: createMaskingPipeline({ judge: variant.masker === undefined ? undefined : { masker: variant.masker } }),
 				compaction: made.compaction,
-				judge: variant.judge,
 			});
 			const { commandHandler } = registerExtension(commands);
 			const { ctx, notifications } = recordingContext();
