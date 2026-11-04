@@ -1,6 +1,6 @@
 {
 	"name": "pi-keep-secret",
-	"version": "0.2.0",
+	"version": "0.3.0",
 	"type": "module",
 	"description": "Transparent egress secret masking for pi coding-agent sessions",
 	"author": "Jesset (https://github.com/jesset)",

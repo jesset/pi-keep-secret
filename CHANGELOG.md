@@ -6,6 +6,8 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-04
+
 ### Changed
 
 - **架构（ADR-0001）：出站掩码组合与 Clean Verdict 协议内聚进掩码管线。**
