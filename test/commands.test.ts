@@ -18,13 +18,14 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createConfiguredMaskingExtension, CONFIG_PATH_ENV } from "../src/config/index.ts";
 import type { MaskedCompactionStatus } from "../src/compaction/index.ts";
 import { createKeepSecretCommandsExtension } from "../src/commands/index.ts";
 import type { JudgeLayerOutcome, JudgeStatus, JudgeTextMasker, JudgeWire } from "../src/judge/index.ts";
 import { createMaskingPipeline } from "../src/masking/index.ts";
 import { createHarnessSession, requestText } from "../src/harness/fake-session.ts";
+import { emptyJudgeStatus, recordingContext, registerExtension } from "./helpers.ts";
 
 const OPENAI_KEY = "sk-live-abcdefghijklmnopqrst";
 
@@ -48,43 +49,6 @@ function makeCommands(configContent?: string) {
 	const compaction: MaskedCompactionStatus = { cancellations: 0, lastCancellationError: undefined };
 	const commands = createKeepSecretCommandsExtension({ loader, pipeline, compaction });
 	return { factory, commands, loader, pipeline, compaction, configPath };
-}
-
-/** stub pi：记录注册的 input 处理器与 /keep-secret 命令 handler（与 pi 同一调用面）。 */
-function registerExtension(factory: (pi: ExtensionAPI) => void) {
-	const registered: {
-		inputHandler?: (event: { type: "input"; text: string }, ctx: ExtensionCommandContext) => unknown;
-		commandHandler?: (args: string, ctx: ExtensionCommandContext) => Promise<void> | void;
-	} = {};
-	const pi = {
-		on: (event: string, handler: unknown) => {
-			if (event === "input") {
-				registered.inputHandler = handler as NonNullable<typeof registered.inputHandler>;
-			}
-		},
-		registerCommand: (name: string, options: { handler: unknown }) => {
-			if (name === "keep-secret") {
-				registered.commandHandler = options.handler as NonNullable<typeof registered.commandHandler>;
-			}
-		},
-	} as unknown as ExtensionAPI;
-	factory(pi);
-	return registered;
-}
-
-/** 记录 notify 调用的 ctx（handler 直测观察点）。 */
-function recordingContext(mode: "tui" | "print" | "rpc" = "tui", hasUI = true) {
-	const notifications: { message: string; type?: "info" | "warning" | "error" }[] = [];
-	const ctx = {
-		mode,
-		hasUI,
-		ui: {
-			notify: (message: string, type?: "info" | "warning" | "error") => {
-				notifications.push({ message, type });
-			},
-		},
-	} as unknown as ExtensionCommandContext;
-	return { ctx, notifications };
 }
 
 describe("T7 input 预检通知（默认 regex 集快扫，非阻塞）", () => {
@@ -141,17 +105,6 @@ async function runCommand(commands: (pi: ExtensionAPI) => void, args: string): P
 /** 折叠空白（报告按 72 列预算预先折行；断言多词短语前先归一）。 */
 function flat(text: string): string {
 	return text.replace(/\s+/g, " ");
-}
-
-/** 空状态计数（每用例独立实例）。 */
-function emptyJudgeStatus(): JudgeStatus {
-	return {
-		degradedTexts: 0,
-		lastResolutionError: undefined,
-		judgedTexts: 0,
-		failClosed: 0,
-		truncatedCandidates: 0,
-	};
 }
 
 /** 恒等掩码器的 judge 替身（状态可注入；自测时假密码不被掩码；恒 clean）。 */
