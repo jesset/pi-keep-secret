@@ -461,7 +461,7 @@ describe("T7 /keep-secret reload 配置热重载", () => {
 
 	test("非检测器段变更（judge 配置）reload → 配置已重读、检测器集无变更且仅新会话生效", async () => {
 		const made = makeCommands(ALPHA_CONFIG);
-		// 检测器集不变，仅新增 judge 段（与 loader 的 fingerprint 同口径判定为变更）
+		// 检测器集不变，仅新增 judge 段（reload 分类：judge=true、detectors=false）
 		writeFileSync(
 			made.configPath,
 			JSON.stringify({
@@ -472,9 +472,29 @@ describe("T7 /keep-secret reload 配置热重载", () => {
 		);
 		const text = await runCommand(made.commands, "reload");
 		expect(text).toMatch(/detectors\s+unchanged/);
-		expect(flat(text)).toContain("take effect in new sessions");
+		// 文案由分类驱动：仅列出实际变更的 session-only 段名
+		expect(flat(text)).toContain("judge change(s) take effect in new sessions");
 		expect(text).not.toContain("hot-applied"); // 检测器集未变：不触发热应用
 		expect(made.loader.get().judge?.modelId).toBe("typesafe/jev-latest");
+	});
+
+	test("混合变更（检测器 + hashLength）reload → 热应用并列出 session-only 变更段名", async () => {
+		const made = makeCommands(ALPHA_CONFIG);
+		writeFileSync(
+			made.configPath,
+			JSON.stringify({
+				detectors: [
+					...JSON.parse(ALPHA_CONFIG).detectors,
+					{ name: "beta-key", pattern: "beta-[A-Za-z0-9]{20,}", redactTemplate: "beta-{hash}" },
+				],
+				hashLength: 20,
+			}),
+			"utf8",
+		);
+		const text = await runCommand(made.commands, "reload");
+		expect(text).toContain("hot-applied");
+		expect(text).toContain("beta-key");
+		expect(flat(text)).toContain("hashLength change(s) take effect in new sessions");
 	});
 
 	test("reload 读到非法新配置 → notify 报错并回退内置默认集", async () => {

@@ -400,11 +400,14 @@ describe("detectorsMode 策略开关（ticket #13 / T13）", () => {
 			"utf8",
 		);
 		const seen: number[] = [];
-		loader.subscribe(() => seen.push(1));
+		loader.subscribe((_config, outcome) => {
+			if (outcome.changes.detectors) seen.push(1);
+		});
 		const reloaded = loader.reload();
-		expect(reloaded.detectorsMode).toBe("merge");
-		expect(reloaded.detectors).toHaveLength(DEFAULT_DETECTOR_SPECS.length + 1); // 内置 + corp
-		expect(seen).toEqual([1]); // 模式变更同样经指纹通知（含模式）热应用
+		expect(reloaded.config.detectorsMode).toBe("merge");
+		expect(reloaded.config.detectors).toHaveLength(DEFAULT_DETECTOR_SPECS.length + 1); // 内置 + corp
+		expect(reloaded.changes.detectors).toBe(true); // 解析后检测器集变更 → 可热应用
+		expect(seen).toEqual([1]); // 模式变更同样经分类通知（解析集变更才热应用）
 	});
 });
 
@@ -441,7 +444,8 @@ describe("配置热重载（load/reload/订阅变更）", () => {
 			"utf8",
 		);
 		const reloaded = loader.reload();
-		expect(reloaded.detectors[0].name).toBe("corp-v2");
+		expect(reloaded.config.detectors[0].name).toBe("corp-v2");
+		expect(reloaded.changed).toBe(true);
 		expect(loader.get().detectors[0].name).toBe("corp-v2");
 		expect(seen).toEqual(["corp-v2"]);
 
@@ -461,8 +465,59 @@ describe("配置热重载（load/reload/订阅变更）", () => {
 
 		writeFileSync(path, "{ broken", "utf8");
 		const reloaded = loader.reload();
-		expect(reloaded.errors.length).toBeGreaterThan(0);
-		expect(reloaded.detectors).toEqual(DEFAULT_DETECTOR_SPECS);
+		expect(reloaded.config.errors.length).toBeGreaterThan(0);
+		expect(reloaded.config.detectors).toEqual(DEFAULT_DETECTOR_SPECS);
 		expect(seen).toEqual([1]);
+	});
+
+	test("reload 变更分类：逐段标志（同内容 / judge-only / hashLength-only / 检测器变更）", () => {
+		const corp = JSON.parse(CORP_CONFIG) as Record<string, unknown>;
+		const path = writeTempConfig(CORP_CONFIG);
+		const loader = createConfigLoader({ path });
+
+		// 同内容：无变更
+		const same = loader.reload();
+		expect(same.changed).toBe(false);
+		expect(same.changes).toEqual({
+			detectors: false,
+			detectorsMode: false,
+			hashLength: false,
+			cleanCache: false,
+			judge: false,
+			errors: false,
+		});
+
+		// judge-only：changed 但 detectors 不变（订阅处不触发热应用）
+		writeFileSync(path, JSON.stringify({ ...corp, judge: { provider: "litellm", modelId: "jev" } }), "utf8");
+		const judgeOnly = loader.reload();
+		expect(judgeOnly.changed).toBe(true);
+		expect(judgeOnly.changes.judge).toBe(true);
+		expect(judgeOnly.changes.detectors).toBe(false);
+		expect(judgeOnly.config.judge?.modelId).toBe("jev");
+
+		// hashLength-only：仍不触发热应用
+		writeFileSync(path, JSON.stringify({ ...corp, hashLength: 20, judge: { provider: "litellm", modelId: "jev" } }), "utf8");
+		const hashOnly = loader.reload();
+		expect(hashOnly.changes.hashLength).toBe(true);
+		expect(hashOnly.changes.detectors).toBe(false);
+		expect(hashOnly.changes.judge).toBe(false);
+
+		// 检测器集变更：可热应用
+		writeFileSync(
+			path,
+			JSON.stringify({
+				...corp,
+				hashLength: 20,
+				judge: { provider: "litellm", modelId: "jev" },
+				detectors: [
+					{ name: "corp-api-key", pattern: "corp-[A-Za-z0-9]{20,}" },
+					{ name: "beta-key", pattern: "beta-[A-Za-z0-9]{20,}" },
+				],
+			}),
+			"utf8",
+		);
+		const detectorSwap = loader.reload();
+		expect(detectorSwap.changes.detectors).toBe(true);
+		expect(detectorSwap.config.detectors).toHaveLength(2);
 	});
 });

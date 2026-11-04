@@ -149,7 +149,7 @@ cp -R pi-keep-secret/{package.json,extension,src} ~/.pi/agent/extensions/pi-keep
 
 内置检测器：`openai-key`（`sk-…`，排除 `sk-ant-`）、`github-pat`（`ghp_…`）、`aws-access-key-id`（`AKIA…`）、`google-api-key`（`AIza…`）、`slack-bot-token`（`xoxb-…`）、`pem-private-key`（多行 PEM 块）、`jwt`（三段 base64url）。
 
-非法配置 → 内置默认集 + 可见错误（TUI 通知、`/keep-secret` 状态面）。检测器集变更经 `/keep-secret reload` 热应用；`hashLength`、`cleanCache`、`judge` 变更仅新会话生效。
+非法配置 → 内置默认集 + 可见错误（TUI 通知、`/keep-secret` 状态面）。检测器集变更经 `/keep-secret reload` 热应用；`hashLength`、`cleanCache`、`judge` 变更仅新会话生效——且不再重置会话的 clean cache 统计（仅检测器集实质变更才清空）。
 
 ## Judge 配置
 

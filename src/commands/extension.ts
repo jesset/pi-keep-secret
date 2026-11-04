@@ -25,8 +25,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import { compileRegexDetector, detectRegexSpans, type CompiledRegexDetector } from "../engine/index.ts";
 import { DEFAULT_DETECTOR_SPECS } from "../masking/detectors.ts";
 import type { AnyMaskingPipeline } from "../masking/index.ts";
-import type { ConfigLoader } from "../config/index.ts";
-import { configFingerprint } from "../config/index.ts";
+import type { ConfigLoader, ReloadChanges } from "../config/index.ts";
 import type { MaskedCompactionStatus } from "../compaction/index.ts";
 import type { JudgeWire } from "../judge/index.ts";
 import {
@@ -302,6 +301,17 @@ function buildReloadReport(spec: {
 	return formatReport({ title: "pi-keep-secret · reload", sections });
 }
 
+/** 仅新会话生效的配置段名（reload 分类 → 通知文案；顺序稳定）。 */
+function sessionOnlySections(changes: ReloadChanges): string[] {
+	const sections: [boolean, string][] = [
+		[changes.detectorsMode, "detectorsMode"],
+		[changes.hashLength, "hashLength"],
+		[changes.cleanCache, "cleanCache"],
+		[changes.judge, "judge"],
+	];
+	return sections.filter(([flag]) => flag).map(([, name]) => name);
+}
+
 /** 创建 T7 可见性扩展：input 预检通知 + /keep-secret 命令面。 */
 export function createKeepSecretCommandsExtension(options: KeepSecretCommandsOptions) {
 	return (pi: ExtensionAPI): void => {
@@ -331,9 +341,10 @@ export function createKeepSecretCommandsExtension(options: KeepSecretCommandsOpt
 					break;
 				}
 				case "reload": {
-					const before = options.loader.get();
-					const beforeFingerprint = configFingerprint(before);
-					const after = options.loader.reload(); // 变更时同步触发热应用（applyDetectors + 清空缓存）
+					// 分类驱动的唯一口径（loader.reload 产出；文案与行为同源）：
+					// 仅检测器集实质变更触发热应用（订阅处同一口径），非检测器段
+					// 仅新会话生效——不再自行比对 fingerprint，显示与行为不会分叉
+					const { config: after, changed, changes } = options.loader.reload();
 					const activeDetectors = after.detectors.map((detector) => detector.name).join(", ");
 					if (after.errors.length > 0) {
 						ctx.ui.notify(
@@ -353,28 +364,29 @@ export function createKeepSecretCommandsExtension(options: KeepSecretCommandsOpt
 							}),
 							"error",
 						);
-					} else if (configFingerprint(after) !== beforeFingerprint) {
-						// 变更判定与 loader.reload/订阅同口径（configFingerprint）；检测器
-						// 集是否变化仅决定提示语（热应用 vs 仅新会话生效）
-						if (JSON.stringify(before.detectors) !== JSON.stringify(after.detectors)) {
-							ctx.ui.notify(
-								buildReloadReport({
-									configValue: "re-read",
-									detectorsValue: `hot-applied — ${after.detectors.length} active: ${activeDetectors}`,
-									note: "hashLength / cleanCache / judge changes take effect in new sessions",
-								}),
-								"info",
-							);
-						} else {
-							ctx.ui.notify(
-								buildReloadReport({
-									configValue: "re-read",
-									detectorsValue: `unchanged — ${after.detectors.length} active: ${activeDetectors}`,
-									note: "non-detector changes (judge / hashLength / cleanCache) take effect in new sessions",
-								}),
-								"info",
-							);
-						}
+					} else if (changes.detectors) {
+						const sessionOnly = sessionOnlySections(changes);
+						ctx.ui.notify(
+							buildReloadReport({
+								configValue: "re-read",
+								detectorsValue: `hot-applied — ${after.detectors.length} active: ${activeDetectors}`,
+								note:
+									sessionOnly.length === 0
+										? undefined
+										: `${sessionOnly.join(" / ")} change(s) take effect in new sessions`,
+							}),
+							"info",
+						);
+					} else if (changed) {
+						const sessionOnly = sessionOnlySections(changes);
+						ctx.ui.notify(
+							buildReloadReport({
+								configValue: "re-read",
+								detectorsValue: `unchanged — ${after.detectors.length} active: ${activeDetectors}`,
+								note: `${sessionOnly.join(" / ")} change(s) take effect in new sessions`,
+							}),
+							"info",
+						);
 					} else {
 						ctx.ui.notify(
 							buildReloadReport({

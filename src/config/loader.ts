@@ -35,9 +35,10 @@
  * - 文件不存在 → 内置默认集、无错误（默认安装无配置文件）。
  * - 任何非法（读失败/JSON 解析/schema/regex 编译）→ errors 可见 +
  *   **整体回退**内置默认集（全有或全无，不做部分采纳）。
- * - 热重载：reload() 重读磁盘并按内容指纹判定变更，变更才通知订阅者
- *   （T7 的 /keep-secret reload 消费；hashLength/cleanCache 变更仅在
- *   新会话生效，检测器集变更经订阅即时热应用）。
+ * - 热重载：reload() 重读磁盘并返回按段变更分类（ReloadOutcome，变更
+ *   判定与通知的唯一口径），有实质变更才通知订阅者（T7 的 /keep-secret
+ *   reload 消费；仅 detectors 段变更应热应用，hashLength/cleanCache/
+ *   judge 段变更仅在断会话生效）。
  */
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -472,17 +473,49 @@ function loadFromDisk(path: string): ResolvedConfig {
 	};
 }
 
-/** 配置内容指纹（reload 变更判定与订阅通知的唯一口径；命令面 reload 复用）。 */
-export function configFingerprint(config: ResolvedConfig): string {
-	return JSON.stringify([
-		config.exists,
-		config.detectors,
-		config.detectorsMode,
-		config.hashLength,
-		config.cleanCache,
-		config.judge,
-		config.errors,
-	]);
+/** reload 变更分类（按配置段逐字段；订阅通知与 /keep-secret reload 文案的
+ *  唯一口径——命令面不再自行比对 fingerprint）。热应用语义：仅
+ *  `changes.detectors` 为 true 时订阅者才应重编译检测器集；judge/
+ *  hashLength/cleanCache 等段仅新会话生效（会话内装配在工厂创建时定格）。 */
+export interface ReloadChanges {
+	/** 检测器集（含 detectorsMode 解析后的最终集）变更——可热应用。 */
+	detectors: boolean;
+	/** 检测器合并策略变更（展示口径；通常伴随 detectors 变更）。 */
+	detectorsMode: boolean;
+	/** 伪值哈希段长度变更——仅新会话生效。 */
+	hashLength: boolean;
+	/** clean cache 调参变更——仅新会话生效。 */
+	cleanCache: boolean;
+	/** judge 段变更——仅新会话生效。 */
+	judge: boolean;
+	/** 配置错误列表变更（回退语义变化）。 */
+	errors: boolean;
+}
+
+/** reload 结果：最新配置 + 按段变更分类。 */
+export interface ReloadOutcome {
+	/** 重读后的最新配置（与随后 get() 一致）。 */
+	config: ResolvedConfig;
+	/** 是否有任一配置段实质变更（变更才通知订阅者）。 */
+	changed: boolean;
+	/** 各段变更标志（相对重读前）。 */
+	changes: ReloadChanges;
+}
+
+/** 单段深度比较（loader 自建对象键序稳定，JSON 序列化可作等值判定）。 */
+const fieldDiffers = (a: unknown, b: unknown): boolean => JSON.stringify(a) !== JSON.stringify(b);
+
+/** 重读前后各配置段变更分类（变更判定与订阅通知的唯一口径）。 */
+function classifyReload(next: ResolvedConfig, current: ResolvedConfig): ReloadOutcome {
+	const changes: ReloadChanges = {
+		detectors: fieldDiffers(next.detectors, current.detectors),
+		detectorsMode: fieldDiffers(next.detectorsMode, current.detectorsMode),
+		hashLength: fieldDiffers(next.hashLength, current.hashLength),
+		cleanCache: fieldDiffers(next.cleanCache, current.cleanCache),
+		judge: fieldDiffers(next.judge, current.judge),
+	errors: fieldDiffers(next.errors, current.errors),
+	};
+	return { config: next, changed: Object.values(changes).some(Boolean), changes };
 }
 
 export interface ConfigLoaderOptions {
@@ -493,17 +526,18 @@ export interface ConfigLoaderOptions {
 export interface ConfigLoader {
 	/** 当前生效配置（创建时即完成首次加载）。 */
 	get(): ResolvedConfig;
-	/** 重读磁盘并返回最新配置；内容变更时通知订阅者。 */
-	reload(): ResolvedConfig;
-	/** 订阅配置变更（T7 /keep-secret reload 后热应用检测器集）。返回解绑函数。 */
-	subscribe(listener: (config: ResolvedConfig) => void): () => void;
+	/** 重读磁盘并返回变更分类结果；有实质变更时通知订阅者。 */
+	reload(): ReloadOutcome;
+	/** 订阅配置变更（T7 /keep-secret reload 后热应用检测器集；仅
+	 *  outcome.changes.detectors 时才应重编译）。返回解绑函数。 */
+	subscribe(listener: (config: ResolvedConfig, outcome: ReloadOutcome) => void): () => void;
 }
 
 /** 创建配置 loader：创建即加载，reload 支持热重载（变更订阅）。 */
 export function createConfigLoader(options: ConfigLoaderOptions = {}): ConfigLoader {
 	const path = options.path ?? process.env[CONFIG_PATH_ENV] ?? defaultConfigPath();
 	let current = loadFromDisk(path);
-	const listeners = new Set<(config: ResolvedConfig) => void>();
+	const listeners = new Set<(config: ResolvedConfig, outcome: ReloadOutcome) => void>();
 
 	return {
 		get() {
@@ -511,14 +545,14 @@ export function createConfigLoader(options: ConfigLoaderOptions = {}): ConfigLoa
 		},
 		reload() {
 			const next = loadFromDisk(path);
-			const changed = configFingerprint(next) !== configFingerprint(current);
+			const outcome = classifyReload(next, current);
 			current = next;
-			if (changed) {
+			if (outcome.changed) {
 				for (const listener of [...listeners]) {
-					listener(current);
+					listener(current, outcome);
 				}
 			}
-			return current;
+			return outcome;
 		},
 		subscribe(listener) {
 			listeners.add(listener);
