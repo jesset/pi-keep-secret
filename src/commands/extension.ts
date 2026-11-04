@@ -24,11 +24,11 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { compileRegexDetector, detectRegexSpans, type CompiledRegexDetector } from "../engine/index.ts";
 import { DEFAULT_DETECTOR_SPECS } from "../masking/detectors.ts";
-import type { MaskingPipeline } from "../masking/index.ts";
+import type { AnyMaskingPipeline } from "../masking/index.ts";
 import type { ConfigLoader } from "../config/index.ts";
 import { configFingerprint } from "../config/index.ts";
 import type { MaskedCompactionStatus } from "../compaction/index.ts";
-import type { JudgeTextMasker, JudgeWire } from "../judge/index.ts";
+import type { JudgeWire } from "../judge/index.ts";
 import {
 	formatBlockReport,
 	formatBullets,
@@ -42,17 +42,11 @@ import {
 export interface KeepSecretCommandsOptions {
 	/** 配置 loader（状态面的配置摘要来源；reload 动作消费）。 */
 	loader: ConfigLoader;
-	/** 会话级掩码管线（状态面的注册表/缓存/检测器命中计数来源）。 */
-	pipeline: MaskingPipeline;
+	/** 会话级掩码管线（状态面与自测的统一数据源：注册表/缓存/检测器命中/
+	 *  judge 快照均经管线读取——ADR-0001；自测样本经管线统一出站入口掩码）。 */
+	pipeline: AnyMaskingPipeline;
 	/** 掩码压缩故障状态（状态面的取消计数来源）。 */
 	compaction: MaskedCompactionStatus;
-	/**
-	 * judge 文本掩码器（T8 正式接线：配置 judge 段时由组合根传入同一实例）。
-	 * 缺省（未配置 judge 段）状态面显示「未接入」，自测假密码项期望未掩码；
-	 * 传入时状态面展示 JudgeStatus 计数，自测经 judge→regex 全链评估，
-	 * 假密码项期望掩码（降级时如实报未通过——降级可见信号）。
-	 */
-	judge?: JudgeTextMasker;
 }
 
 /** 预检快扫检测器集（内置默认集编译态；与配置无关的固定提示层）。 */
@@ -147,18 +141,19 @@ function buildStatusReport(options: KeepSecretCommandsOptions): string {
 		],
 	});
 
+	const judge = options.pipeline.judgeInfo();
 	const judgeFields: ReportField[] = [];
-	if (options.judge === undefined) {
+	if (judge === undefined) {
 		judgeFields.push({ label: "layer", value: "regex only (no judge config)" });
 	} else {
-		const status = options.judge.status;
-		judgeFields.push({ label: "judged", value: plural(status.judgedTexts, "text") });
-		judgeFields.push({ label: "truncated", value: plural(status.truncatedCandidates, "candidate") });
-		judgeFields.push({ label: "fail-closed", value: plural(status.failClosed, "text") });
-		judgeFields.push({ label: "degraded", value: plural(status.degradedTexts, "text") });
-		judgeFields.push({ label: "on missing", value: config.judge?.onMissing ?? "fail_closed" });
-		if (options.judge.wire !== undefined) {
-			judgeFields.push({ label: "wire", value: describeJudgeWire(options.judge.wire) });
+		judgeFields.push({ label: "judged", value: plural(judge.status.judgedTexts, "text") });
+		judgeFields.push({ label: "truncated", value: plural(judge.status.truncatedCandidates, "candidate") });
+		judgeFields.push({ label: "fail-closed", value: plural(judge.status.failClosed, "text") });
+		judgeFields.push({ label: "degraded", value: plural(judge.status.degradedTexts, "text") });
+		// 生效策略口径（ADR-0001 Q6）：读会话实际生效的 judge 层，而非磁盘新配置
+		judgeFields.push({ label: "on missing", value: judge.onMissing });
+		if (judge.wire !== undefined) {
+			judgeFields.push({ label: "wire", value: describeJudgeWire(judge.wire) });
 		}
 	}
 	sections.push({ heading: "Judge", fields: judgeFields });
@@ -214,28 +209,26 @@ const SELF_TEST_SAMPLES: SelfTestSample[] = [
 	},
 ];
 
-/** /keep-secret test：合成样本逐项过会话链路（judge→regex 同出站序），报告掩码结果与期望是否一致。 */
+/** /keep-secret test：合成样本逐项过管线统一出站入口（ADR-0001：judge→regex 完整掩码），报告掩码结果与期望是否一致。 */
 async function buildSelfTestReport(
 	options: KeepSecretCommandsOptions,
 	ctx: ExtensionCommandContext,
 ): Promise<{ text: string; allPassed: boolean }> {
-	const judgeEnabled = options.judge !== undefined;
+	const judge = options.pipeline.judgeInfo();
+	const judgeEnabled = judge !== undefined;
 	// 模型缺失 + fail_closed（默认）：未验证候选一律掩码——全部样本期望掩码
 	//（含干净订单号：候选被兜底掩码属预期，而非配置问题）
 	const failClosedNoModel =
-		options.judge !== undefined &&
-		options.judge.onMissing === "fail_closed" &&
-		options.judge.modelMissing;
+		judge !== undefined && judge.onMissing === "fail_closed" && judge.modelMissing;
 	const rows: ReportTableRow[] = [];
 	let passed = 0;
 	for (const sample of SELF_TEST_SAMPLES) {
-		// 与出站链同序：judge 先判原文，regex 后兜底（伪值幂等跳过）；
-		// judge 降级（regex_only）时 mask 原样返回，仅 regex 层结果——假密码项如实报未通过
-		let current = sample.text;
-		if (options.judge !== undefined) {
-			current = await options.judge.mask(current, ctx);
-		}
-		current = options.pipeline.maskText(current);
+		// 管线统一出站入口：完整掩码（judge 先判原文、regex 后兜底，伪值幂等
+		// 跳过，Clean Verdict 协议在内）；judge 降级（regex_only）时仅 regex 层
+		// 结果——假密码项如实报未通过
+		const pipeline = options.pipeline;
+		const current =
+			"mask" in pipeline ? await pipeline.mask(sample.text, ctx) : pipeline.maskText(sample.text);
 		const masked = current !== sample.text;
 		const expectMasked = failClosedNoModel
 			? true
@@ -258,7 +251,7 @@ async function buildSelfTestReport(
 	}
 	const allPassed = passed === SELF_TEST_SAMPLES.length;
 	const notes: string[] = [];
-	if (judgeEnabled && options.judge !== undefined && options.judge.status.degradedTexts > 0 && !allPassed) {
+	if (judge !== undefined && judge.status.degradedTexts > 0 && !allPassed) {
 		notes.push(
 			"judge degraded (classifier model unavailable, regex layer only) — " +
 				"the failing fake-password sample is the degradation signal",

@@ -13,18 +13,20 @@
  * via the registry — the stored summary holds real values, the retained
  * region stays local (egress masking keeps covering it on later requests).
  *
- * Masking chain (ticket #12): summary input leaves (conversation messages,
- * previousSummary, customInstructions) run judge-first then regex — the same
- * order and the same instances as the egress chain (judge needs the original
- * text; the regex layer idempotently skips already-issued placeholders, and
- * placeholder forms stay unified via first-issuer-wins). Without a judge
- * masker the chain degrades to regex only, i.e. the pre-#12 behavior for
- * sessions without a judge config. Judge failures never disturb compaction:
- * classify errors fail closed inside the masker (unverified candidates
- * masked) and compaction continues; a missing classifier model follows the
- * egress onMissing policy (default fail_closed, regex_only = explicit
- * informed degradation to the regex layer for the summary input as well).
- * The retry/cancel path below is reserved for the summarization call itself.
+ * Masking chain (ticket #12; ADR-0001): summary input leaves (conversation
+ * messages, previousSummary, customInstructions) go through the pipeline's
+ * unified egress entry — judge layer first when wired in (it needs the
+ * original text), then the regex stage (idempotent over already-issued
+ * placeholders; placeholder forms stay unified via first-issuer-wins). The
+ * composition is owned by the pipeline, so the summary path cannot compose
+ * the layers wrong. Without a judge layer the chain degrades to regex only,
+ * i.e. the pre-#12 behavior for sessions without a judge config. Judge
+ * failures never disturb compaction: classify errors fail closed inside the
+ * masker (unverified candidates masked) and compaction continues; a missing
+ * classifier model follows the egress onMissing policy (default fail_closed,
+ * regex_only = explicit informed degradation to the regex layer for the
+ * summary input as well). The retry/cancel path below is reserved for the
+ * summarization call itself.
  *
  * The summary call goes through `ctx.modelRegistry.complete` (the session's
  * current model, the extension-side facade); the prompt mirrors pi's default
@@ -50,8 +52,7 @@ import type {
 import { convertToLlm, prepareBranchEntries, serializeConversation } from "@earendil-works/pi-coding-agent";
 import type { Usage } from "@earendil-works/pi-ai";
 import { normalizeContext } from "@earendil-works/pi-ai";
-import type { JudgeTextMasker } from "../judge/index.ts";
-import type { MaskingPipeline } from "../masking/index.ts";
+import type { AnyMaskingPipeline } from "../masking/index.ts";
 import { maskMessageTreeAsync } from "../masking/index.ts";
 import {
 	BRANCH_SUMMARY_PREAMBLE,
@@ -81,14 +82,14 @@ export interface MaskedCompactionStatus {
 
 export interface MaskedCompactionOptions {
 	/** Session-level masking pipeline (shares the registry with the egress
-	 *  hooks, keeping placeholder forms consistent). */
-	pipeline: MaskingPipeline;
-	/** Judge text masker, the same instance the egress chain uses (shared
-	 *  registry/clean cache/tombstones). When provided, summary input is
-	 *  masked judge-first then regex; omitted = regex only (sessions without
-	 *  a judge config keep the pre-#12 behavior). Judge failures stay inside
-	 *  the masker (fail_closed masking) and never cancel compaction. */
-	judge?: JudgeTextMasker;
+	 *  hook, keeping placeholder forms consistent). Summary-input leaves go
+	 *  through the pipeline's unified egress entry (ADR-0001: judge first
+	 *  when wired in, then the regex stage — callers cannot compose the
+	 *  layers wrong). Without a judge layer the chain degrades to regex
+	 *  only, i.e. the pre-#12 behavior for sessions without a judge config.
+	 *  Judge failures never disturb compaction (fail_closed masking inside
+	 *  the masker) and retry/cancel semantics stay with the summary call. */
+	pipeline: AnyMaskingPipeline;
 	/** Failure status (created by this factory when omitted); callers that
 	 *  need to observe cancellations (tests, status command) pass one in. */
 	status?: MaskedCompactionStatus;
@@ -114,17 +115,17 @@ interface SummaryCall {
 /** 创建掩码压缩扩展（注册 session_before_compact / session_before_tree）。 */
 export function createMaskedCompactionExtension(options: MaskedCompactionOptions) {
 	const { pipeline } = options;
-	const judge = options.judge;
 	const status: MaskedCompactionStatus =
 		options.status ?? { cancellations: 0, lastCancellationError: undefined };
 
-	/** Mask one summary-input text leaf with the egress chain's composition:
-	 *  judge first (when wired in — it needs the original text), then the regex
-	 *  pipeline (idempotent over already-issued placeholders). Judge classify
-	 *  failures fail closed inside the masker, so masking never interrupts
-	 *  compaction; retry/cancel semantics are owned by the summary call. */
+	/** Mask one summary-input text leaf with the pipeline's unified egress
+	 *  entry (ADR-0001): judge layer first (when wired in — it needs the
+	 *  original text), then the regex stage, with the Clean Verdict protocol
+	 *  maintained at the entry. Judge classify failures fail closed inside
+	 *  the masker, so masking never interrupts compaction; retry/cancel
+	 *  semantics are owned by the summary call. */
 	const maskSummaryInput = async (text: string, ctx: ExtensionContext): Promise<string> =>
-		pipeline.maskText(judge === undefined ? text : await judge.mask(text, ctx));
+		"mask" in pipeline ? await pipeline.mask(text, ctx) : pipeline.maskText(text);
 
 	/** Messages → LLM shape (convertToLlm, incl. branchSummary/compactionSummary
 	 *  projections) → mask text leaves → serialized conversation text. */

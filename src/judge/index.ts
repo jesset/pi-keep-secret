@@ -1,30 +1,34 @@
 /**
- * System One judge 层公共出口（T5 交付）。
+ * System One judge 层公共出口（T5 交付；ADR-0001 起出站组合归掩码管线，
+ * 原 judge 出站扩展已并入 createEgressMaskingExtension）。
  *
  * - `createSystemOneJudge`：两阶段判定适配器（gate 单问短路 → 候选批量
  *   bool 判定；fail_closed 兜底；classify 并发信号量）——classify 通道
- *   由调用方注入（扩展层绑定 ctx.modelRegistry.classify，纯逻辑测试注入
+ *   由调用方注入（掩码器绑定 ctx.modelRegistry.classify，纯逻辑测试注入
  *   进程内假函数）。
- * - `createJudgeEgressExtension`：出站扩展工厂（context_with_system 上
- *   的 judge 检测器；模型缺失按 onMissing 策略处理——默认 fail_closed
- *   掩码未验证候选，regex_only 显式降级仅 regex 层 + 状态计数）。须先于
- *   regex 出站扩展注册。T4 配置层合入前由装配方显式传 modelRef。
- * - `JudgeVerdict.clean`：与 T4 clean cache 的协同依据——judge 层 gate
- *   前查询短路（已判干净不再发起 gate）；非 clean 结论（命中/gate 命中/
- *   fail_closed）以 hasSecret=true 记墓碑，拦截后置 regex 层的干净写入。
+ * - `createJudgeTextMasker` / `createJudgeTextMaskerFor`：judge 文本掩码器
+ *   （单文本叶判定+掩码，返回本层结论；不读写 clean cache——Clean
+ *   Verdict 协议归掩码管线的完整出站入口）。模型缺失按 onMissing 策略
+ *   处理——默认 fail_closed 掩码未验证候选，regex_only 显式降级仅 regex
+ *   层 + 状态计数。
+ * - `JudgeLayerOutcome.verdict`：管线维护 Clean Verdict 的依据——clean
+ *   可与 regex 层零命中合成干净结论；masked/unverified 记墓碑（后者为
+ *   降级放行，防 judge 恢复后被缓存短路）。
  */
 export {
-	createJudgeEgressExtension,
 	createJudgeTextMasker,
+	createJudgeTextMaskerFor,
 	DEFAULT_JUDGE_TEMPLATE,
+	MODEL_API_BY_JUDGE_API,
 	type ClassifyChannel,
 	type ClassifierModelRef,
-	type JudgeEgressOptions,
+	type JudgeLayerOutcome,
 	type JudgeStatus,
 	type JudgeTextMasker,
+	type JudgeTextMaskerOptions,
 	type JudgeWire,
 	type ModelResolver,
-} from "./extension.ts";
+} from "./masker.ts";
 export {
 	DEFAULT_BATCH_SIZE,
 	DEFAULT_CANDIDATE_THRESHOLD,

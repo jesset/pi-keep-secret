@@ -27,7 +27,7 @@
  *   自定义 api 尊重插件实现 + 偏好未生效提示），见 JudgeApi）；未配置
  *   即不接入 judge（仅 regex 检测层）。模型缺失时按 onMissing 处理（默认
  *   fail_closed——未验证候选一律掩码；regex_only——降级仅 regex 层，
- *   见 src/judge/extension.ts 与 JudgeOnMissing）。
+ *   见 src/judge/masker.ts 与 JudgeOnMissing）。
  *   judge 段变更与 hashLength/cleanCache 同语义：仅新会话生效（会话内
  *   的 judge 装配在工厂创建时定格）。
  * - 路径解析优先级：显式参数 > 环境变量 PI_KEEP_SECRET_CONFIG > 默认
@@ -83,7 +83,7 @@ export type JudgeOnMissing = "fail_closed" | "regex_only";
  * bool→predicate、criteria 折进 instructions、state 为 JSON 文本）。
  * 两种协议同一 LiteLLM 网关后端路由，baseUrl 都配 `https://<host>/v1`。
  * loader 仅校验合法值（防 typo）；偏好的三分支应用在装配处（见
- * src/judge/extension.ts 的 JudgeEgressOptions.api）。
+ * src/judge/masker.ts 的 JudgeTextMaskerOptions.api）。
  */
 export type JudgeApi = "systemone" | "decisions";
 
@@ -118,7 +118,7 @@ export interface JudgeConfig {
 	/** 判定线缆偏好（见 JudgeApi）。缺省 undefined 跟随模型注册条目
 	 *  的 api 字段；填写后按三分支应用（T16）：模型注册为 pi-ai 已知
 	 *  classifier api → 覆盖分发线缆（typesafe-system-one↔systemone、
-	 *  openai-decisions↔decisions，见 src/judge/extension.ts 的
+	 *  openai-decisions↔decisions，见 src/judge/masker.ts 的
 	 *  MODEL_API_BY_JUDGE_API）；插件自定义 api → 尊重插件实现、偏好
 	 *  未生效（info 通知 + 状态面标记）。分工：loader 只校验合法值
 	 *  （非法仍 judge 段整体回退），偏好在装配处应用。 */

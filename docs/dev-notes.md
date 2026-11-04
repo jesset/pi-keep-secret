@@ -631,13 +631,19 @@ only on the `(args, ctx)` signature and can be tested directly.
 
 Code: `extension/index.ts` (`createKeepSecretExtension` composition + the
 default export), `src/config/loader.ts` (judge section),
-`src/config/extension.ts` (judge wiring), `src/judge/extension.ts`
-(`createJudgeTextMasker`), `src/commands/extension.ts` (judge counters and
+`src/config/extension.ts` (judge wiring), `src/judge/masker.ts`
+(`createJudgeTextMasker`; T8-era path `src/judge/extension.ts`), `src/commands/extension.ts` (judge counters and
 dynamic self-test expectations); acceptance cases:
 `test/e2e-convergence.test.ts` (seam 1), `test/helpers.ts` (shared fake
 classifier double).
 
 ### Formal composition wiring (judge integration)
+
+> **ADR-0001 update**: the composition described below is the T8-era shape
+> and has since been deepened — `createMaskingPipeline` now owns the egress
+> composition and the Clean Verdict protocol (single egress extension,
+> single traversal, judge layer internal to the pipeline; the "judge before
+> regex" registration-order contract is gone). Kept for history.
 
 - **Assembly**: `createConfiguredMaskingExtension` reads config.json's
   `judge` section (provider/modelId/thresholds/onMissing) to create a
