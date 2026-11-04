@@ -149,7 +149,7 @@ One JSON file, unknown keys rejected, all-or-nothing validation (any invalid val
 
 Built-in detectors: `openai-key` (`sk-…`, excluding `sk-ant-`), `github-pat` (`ghp_…`), `aws-access-key-id` (`AKIA…`), `google-api-key` (`AIza…`), `slack-bot-token` (`xoxb-…`), `pem-private-key` (multi-line PEM blocks), `jwt` (three base64url segments).
 
-Invalid config → built-in defaults + visible errors (TUI notification, `/keep-secret` status). Detector-set changes hot-apply via `/keep-secret reload`; `hashLength`, `cleanCache`, and `judge` changes take effect in new sessions.
+Invalid config → built-in defaults + visible errors (TUI notification, `/keep-secret` status). Detector-set changes hot-apply via `/keep-secret reload`; `hashLength`, `cleanCache`, and `judge` changes take effect in new sessions — and no longer reset the session's clean-cache statistics (only an actual detector-set change clears them).
 
 ## Judge setup
 

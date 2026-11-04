@@ -14,7 +14,6 @@ export {
 } from "./extension.ts";
 export {
 	CONFIG_PATH_ENV,
-	configFingerprint,
 	createConfigLoader,
 	defaultConfigPath,
 	type CleanCacheConfig,
@@ -24,5 +23,7 @@ export {
 	type JudgeApi,
 	type JudgeConfig,
 	type JudgeOnMissing,
+	type ReloadChanges,
+	type ReloadOutcome,
 	type ResolvedConfig,
 } from "./loader.ts";

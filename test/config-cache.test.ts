@@ -21,6 +21,7 @@ import { CONFIG_PATH_ENV } from "../src/config/loader.ts";
 import { createConfiguredMaskingExtension } from "../src/config/index.ts";
 import { createCleanCache } from "../src/cache/index.ts";
 import { createEgressMaskingExtension } from "../src/masking/extension.ts";
+import { createMaskingPipeline } from "../src/masking/index.ts";
 import { createHarnessSession, requestText } from "../src/harness/fake-session.ts";
 
 /** 正式扩展入口（目录扩展 index.ts 工厂，读 JSON 配置）。 */
@@ -192,8 +193,8 @@ describe("T4 配置热重载（load/reload/订阅，T7 /keep-secret reload 消�
 			// 重写配置为 v2（补 beta 检测器）并热重载
 			writeFileSync(path, V2, "utf8");
 			const reloaded = loader.reload();
-			expect(reloaded.errors).toEqual([]);
-			expect(reloaded.detectors.map((d) => d.name)).toContain("beta-key");
+			expect(reloaded.config.errors).toEqual([]);
+			expect(reloaded.config.detectors.map((d) => d.name)).toContain("beta-key");
 
 			// 第二轮：v1 时代判定干净的 beta 消息必须重新检测并掩码
 			// （检测器集变更清空 clean cache，否则缓存的干净判定会造成泄漏）
@@ -204,5 +205,62 @@ describe("T4 配置热重载（load/reload/订阅，T7 /keep-secret reload 消�
 		} finally {
 			h.dispose();
 		}
+	});
+
+	test("reload 变更分类驱动热应用：judge-only 变更不清空 clean cache（旧干净判定仍短路）", async () => {
+		const path = tempConfig(V1);
+		const { factory, loader, pipeline } = createConfiguredMaskingExtension({ configPath: path });
+		const h = await createHarnessSession({ extensionFactories: [factory] });
+		try {
+			h.provider.setScript([{ text: "ok" }, { text: "done" }]);
+			await h.session.prompt(`rotate ${BETA_KEY}`); // v1：beta 干净 → 缓存干净结论
+			const before = pipeline.cacheStats();
+
+			// 仅新增 judge 段（检测器集不变）：分类判定不应触发热应用
+			writeFileSync(
+				path,
+				JSON.stringify({
+					detectors: JSON.parse(V1).detectors,
+					judge: { provider: "litellm", modelId: "typesafe/jev-latest" },
+				}),
+				"utf8",
+			);
+			const outcome = loader.reload();
+			expect(outcome.changes.judge).toBe(true);
+			expect(outcome.changes.detectors).toBe(false);
+
+			// 行为锚：reload 后旧文本仍命中缓存——第二轮检测增量仅为新增文本
+			//（若误清缓存，历史 system/user 叶将全部重扫，增量 ≥ 3）
+			await h.session.prompt("status");
+			const after = pipeline.cacheStats();
+			expect(after.misses - before.misses).toBe(2);
+			expect(after.hits - before.hits).toBe(before.misses);
+		} finally {
+			h.dispose();
+		}
+	});
+
+	test("applyDetectors 幂等：相同检测器集 no-op（统计保留），实质变更才清空", () => {
+		const alpha = { name: "alpha-key", pattern: "alpha-[A-Za-z0-9]{20,}", template: "alpha-{hash}" };
+		const pipeline = createMaskingPipeline({ detectors: [alpha] });
+		pipeline.maskText("rotate alpha-qwertyuiopasdfghjklzx"); // 命中 → 墓碑 + 命中计数
+		pipeline.maskText("nothing interesting here"); // 干净 → 缓存条目
+		const stats = pipeline.cacheStats();
+		const hits = pipeline.detectorHitCounts();
+		expect(hits.get("alpha-key")).toBe(1);
+		expect(stats.size).toBe(1); // 一条干净结论在缓存
+
+		// 同集热应用：no-op——clean cache 与命中统计原样保留
+		pipeline.applyDetectors([alpha]);
+		expect(pipeline.cacheStats()).toEqual(stats);
+		expect(pipeline.detectorHitCounts()).toEqual(hits);
+
+		// 实质变更：清空（旧的干净判定对新检测器集不可信）
+		pipeline.applyDetectors([
+			alpha,
+			{ name: "beta-key", pattern: "beta-[A-Za-z0-9]{20,}", template: "beta-{hash}" },
+		]);
+		expect(pipeline.cacheStats().size).toBe(0);
+		expect(pipeline.detectorHitCounts().size).toBe(0);
 	});
 });

@@ -93,9 +93,11 @@ export interface MaskingPipelineBase {
 	/** 共享注册表（T3 回程还原 / T6 掩码压缩共用同一映射）。 */
 	readonly registry: PlaceholderRegistry;
 	/**
-	 * 热应用新检测器集：重编译检测器并清空 clean cache（检测器集变更后
-	 * 旧的干净判定不再可信）与检测器命中计数（名集合已变）。T4 配置层
-	 * 热重载（loader.subscribe）消费。
+	 * 热应用新检测器集（幂等）：与当前集相同则 no-op（不清空 clean cache
+	 * 与检测器命中计数——非检测器段 reload 不得误清运行统计）；实质变更
+	 * 时重编译检测器并清空 clean cache（检测器集变更后旧的干净判定不再
+	 * 可信）与命中计数（名集合已变）。T4 配置层热重载（loader.subscribe）
+	 * 消费。
 	 */
 	applyDetectors(specs: RegexDetectorSpec[]): void;
 	/** 各检测器命中计数（合并后 span 按检测器名累计；T7 /keep-secret 状态面）。 */
@@ -131,9 +133,8 @@ export function createMaskingPipeline(options?: MaskingPipelineOptions): Masking
 export function createMaskingPipeline(
 	options: MaskingPipelineOptions = {},
 ): MaskingPipeline | JudgedMaskingPipeline {
-	let detectors: CompiledRegexDetector[] = (options.detectors ?? DEFAULT_DETECTOR_SPECS).map(
-		compileRegexDetector,
-	);
+	let detectorSpecs: RegexDetectorSpec[] = options.detectors ?? DEFAULT_DETECTOR_SPECS;
+	let detectors: CompiledRegexDetector[] = detectorSpecs.map(compileRegexDetector);
 	let templates = new Map(detectors.map((detector) => [detector.name, detector.template]));
 	const registry =
 		options.registry ??
@@ -171,6 +172,12 @@ export function createMaskingPipeline(
 		unmaskText: (text) => unmaskText(text, registry.snapshot()),
 		registry,
 		applyDetectors(specs) {
+			// 幂等：相同检测器集 no-op（loader 键序稳定，序列化可作等值判定），
+			// 不清 clean cache 与命中统计
+			if (JSON.stringify(specs) === JSON.stringify(detectorSpecs)) {
+				return;
+			}
+			detectorSpecs = specs;
 			detectors = specs.map(compileRegexDetector);
 			templates = new Map(detectors.map((detector) => [detector.name, detector.template]));
 			cleanCache.clear();

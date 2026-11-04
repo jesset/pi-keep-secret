@@ -76,7 +76,13 @@ export function createConfiguredMaskingExtension(
 						classify: options.classify,
 					},
 				}));
-	loader.subscribe((config) => pipeline.applyDetectors(config.detectors));
+	// 仅检测器集实质变更才热应用（judge/hashLength/cleanCache 段变更仅新会话
+	// 生效——不重编译、不清统计；分类口径见 ReloadOutcome）
+	loader.subscribe((config, outcome) => {
+		if (outcome.changes.detectors) {
+			pipeline.applyDetectors(config.detectors);
+		}
+	});
 
 	/** 已上报过的配置错误（每条只 notify 一次，reload 新错误再报）。 */
 	const reported = new Set<string>();

@@ -30,6 +30,15 @@
   态；`createConfiguredMaskingExtension` 不再返回 `judge`；`src/judge/
   extension.ts` 拆入 `src/judge/masker.ts`（judge 出站扩展工厂移除）。
 
+- **reload 变更分类收口（架构评审候选 2）**：`loader.reload()` 返回按段变更分
+  类（`ReloadOutcome`：`config` / `changed` / 逐字段 `changes`），作为订阅通
+  知与 `/keep-secret reload` 文案的唯一口径；`configFingerprint` 不再导出。
+  仅检测器集实质变更触发热应用——judge/hashLength/cleanCache 段变更不再误清
+  clean cache 与检测器命中统计（此前任意字段变更都会清空运行统计，而状态面
+  显示 "detectors unchanged"）；`applyDetectors` 幂等化（相同检测器集
+  no-op）；reload 通知文案改由分类驱动，列出实际变更的仅新会话生效段名；
+  订阅回调签名追加第二参数 `outcome`。
+
 ## [0.2.0] - 2026-11-03
 
 ### Added
